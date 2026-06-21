@@ -1,0 +1,1306 @@
+"""LLM callers for saddle.
+
+Per-provider caller classes (one per LLM endpoint family) plus
+factory + registry plumbing consumed by `LLMPool`. The active provider
+order lives in `ACTIVE_PRIORITY` — leftmost wins.
+
+The OLD `CallerRouter` / `build_router` abstraction (primary/fast/hlr
+caller split keyed off call_type strings) was retired 2026-05-04 when
+the pipeline finished migrating to `LLMPool`. Per-call provider
+selection now happens at the pool layer via intent-based routing
+(see `saddle.llm.llm_pool`).
+
+Saddle's lead provider is `ClaudeAgentCaller` (saddle.llm.claude_agent):
+Claude via the Agent SDK, driving the local `claude` CLI directly
+(subscription auth — no api key). The same SDK backs the interactive
+chat (`python -m saddle.chat`), so the user-facing surface and the pool's
+lead provider are one engine.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import tempfile
+import threading
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+import httpx
+
+from .json_tools import extract_json_text, strip_llm_wrappers
+from .pool import PoolSlot, get_pool
+from .protocol import LLMCaller
+from .retry_category import categorize_retry
+from .policy import active_priority, merged_config
+from saddle.context import Context
+
+_KIMI_CRED_PATH = Path.home() / ".kimi/credentials/kimi-code.json"
+_KIMI_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
+_KIMI_AUTH_URL = "https://auth.kimi.com/api/oauth/token"
+_KIMI_DEFAULT_API_BASE_URL = "https://api.kimi.com/coding/v1"
+_KIMI_DEFAULT_MODEL = "kimi-for-coding"
+_DEEPSEEK_DEFAULT_API_BASE_URL = "https://api.deepseek.com/anthropic"
+_DEEPSEEK_PRO_DEFAULT_MODEL = "deepseek-v4-pro"
+_DEEPSEEK_FLASH_DEFAULT_MODEL = "deepseek-v4-flash"
+_MINIMAX_DEFAULT_API_BASE_URL = "https://api.minimax.io/v1/chat/completions"
+_MINIMAX_DEFAULT_MODEL = "MiniMax-M3"
+
+_kimi_token_cache: dict = {}
+_kimi_token_cache_time: float = 0
+_kimi_refresh_lock = threading.Lock()
+_log = logging.getLogger("saddle.llm.callers")
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _provider_deadline_seconds() -> float:
+    return _env_float("RAYXI_LLM_PROVIDER_DEADLINE_SECONDS", 0.0)
+
+
+async def _call_with_provider_deadline(
+    caller: LLMCaller,
+    system: str,
+    prompt: str,
+    *,
+    json_mode: bool,
+    label: str,
+) -> str:
+    deadline = _provider_deadline_seconds()
+    coro = caller(system, prompt, json_mode=json_mode, label=label)
+    if deadline <= 0:
+        return await coro
+    return await asyncio.wait_for(coro, timeout=deadline)
+
+
+def _config_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    env_path = os.environ.get("RAYXI_LLM_CONFIG")
+    if env_path:
+        candidates.append(Path(env_path))
+    repo_root = Path(__file__).resolve().parents[3]
+    candidates.extend(
+        [
+            repo_root / "config" / "llm_config.json",
+            Path.cwd() / "config" / "llm_config.json",
+            Path.home() / ".config" / "rayxi" / "llm_config.json",
+            # Removed: hardcoded cross-project path leaked local filesystem.
+        ]
+    )
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key in seen:
+            continue
+        deduped.append(candidate)
+        seen.add(key)
+    return deduped
+
+
+def _resolve_config_path() -> Path | None:
+    for candidate in _config_candidates():
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _safe_response_payload(resp: httpx.Response) -> dict:
+    try:
+        data = resp.json()
+        if isinstance(data, dict):
+            return data
+        return {"data": data}
+    except Exception:
+        text = (resp.text or "").strip()
+        return {"raw_text": text[:1000]}
+
+
+def _http_error(provider: str, resp: httpx.Response) -> RuntimeError:
+    payload = _safe_response_payload(resp)
+    return RuntimeError(f"{provider} error {resp.status_code}: {json.dumps(payload)[:200]}")
+
+
+def _is_retryable_status(status_code: int) -> bool:
+    return status_code in {408, 409, 425, 429, 500, 502, 503, 504}
+
+
+def _retry_same_provider(category: str) -> bool:
+    """Whether an in-provider retry is worth attempting for this category.
+
+    A rate-limit (429 / quota) won't clear in the 1-2s an in-provider
+    retry sleeps — retrying the SAME provider just burns the call's time
+    budget before the fallback/race chain can route to a different
+    provider. So `external_rate_limit` gets NO in-provider retry: raise
+    at once and let FallbackCaller / RaceCaller pick another provider.
+    Other retryable categories (5xx outage, timeout, empty / incomplete
+    stream) DO clear quickly, so they keep their in-provider retry.
+    """
+    return category != "external_rate_limit"
+
+
+def _normalize_content(text: str, *, json_mode: bool) -> str:
+    clean = strip_llm_wrappers(text)
+    if json_mode:
+        clean = extract_json_text(clean)
+    return clean.strip()
+
+
+def _load_config(ctx: "Context | None" = None) -> dict:
+    # Saddle's secrets/policy split: api keys come from a SHARED file, routing
+    # (priority + caps) from saddle's OWN config/llm_policy.json. merged_config
+    # overlays the two into the {"providers": {...}} shape the factories expect.
+    # The resolved set is tenant/project-specific (saddle.llm.policy +
+    # saddle.context); ctx=None resolves the ambient (env + cwd) context.
+    return merged_config(ctx)
+
+
+def _first_env(*names: str) -> str | None:
+    for name in names:
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
+def _get_kimi_token() -> str:
+    global _kimi_token_cache, _kimi_token_cache_time
+    now = time.time()
+    if _kimi_token_cache and now - _kimi_token_cache_time < 30:
+        return _kimi_token_cache["access_token"]
+    # Serialize refresh across threads (in-process) to prevent stampede.
+    with _kimi_refresh_lock:
+        # Re-check after acquiring lock — another thread may have refreshed.
+        now = time.time()
+        if _kimi_token_cache and now - _kimi_token_cache_time < 30:
+            return _kimi_token_cache["access_token"]
+        creds = json.loads(_KIMI_CRED_PATH.read_text(encoding="utf-8"))
+        if creds.get("expires_at", 0) - now < 300:
+            body = urllib.parse.urlencode({
+                "grant_type": "refresh_token",
+                "refresh_token": creds["refresh_token"],
+                "client_id": _KIMI_CLIENT_ID,
+            }).encode()
+            req = urllib.request.Request(
+                _KIMI_AUTH_URL, data=body,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                new_creds = json.loads(resp.read())
+            new_creds["expires_at"] = time.time() + new_creds.get("expires_in", 900)
+            # Atomic write: tmp file + rename prevents concurrent readers
+            # from seeing a half-written credential file.
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=str(_KIMI_CRED_PATH.parent), suffix=".tmp",
+            )
+            try:
+                os.write(tmp_fd, json.dumps(new_creds).encode("utf-8"))
+                os.close(tmp_fd)
+                os.chmod(tmp_path, 0o600)
+                os.replace(tmp_path, str(_KIMI_CRED_PATH))
+            except BaseException:
+                try:
+                    os.close(tmp_fd)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+            creds = new_creds
+        _kimi_token_cache = creds
+        _kimi_token_cache_time = now
+        return creds["access_token"]
+
+
+class GlmCaller:
+    """GLM caller — uses Anthropic-compatible endpoint at z.ai by default.
+
+    The z.ai anthropic endpoint works reliably. The paas/v4 OpenAI-compat
+    endpoint throws billing errors even with balance remaining — avoid it.
+
+    For web search: uses the paas/v4 endpoint with tools parameter since
+    the anthropic endpoint doesn't support tools. Falls back gracefully.
+    """
+
+    # Concurrent-request admission cap — see MiniMaxCaller for the
+    # full design comment. GLM is rarely picked (not in ACTIVE_PRIORITY
+    # by default); 4 is a conservative tested ceiling.
+    concurrent_request_cap: int = 4
+
+
+    def __init__(self, cfg: dict) -> None:
+        self._cfg = cfg
+        base = cfg.get("api_base_url", "https://api.z.ai/api/anthropic/v1")
+        # Keep the anthropic endpoint as-is — it works
+        if "/anthropic/" in base:
+            self._anthropic_url = base.rstrip("/") + "/messages"
+            self._openai_url = "https://api.z.ai/api/paas/v4/chat/completions"
+            self._use_anthropic = True
+        elif base.endswith("/chat/completions"):
+            self._anthropic_url = None
+            self._openai_url = base
+            self._use_anthropic = False
+        else:
+            self._anthropic_url = None
+            self._openai_url = f"{base}/chat/completions"
+            self._use_anthropic = False
+
+    async def _call_anthropic(
+        self, system: str, prompt: str, *, json_mode: bool, label: str,
+    ) -> str:
+        """Call via Anthropic-compatible endpoint (reliable, no web search)."""
+        body: dict = {
+            "model": self._cfg.get("model", "GLM-5.1"),
+            "system": system,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self._cfg.get("max_tokens", 32768),
+            "temperature": self._cfg.get("temperature", 0.7),
+        }
+        slot_label = f"GLM-anthropic/{label}" if label else "GLM-anthropic"
+        async with PoolSlot(get_pool(), slot_label):
+            async with httpx.AsyncClient(timeout=self._cfg.get("timeout_seconds", 600)) as client:
+                resp = await client.post(
+                    self._anthropic_url,
+                    headers={
+                        "x-api-key": self._cfg["api_key"],
+                        "anthropic-version": "2023-06-01",
+                        "Content-Type": "application/json",
+                    },
+                    json=body,
+                )
+        data = _safe_response_payload(resp)
+        if resp.status_code != 200:
+            raise _http_error("GLM-anthropic", resp)
+        # Anthropic format: data.content[0].text
+        content = data.get("content", [])
+        if isinstance(content, list) and content:
+            text = content[0].get("text", "")
+        else:
+            text = str(content)
+        text = _normalize_content(text, json_mode=json_mode)
+        if not text:
+            raise RuntimeError(f"GLM-anthropic empty response: {json.dumps(data)[:300]}")
+        return text
+
+    async def _call_openai(
+        self, system: str, prompt: str, *,
+        json_mode: bool, label: str, web_search: bool = False,
+    ) -> str:
+        """Call via OpenAI-compatible endpoint (needed for web search tools)."""
+        body: dict = {
+            "model": self._cfg.get("model", "GLM-5.1"),
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+            "max_tokens": self._cfg.get("max_tokens", 32768),
+            "temperature": self._cfg.get("temperature", 0.7),
+        }
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
+        if web_search:
+            body["tools"] = [{"type": "web_search", "web_search": {"enable": True}}]
+        slot_label = f"GLM-openai/{label}" if label else "GLM-openai"
+        async with PoolSlot(get_pool(), slot_label):
+            async with httpx.AsyncClient(timeout=self._cfg.get("timeout_seconds", 600)) as client:
+                resp = await client.post(
+                    self._openai_url,
+                    headers={"Authorization": f"Bearer {self._cfg['api_key']}", "Content-Type": "application/json"},
+                    json=body,
+                )
+        data = _safe_response_payload(resp)
+        if resp.status_code != 200:
+            raise _http_error("GLM-openai", resp)
+        text = _normalize_content(data["choices"][0]["message"]["content"], json_mode=json_mode)
+        if not text:
+            raise RuntimeError(f"GLM-openai empty response: {json.dumps(data)[:300]}")
+        return text
+
+    async def __call__(
+        self, system: str, prompt: str, *,
+        json_mode: bool = False, label: str = "", web_search: bool = False,
+    ) -> str:
+        # Web search requires OpenAI-compat endpoint (anthropic doesn't support tools)
+        if web_search:
+            return await self._call_openai(
+                system, prompt, json_mode=json_mode, label=label, web_search=True,
+            )
+        # Normal calls: prefer anthropic endpoint (reliable)
+        if self._use_anthropic:
+            return await self._call_anthropic(
+                system, prompt, json_mode=json_mode, label=label,
+            )
+        return await self._call_openai(
+            system, prompt, json_mode=json_mode, label=label,
+        )
+
+
+# ChatServiceCaller (the sibling project's gallery /api/agent/query HTTP
+# relay) was removed for saddle. The Claude surface is now
+# ClaudeAgentCaller, which drives the Agent SDK directly
+# (saddle.llm.claude_agent) — there is no gallery process to POST to.
+# See _build_claude_agent below.
+
+
+# Artifact-name markers (matched as substrings of the call label
+# `{caller_label}:{artifact_name}:attempt{n}`) for the high-volume, schema-
+# bounded content_pack enumeration phases where MiniMax CoT adds latency, not
+# quality. MiniMax thinking is suppressed for these and kept ON elsewhere
+# (creative_design_board / design_record / doctrine / mechanic_graph / world
+# content are low-volume + reasoning-critical).
+_MINIMAX_THINKING_OFF_MARKERS: tuple[str, ...] = (
+    "redesign_class_identity",
+    "redesign_composition",
+    "redesign_naming",
+)
+
+
+class MiniMaxCaller:
+    # Concurrent-request admission cap — max in-flight calls to this
+    # provider AT ONCE before the IntentRouter routes new calls
+    # elsewhere. Proactive admission control: prevents the 20-parallel-
+    # call burst that 429-cascaded Kimi on 2026-05-13.
+    #
+    # MiniMax: the dynamic per-provider limiter (llm_pool._DynamicLimiter) uses
+    # this as the FLOOR and self-tunes UP toward the empirical 429 onset
+    # (~45 concurrent — measured from the crash runs, 2026-06-20). 36 = ~80% of
+    # the lowest observed onset (45), a strong safe floor; config override
+    # (providers.minimax.concurrent_request_cap) / RAYXI_MINIMAX_CONCURRENT_CAP
+    # still win. The 429 limit is really tokens/minute, so the dynamic cap +
+    # 429-latch handle sustained-rate throttling above this floor.
+    concurrent_request_cap: int = 36
+
+    def __init__(self, cfg: dict) -> None:
+        self._cfg = cfg
+        # Per-instance admission cap override. MiniMax's token PLAN carries a
+        # per-minute token rate limit (429 "Token Plan rate limit reached
+        # (2062)") that a 20-concurrent burst of large content_pack calls
+        # blows through — and with minimax the sole content_pack provider
+        # (deepseek out of credit), there's nothing to fail over to, so the
+        # build hard-fails. Pace the burst by lowering the cap. Config
+        # (`providers.minimax.concurrent_request_cap`) or env
+        # (RAYXI_MINIMAX_CONCURRENT_CAP) overrides the class default; a
+        # lower cap trades build wall-clock for staying under the plan.
+        _cap_override = cfg.get("concurrent_request_cap")
+        if _cap_override is None:
+            _env_cap = _first_env("RAYXI_MINIMAX_CONCURRENT_CAP")
+            _cap_override = _env_cap if _env_cap else None
+        if _cap_override is not None:
+            try:
+                self.concurrent_request_cap = max(1, int(_cap_override))
+            except (TypeError, ValueError):
+                pass
+
+    async def _call_streaming(
+        self,
+        client: httpx.AsyncClient,
+        body: dict,
+        *,
+        label: str,
+        json_mode: bool,
+    ) -> str:
+        content_parts: list[str] = []
+        chunk_count = 0
+        thinking_chunk_count = 0
+        saw_done = False
+
+        async with client.stream(
+            "POST",
+            self._cfg["api_base_url"],
+            headers={"Authorization": f"Bearer {self._cfg['api_key']}", "Content-Type": "application/json"},
+            json=body,
+        ) as resp:
+            if resp.status_code != 200:
+                body_text = (await resp.aread()).decode("utf-8", errors="replace")
+                raise RuntimeError(f"MiniMax error {resp.status_code}: {body_text[:500]}")
+
+            async for raw_line in resp.aiter_lines():
+                line = (raw_line or "").strip()
+                if not line or line.startswith(":"):
+                    continue
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if not line:
+                    continue
+                if line == "[DONE]":
+                    saw_done = True
+                    break
+                try:
+                    frame = json.loads(line)
+                except json.JSONDecodeError:
+                    _log.debug("MiniMax stream non-JSON frame for %s: %s", label or "request", line[:160])
+                    continue
+
+                choices = frame.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0] if isinstance(choices[0], dict) else {}
+                delta = choice.get("delta") or {}
+                message = choice.get("message") or {}
+                piece = (
+                    delta.get("content")
+                    or message.get("content")
+                    or delta.get("reasoning_content")
+                    or message.get("reasoning_content")
+                    or ""
+                )
+                if not isinstance(piece, str) or not piece:
+                    continue
+                chunk_count += 1
+                if "<think" in piece.lower() or thinking_chunk_count and "</think>" not in piece.lower():
+                    thinking_chunk_count += 1
+                content_parts.append(piece)
+                if chunk_count == 1:
+                    _log.info("MiniMax stream started for %s", label or "request")
+
+        text = "".join(content_parts)
+        _log.info(
+            "MiniMax stream finished for %s: chunks=%d thinking_chunks=%d done=%s",
+            label or "request", chunk_count, thinking_chunk_count, saw_done,
+        )
+        return _normalize_content(text, json_mode=json_mode)
+
+    async def __call__(self, system: str, prompt: str, *, json_mode: bool = False, label: str = "") -> str:
+        body: dict = {
+            "model": self._cfg["model"],
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+            "max_tokens": self._cfg.get("max_tokens", 32768),
+            "temperature": self._cfg.get("temperature", 0.7),
+        }
+        # MiniMax-M3 is a reasoning model: it emits <think>…</think> before the
+        # answer (stripped downstream), and GENERATING the CoT is what made
+        # content_pack calls take 40-72s and, under sustained load, drove the
+        # immediate-reject failures that excluded minimax from the chain. But
+        # CoT is QUALITY-CRITICAL for the low-volume creative/design phases —
+        # suppressing it globally collapsed the creative_design_board (its
+        # invented_role_identity gate failed on un-reasoned candidates). So
+        # suppress thinking ONLY for the high-volume, schema-bounded content_pack
+        # enumeration (per-class / per-ability / per-name — ~200 calls/build,
+        # where CoT adds latency not quality); keep it ON everywhere else.
+        # Only `thinking: {type: disabled}` actually stops generation (other
+        # vendor flags were ignored — tested live). cfg.thinking forces a value.
+        _thinking = self._cfg.get("thinking")
+        if _thinking is None and any(
+            m in (label or "") for m in _MINIMAX_THINKING_OFF_MARKERS
+        ):
+            _thinking = {"type": "disabled"}
+        if _thinking is not None:
+            body["thinking"] = _thinking
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
+        use_stream = bool(self._cfg.get("stream", False))
+        if use_stream:
+            body["stream"] = True
+
+        last_exc: Exception | None = None
+        # 2 retries max — per project rule "every LLM retry is a bug",
+        # empty/malformed responses should surface the contract gap fast.
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=self._cfg.get("timeout_seconds", 600)) as client:
+                    if use_stream:
+                        text = await self._call_streaming(client, body, label=label, json_mode=json_mode)
+                        if not text:
+                            last_exc = RuntimeError("MiniMax empty streaming response after wrapper-strip")
+                            if attempt < 1:
+                                wait = 2 ** attempt
+                                _category = categorize_retry(raw_response="")
+                                _log.warning(
+                                    "MiniMax empty streaming response for %s "
+                                    "— retry %d in %ds [retry_category=%s]",
+                                    label or "request", attempt + 1, wait,
+                                    _category,
+                                )
+                                await asyncio.sleep(wait)
+                                continue
+                            raise last_exc
+                        return text
+                    resp = await client.post(
+                        self._cfg["api_base_url"],
+                        headers={"Authorization": f"Bearer {self._cfg['api_key']}", "Content-Type": "application/json"},
+                        json=body,
+                    )
+                if resp.status_code == 529 or resp.status_code == 500:
+                    # iter10: detect permanent token-plan errors and bail
+                    # immediately — retrying a "your current token plan not
+                    # support model X" 4 times with 1+2+4+8s backoff is 15s
+                    # of pure waste that compounds across ~70 calls per
+                    # pipeline run (~17 min lost per attempt).
+                    body_text = (resp.text or "")[:500]
+                    permanent_markers = (
+                        "token plan not support",
+                        "model not support",
+                        "model not found",
+                        "invalid model",
+                    )
+                    if any(marker in body_text for marker in permanent_markers):
+                        _log.warning(
+                            "MiniMax %d for %s — permanent error, no retry: %s",
+                            resp.status_code, label or "request", body_text[:200],
+                        )
+                        raise _http_error("MiniMax", resp)
+                    wait = 2 ** attempt  # 1, 2, 4, 8 seconds
+                    # 529/500 → provider_outage (or rate_limit if body
+                    # text mentions throttling). categorize_retry reads
+                    # both signals so the surfacing is accurate.
+                    _category = categorize_retry(
+                        status_code=resp.status_code,
+                        raw_response=body_text,
+                    )
+                    if not _retry_same_provider(_category):
+                        # Throttle dressed as a 5xx — a quota won't reset
+                        # in the backoff window. Fail over to another
+                        # provider instead of retrying this one.
+                        _log.warning(
+                            "MiniMax %d for %s — rate-limited, no in-provider "
+                            "retry, failing over [retry_category=%s]",
+                            resp.status_code, label or "request", _category,
+                        )
+                        raise _http_error("MiniMax", resp)
+                    _log.warning(
+                        "MiniMax %d for %s — retry %d in %ds "
+                        "[retry_category=%s]",
+                        resp.status_code, label or "request",
+                        attempt + 1, wait, _category,
+                    )
+                    last_exc = _http_error("MiniMax", resp)
+                    await asyncio.sleep(wait)
+                    continue
+                data = _safe_response_payload(resp)
+                if resp.status_code != 200:
+                    raise _http_error("MiniMax", resp)
+                choices = data.get("choices")
+                if not choices or not choices[0].get("message", {}).get("content"):
+                    last_exc = RuntimeError(f"MiniMax empty response: {json.dumps(data)[:300]}")
+                    if attempt < 1:
+                        wait = 2 ** attempt
+                        _category = categorize_retry(raw_response="")
+                        _log.warning(
+                            "MiniMax empty response for %s — retry %d "
+                            "in %ds [retry_category=%s]",
+                            label or "request", attempt + 1, wait,
+                            _category,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+                    raise last_exc
+                text = _normalize_content(choices[0]["message"]["content"], json_mode=json_mode)
+                if not text:
+                    last_exc = RuntimeError("MiniMax empty response after think-strip")
+                    if attempt < 1:
+                        wait = 2 ** attempt
+                        _category = categorize_retry(raw_response="")
+                        _log.warning(
+                            "MiniMax empty response after wrapper-strip "
+                            "for %s — retry %d in %ds [retry_category=%s]",
+                            label or "request", attempt + 1, wait,
+                            _category,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+                    raise last_exc
+                return text
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                last_exc = exc
+                if attempt < 1:
+                    wait = 2 ** attempt
+                    _category = categorize_retry(exception=exc)
+                    _log.warning(
+                        "MiniMax transport error for %s — retry %d in %ds "
+                        "[retry_category=%s]",
+                        label or "request", attempt + 1, wait, _category,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                raise
+        raise RuntimeError(f"MiniMax failed after 2 attempts: {last_exc}")
+
+
+def _resolve_kimi_config(providers: dict) -> dict | None:
+    for name in ("kimi", "kimik"):
+        cfg = providers.get(name)
+        if isinstance(cfg, dict) and cfg.get("api_key"):
+            fixed = dict(cfg)
+            if not fixed.get("api_base_url"):
+                fixed["api_base_url"] = _KIMI_DEFAULT_API_BASE_URL
+            if not fixed.get("model"):
+                fixed["model"] = _KIMI_DEFAULT_MODEL
+            return fixed
+
+    env_key = _first_env(
+        "RAYXI_KIMIK_API_KEY",
+        "KIMIK_API_KEY",
+        "RAYXI_KIMI_API_KEY",
+        "KIMI_API_KEY",
+        "MOONSHOT_API_KEY",
+    )
+    if env_key:
+        return {
+            "api_key": env_key,
+            "api_base_url": _KIMI_DEFAULT_API_BASE_URL,
+            "model": _KIMI_DEFAULT_MODEL,
+        }
+
+    # Kimi Code keys are sometimes stored under older "moonshot" config
+    # names. They authenticate against api.kimi.com, not api.moonshot.ai.
+    cfg = providers.get("moonshot")
+    if isinstance(cfg, dict) and str(cfg.get("api_key", "")).startswith("sk-kimi"):
+        fixed = dict(cfg)
+        base = str(fixed.get("api_base_url", "")).lower()
+        if "moonshot.ai" in base or not base:
+            fixed["api_base_url"] = _KIMI_DEFAULT_API_BASE_URL
+        if not fixed.get("model"):
+            fixed["model"] = _KIMI_DEFAULT_MODEL
+        return fixed
+    return None
+
+
+class KimiCaller:
+    # Concurrent-request admission cap — see MiniMaxCaller for the
+    # full design comment. Kimi's measured ceiling is ~5 req/sec
+    # safe burst before 429s land (inferred from the 2026-05-13
+    # cascade where 20 parallel calls all 429'd within 0.16s).
+    # Reserved for JSON-gen / coding / design intents where its
+    # quality edge is worth the lower throughput. Bulk-burst phases
+    # fall through to MiniMax (cap=20) automatically when this cap
+    # saturates.
+    concurrent_request_cap: int = 5
+
+    def __init__(self, cfg: dict | None = None) -> None:
+        self._cfg = cfg or {}
+        self._api_key = str(self._cfg.get("api_key", "")).strip() or None
+        base = str(self._cfg.get("api_base_url", _KIMI_DEFAULT_API_BASE_URL)).rstrip("/")
+        self._url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+
+    async def __call__(self, system: str, prompt: str, *, json_mode: bool = False, label: str = "") -> str:
+        token = self._api_key or _get_kimi_token()
+        body: dict = {
+            "model": self._cfg.get("model") or _KIMI_DEFAULT_MODEL,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+            "max_tokens": self._cfg.get("max_tokens", 32768),
+            "temperature": self._cfg.get("temperature", 0.7),
+        }
+        # Thinking-mode toggle. kimi-for-coding ships with extended
+        # thinking ON by default — single calls land at 25-130s because
+        # the model dumps a long internal monologue before producing
+        # the output the pipeline actually parses. The thinking is rarely
+        # load-bearing for our structured-JSON contracts; turning it off
+        # gets us back to deepseek-flash latency territory while
+        # keeping kimi's qualitative advantage on the structural
+        # validators (kit_size enums, role_primary_stat lookups, etc.).
+        # Override via cfg["enable_thinking"]=true for the (rare) case
+        # where a phase actually wants the deeper reasoning pass.
+        enable_thinking = self._cfg.get("enable_thinking", False)
+        body["enable_thinking"] = bool(enable_thinking)
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
+        slot_label = f"Kimi/{label}" if label else "Kimi"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "claude-code/2.0",
+        }
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=self._cfg.get("timeout_seconds", 1800)) as client:
+                    resp = await client.post(
+                        self._url,
+                        headers=headers,
+                        json=body,
+                    )
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                last_exc = exc
+                if attempt == 2:
+                    raise
+                # Categorize: timeout vs transport error (could be
+                # rate limit body inside the exception text).
+                _category = categorize_retry(exception=exc)
+                _log.warning(
+                    "KimiCaller transport failure for %s on attempt %d — "
+                    "retrying [retry_category=%s]",
+                    label or "request",
+                    attempt + 1,
+                    _category,
+                )
+                await asyncio.sleep(1.5)
+                continue
+
+            if resp.status_code != 200:
+                last_exc = _http_error("Kimi", resp)
+                # Categorize by status: 429 → rate_limit, 5xx →
+                # outage, 408/413/414 → timeout/input_too_large.
+                _category = categorize_retry(
+                    status_code=resp.status_code,
+                    raw_response=getattr(resp, "text", "") or "",
+                )
+                if (
+                    attempt < 2
+                    and _is_retryable_status(resp.status_code)
+                    and _retry_same_provider(_category)
+                ):
+                    _log.warning(
+                        "KimiCaller HTTP %d for %s on attempt %d — "
+                        "retrying [retry_category=%s]",
+                        resp.status_code,
+                        label or "request",
+                        attempt + 1,
+                        _category,
+                    )
+                    await asyncio.sleep(1.5)
+                    continue
+                # Rate-limited (or non-retryable): raise now so the
+                # fallback/race chain routes to a different provider — a
+                # quota won't reset in the 1.5s an in-provider retry waits.
+                if _category == "external_rate_limit":
+                    _log.warning(
+                        "KimiCaller HTTP %d for %s — rate-limited, no "
+                        "in-provider retry, failing over [retry_category=%s]",
+                        resp.status_code, label or "request", _category,
+                    )
+                raise last_exc
+
+            data = _safe_response_payload(resp)
+            choices = data.get("choices")
+            if not choices or not choices[0].get("message", {}).get("content"):
+                last_exc = RuntimeError(f"Kimi empty response: {json.dumps(data)[:300]}")
+                if attempt < 2:
+                    # Provider returned 200 but no content → empty_response.
+                    _category = categorize_retry(raw_response="")
+                    _log.warning(
+                        "KimiCaller empty response for %s on attempt %d "
+                        "— retrying [retry_category=%s]",
+                        label or "request",
+                        attempt + 1,
+                        _category,
+                    )
+                    await asyncio.sleep(1.5)
+                    continue
+                raise last_exc
+            text = _normalize_content(choices[0]["message"]["content"], json_mode=json_mode)
+            if not text:
+                last_exc = RuntimeError(f"Kimi empty response: {json.dumps(data)[:300]}")
+                if attempt < 2:
+                    _category = categorize_retry(raw_response="")
+                    _log.warning(
+                        "KimiCaller blank normalized response for %s on "
+                        "attempt %d — retrying [retry_category=%s]",
+                        label or "request",
+                        attempt + 1,
+                        _category,
+                    )
+                    await asyncio.sleep(1.5)
+                    continue
+                raise last_exc
+            return text
+
+        raise RuntimeError(f"Kimi request failed after retries: {last_exc}")
+
+
+class DeepSeekCaller:
+    """DeepSeek-V4 caller — uses Anthropic-compatible endpoint at
+    api.deepseek.com/anthropic.
+
+    Same Messages-API shape as Anthropic / GLM-anthropic / KimiCaller:
+    POST /v1/messages with x-api-key header.  When Anthropic-format
+    is unavailable, falls back to OpenAI-compat at /chat/completions
+    (same pattern as GlmCaller).
+    """
+
+    # Concurrent-request admission cap — see MiniMaxCaller for the
+    # full design comment. DeepSeek Flash has moderate published rpm;
+    # tuned to 10 in-flight, well below typical paid-tier quotas.
+    # Pro mode (reasoning_heavy intent only) uses the same class so
+    # the cap covers both — pro calls are rare enough this cap
+    # functions effectively as a flash-burst cap.
+    concurrent_request_cap: int = 10
+
+    def __init__(self, cfg: dict) -> None:
+        self._cfg = cfg
+        base = cfg.get("api_base_url", "https://api.deepseek.com/anthropic").rstrip("/")
+        if base.endswith("/anthropic"):
+            self._anthropic_url = f"{base}/v1/messages"
+            self._openai_url = "https://api.deepseek.com/v1/chat/completions"
+            self._use_anthropic = True
+        elif base.endswith("/v1/messages"):
+            self._anthropic_url = base
+            self._openai_url = "https://api.deepseek.com/v1/chat/completions"
+            self._use_anthropic = True
+        elif base.endswith("/chat/completions"):
+            self._anthropic_url = None
+            self._openai_url = base
+            self._use_anthropic = False
+        else:
+            self._anthropic_url = None
+            self._openai_url = f"{base}/chat/completions"
+            self._use_anthropic = False
+
+    async def _call_anthropic(
+        self, system: str, prompt: str, *, json_mode: bool, label: str,
+    ) -> str:
+        body: dict = {
+            "model": self._cfg.get("model", "DeepSeek-V4-Pro"),
+            "system": system,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self._cfg.get("max_tokens", 32768),
+            "temperature": self._cfg.get("temperature", 0.7),
+            # Thinking off. DeepSeek rejects the combo of
+            # thinking={"type":"disabled"} + output_config.effort on
+            # both Anthropic-compat AND OpenAI-compat endpoints
+            # (effort is a thinking-mode-only parameter per provider
+            # design — internally the Anthropic endpoint maps
+            # output_config.effort to reasoning_effort and validates
+            # the same constraint). Keeping thinking off so the
+            # streaming response is the structured-output payload
+            # only; effort knob omitted because it can't coexist with
+            # disabled thinking.
+            "thinking": {"type": "disabled"},
+        }
+        slot_label = f"DeepSeek-anthropic/{label}" if label else "DeepSeek-anthropic"
+        async with PoolSlot(get_pool(), slot_label):
+            async with httpx.AsyncClient(timeout=self._cfg.get("timeout_seconds", 600)) as client:
+                resp = await client.post(
+                    self._anthropic_url,
+                    headers={
+                        "x-api-key": self._cfg["api_key"],
+                        "anthropic-version": "2023-06-01",
+                        "Content-Type": "application/json",
+                    },
+                    json=body,
+                )
+        data = _safe_response_payload(resp)
+        if resp.status_code != 200:
+            raise _http_error("DeepSeek-anthropic", resp)
+        # DeepSeek's Anthropic endpoint returns interleaved thinking +
+        # text blocks: [{"type":"thinking","thinking":"..."}, {"type":"text","text":"..."}].
+        # Find the first text block (or concatenate all of them).
+        content = data.get("content", [])
+        text = ""
+        if isinstance(content, list):
+            text_parts = [
+                blk.get("text", "")
+                for blk in content
+                if isinstance(blk, dict) and blk.get("type") == "text"
+            ]
+            text = "".join(text_parts)
+            if not text:
+                # Fallback: some providers put the answer in "thinking"
+                # when no text block was emitted.
+                think_parts = [
+                    blk.get("thinking", "")
+                    for blk in content
+                    if isinstance(blk, dict) and blk.get("type") == "thinking"
+                ]
+                text = "".join(think_parts)
+        elif content:
+            text = str(content)
+        text = _normalize_content(text, json_mode=json_mode)
+        if not text:
+            raise RuntimeError(f"DeepSeek-anthropic empty response: {json.dumps(data)[:300]}")
+        return text
+
+    async def _call_openai(
+        self, system: str, prompt: str, *, json_mode: bool, label: str,
+    ) -> str:
+        body: dict = {
+            "model": self._cfg.get("model", "DeepSeek-V4-Pro"),
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+            "max_tokens": self._cfg.get("max_tokens", 32768),
+            "temperature": self._cfg.get("temperature", 0.7),
+            # Thinking off — see _call_anthropic for the rationale.
+            # reasoning_effort omitted because DeepSeek rejects it
+            # alongside thinking={"type":"disabled"}.
+            "thinking": {"type": "disabled"},
+        }
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
+        slot_label = f"DeepSeek-openai/{label}" if label else "DeepSeek-openai"
+        async with PoolSlot(get_pool(), slot_label):
+            async with httpx.AsyncClient(timeout=self._cfg.get("timeout_seconds", 600)) as client:
+                resp = await client.post(
+                    self._openai_url,
+                    headers={"Authorization": f"Bearer {self._cfg['api_key']}", "Content-Type": "application/json"},
+                    json=body,
+                )
+        data = _safe_response_payload(resp)
+        if resp.status_code != 200:
+            raise _http_error("DeepSeek-openai", resp)
+        text = _normalize_content(data["choices"][0]["message"]["content"], json_mode=json_mode)
+        if not text:
+            raise RuntimeError(f"DeepSeek-openai empty response: {json.dumps(data)[:300]}")
+        return text
+
+    async def __call__(
+        self, system: str, prompt: str, *, json_mode: bool = False, label: str = "",
+    ) -> str:
+        # Always use the Anthropic-compatible endpoint. DeepSeek's
+        # OpenAI-compat endpoint rejects the (thinking={"type":"disabled"}
+        # + reasoning_effort="max") combo we want for max-quality
+        # structured output, while the Anthropic endpoint accepts both
+        # together. OpenAI-compat is kept as a fallback only when the
+        # Anthropic endpoint is unavailable.
+        if self._use_anthropic and self._anthropic_url:
+            try:
+                return await self._call_anthropic(system, prompt, json_mode=json_mode, label=label)
+            except Exception as exc:
+                _log.warning(
+                    "DeepSeek-anthropic failed (%s), falling back to OpenAI endpoint",
+                    str(exc)[:120],
+                )
+        return await self._call_openai(system, prompt, json_mode=json_mode, label=label)
+
+
+class FallbackCaller:
+    def __init__(self, callers: list) -> None:
+        self._callers = callers
+
+    async def __call__(self, system: str, prompt: str, *, json_mode: bool = False, label: str = "") -> str:
+        last_exc: Exception | None = None
+        for caller in self._callers:
+            try:
+                return await _call_with_provider_deadline(
+                    caller,
+                    system,
+                    prompt,
+                    json_mode=json_mode,
+                    label=label,
+                )
+            except Exception as exc:
+                err_str = str(exc).lower()
+                is_transient = any(p in err_str for p in (
+                    "rate limit", "usage limit", "quota", "insufficient balance",
+                    "1302", "1234", "1113", "403", "429", "529", "500", "502", "503",
+                    "overloaded", "empty response", "timeout",
+                    # Provider-side safety classifiers can false-positive on
+                    # benign game-combat prompts. Treat them as provider
+                    # routing failures so the pipeline can try the next
+                    # configured model instead of aborting the whole run.
+                    "content_filter", "content filter", "high risk",
+                    "request was rejected",
+                ))
+                if is_transient or "timeout" in type(exc).__name__.lower():
+                    _log.warning("FallbackCaller: %s failed (%s), trying next…", type(caller).__name__, str(exc)[:120])
+                    last_exc = exc
+                else:
+                    raise
+        raise RuntimeError(f"All callers failed. Last error: {last_exc}")
+
+
+class RaceCaller:
+    """Fires every racer concurrently and returns the FIRST successful response.
+    Loser requests are cancelled the moment the winner resolves. Failures from
+    an early-returning racer don't abort — the caller keeps waiting on the
+    other racers until one succeeds or all fail.
+
+    Context: sequential FallbackCaller makes every call pay the primary's
+    full latency + retry window before trying the secondary. With MiniMax
+    running 200-600s for a 30KB content_pack prompt and occasional
+    transport stalls, that single-provider latency dominates wall time.
+    Racing MiniMax + Kimi in parallel halves expected latency (whichever
+    is faster wins) AND hides per-provider transient failures (the slow/
+    failing one is ignored if the other succeeds first).
+    """
+
+    def __init__(self, racers: list) -> None:
+        if not racers:
+            raise ValueError("RaceCaller requires at least one racer")
+        self._racers = list(racers)
+
+    async def __call__(self, system: str, prompt: str, *, json_mode: bool = False, label: str = "") -> str:
+        tasks: list[asyncio.Task] = [
+            asyncio.create_task(_call_with_provider_deadline(
+                racer,
+                system,
+                prompt,
+                json_mode=json_mode,
+                label=label,
+            ))
+            for racer in self._racers
+        ]
+        errors: list[Exception] = []
+        try:
+            pending = set(tasks)
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    exc = task.exception()
+                    if exc is None:
+                        result = task.result()
+                        if json_mode:
+                            try:
+                                parsed = json.loads(result)
+                            except Exception as parse_exc:
+                                errors.append(RuntimeError(
+                                    "RaceCaller json_mode rejected non-JSON racer response: "
+                                    f"{parse_exc}"
+                                ))
+                                _log.warning(
+                                    "RaceCaller: racer returned non-JSON in json_mode, "
+                                    "waiting on %d other(s)…",
+                                    len(pending),
+                                )
+                                continue
+                            if not isinstance(parsed, dict):
+                                errors.append(RuntimeError(
+                                    "RaceCaller json_mode expected top-level JSON object, got "
+                                    f"{type(parsed).__name__}"
+                                ))
+                                _log.warning(
+                                    "RaceCaller: racer returned top-level %s in json_mode, "
+                                    "waiting on %d other(s)…",
+                                    type(parsed).__name__,
+                                    len(pending),
+                                )
+                                continue
+                        # Winner — cancel every loser and return the result.
+                        for loser in pending:
+                            loser.cancel()
+                        return result
+                    errors.append(exc)
+                    _log.warning(
+                        "RaceCaller: racer failed (%s), waiting on %d other(s)…",
+                        str(exc)[:120], len(pending),
+                    )
+            # Every racer failed.
+            last = errors[-1] if errors else RuntimeError("no racers returned")
+            raise RuntimeError(
+                f"RaceCaller: all {len(self._racers)} racer(s) failed. Last error: {last}"
+            )
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+
+# ---------------------------------------------------------------------------
+# Caller routing — maps call types to the right LLM
+# ---------------------------------------------------------------------------
+
+# Named priority list — single source of truth for both
+# `build_callers` (FallbackCaller chain assembly) and `LLMPool`
+# (intent-based provider rotation).  iter 13 (2026-05-02): MiniMax came
+# back online (plan re-bought) and DeepSeek added a flash variant
+# (deepseek-v4-flash, ~4x faster than -pro).  New active chain orders
+# providers by observed single-call latency from the post-restore
+# probes: minimax 1.3s < deepseek_flash 1.5s < kimi 2.3s.  DeepSeek-Pro
+# stays registered but is opt-in only (intent="reasoning_heavy" or
+# explicit provider="deepseek_pro" — not in the rotation chain).
+# GLM remains dropped at user request.
+# ---------------------------------------------------------------------------
+# Caller registry + active priority
+#
+# Two structures, separated by purpose:
+#
+#   ALL_CALLERS — the full registry. Every caller this codebase knows
+#   about gets a factory entry here. Add a new provider by adding a
+#   factory; the registry stays the source-of-truth list.
+#
+#   ACTIVE_PRIORITY — the active rotation for the default fallback +
+#   race chains. Edit this list to change the order without touching
+#   any factory. Names must exist in ALL_CALLERS (or be skipped at
+#   build time if the caller couldn't be constructed). LEFTMOST WINS.
+#
+# Cron history: provider order has changed multiple times as plans
+# came/went online (MiniMax billing limit → DeepSeek primary →
+# MiniMax restored). Splitting registry from order means each rotation
+# is a one-line edit to ACTIVE_PRIORITY.
+# ---------------------------------------------------------------------------
+
+# Factory registry — name → builder fn that returns an LLMCaller or
+# None if the caller can't be constructed (no creds, no config). The
+# build_callers loop calls each factory; failures are silent (the
+# caller just doesn't get registered, ACTIVE_PRIORITY skips it).
+def _build_claude_agent(providers: dict) -> LLMCaller | None:
+    # claude_agent: Claude via the Agent SDK (local `claude` CLI,
+    # subscription auth — no api key). Saddle's LEAD provider and the
+    # same engine as the interactive chat. Registered ONLY when the SDK
+    # is importable: on a host without `claude_agent_sdk` installed the
+    # caller would raise ModuleNotFoundError at call time and abort the
+    # whole fallback chain. Gate it at construction instead — the same
+    # "factory returns None when the caller can't be built" contract the
+    # cred-less providers use — so the chain falls through to the next
+    # priority entry (e.g. minimax) on SDK-less hosts.
+    import importlib.util
+    if importlib.util.find_spec("claude_agent_sdk") is None:
+        _log.info(
+            "claude_agent: claude_agent_sdk not installed — provider skipped"
+        )
+        return None
+    from .claude_agent import ClaudeAgentCaller
+    return ClaudeAgentCaller(providers.get("claude_agent") or {})
+
+
+def _build_kimi(providers: dict) -> LLMCaller | None:
+    cfg = _resolve_kimi_config(providers)
+    if cfg is None and not _KIMI_CRED_PATH.exists():
+        return None
+    return KimiCaller(cfg)
+
+
+def _deepseek_config(providers: dict, *names: str) -> dict | None:
+    for name in names:
+        cfg = providers.get(name)
+        if cfg:
+            return dict(cfg)
+    env_names: list[str] = []
+    if "deepseek_flash" in names:
+        env_names.extend(["RAYXI_DEEPSEEK_FLASH_API_KEY", "DEEPSEEK_FLASH_API_KEY"])
+    if "deepseek_pro" in names:
+        env_names.extend(["RAYXI_DEEPSEEK_PRO_API_KEY", "DEEPSEEK_PRO_API_KEY"])
+    env_names.extend(["RAYXI_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"])
+    api_key = _first_env(*env_names)
+    if api_key:
+        return {"api_key": api_key}
+    return None
+
+
+def _build_deepseek_pro(providers: dict) -> LLMCaller | None:
+    cfg = _deepseek_config(providers, "deepseek_pro", "deepseek")
+    if cfg is None:
+        return None
+    if not cfg.get("api_base_url"):
+        cfg["api_base_url"] = _DEEPSEEK_DEFAULT_API_BASE_URL
+    if not cfg.get("model"):
+        cfg["model"] = _DEEPSEEK_PRO_DEFAULT_MODEL
+    caller = DeepSeekCaller(cfg)
+    caller.concurrent_request_cap = 10  # pro: lower cap (operator dir)
+    return caller
+
+
+def _build_deepseek_flash(providers: dict) -> LLMCaller | None:
+    cfg = _deepseek_config(providers, "deepseek_flash")
+    if cfg is None:
+        cfg = _deepseek_config(providers, "deepseek", "deepseek_pro")
+        if cfg is None:
+            return None
+        cfg["model"] = cfg.get("flash_model") or _DEEPSEEK_FLASH_DEFAULT_MODEL
+    if not cfg.get("api_base_url"):
+        cfg["api_base_url"] = _DEEPSEEK_DEFAULT_API_BASE_URL
+    if not cfg.get("model"):
+        cfg["model"] = _DEEPSEEK_FLASH_DEFAULT_MODEL
+    caller = DeepSeekCaller(cfg)
+    caller.concurrent_request_cap = 20  # flash: higher cap (operator dir)
+    return caller
+
+
+def _resolve_minimax_config(providers: dict) -> dict | None:
+    cfg = providers.get("minimax")
+    if cfg:
+        resolved = dict(cfg)
+    else:
+        api_key = os.environ.get("RAYXI_MINIMAX_API_KEY") or os.environ.get("MINIMAX_API_KEY")
+        if not api_key:
+            return None
+        resolved = {"api_key": api_key}
+
+    if not resolved.get("api_base_url"):
+        resolved["api_base_url"] = (
+            os.environ.get("RAYXI_MINIMAX_API_BASE_URL")
+            or _MINIMAX_DEFAULT_API_BASE_URL
+        )
+    if not resolved.get("model"):
+        resolved["model"] = os.environ.get("RAYXI_MINIMAX_MODEL") or _MINIMAX_DEFAULT_MODEL
+    resolved.setdefault("stream", True)
+    return resolved
+
+
+def _build_minimax(providers: dict) -> LLMCaller | None:
+    cfg = _resolve_minimax_config(providers)
+    if cfg is None:
+        return None
+    return MiniMaxCaller(cfg)
+
+
+def _build_glm(providers: dict) -> LLMCaller | None:
+    if "glm" not in providers:
+        return None
+    return GlmCaller(providers["glm"])
+
+
+ALL_CALLERS: dict[str, "callable"] = {
+    "claude_agent":   _build_claude_agent,
+    "deepseek":       _build_deepseek_pro,    # alias for deepseek_pro
+    "deepseek_pro":   _build_deepseek_pro,
+    "deepseek_flash": _build_deepseek_flash,
+    "minimax":        _build_minimax,
+    "kimi":           _build_kimi,
+    "glm":            _build_glm,
+}
+
+# Saddle's rotation is POLICY-DRIVEN (config/llm_policy.json -> priority),
+# not hardcoded here. Default when unset: claude_agent -> minimax ->
+# deepseek_flash (see saddle.llm.policy.active_priority). Leftmost wins.
+ACTIVE_PRIORITY: list[str] = active_priority()
+
+def build_callers(ctx: "Context | None" = None) -> dict[str, LLMCaller]:
+    """Construct the LLM caller set for a tenant/project context.
+
+    Returns a dict keyed by provider name plus a "default" fallback
+    chain and a "race" parallel chain built from the context's resolved
+    priority. Callers registered in ALL_CALLERS but absent from that
+    priority stay accessible by name (for explicit provider= overrides)
+    but don't appear in the rotation. ctx=None resolves the ambient
+    (env + cwd) context.
+    """
+    cfg = _load_config(ctx)
+    providers = cfg.get("providers", {})
+    priority = active_priority(ctx)
+    callers: dict[str, LLMCaller] = {}
+
+    # Construct every caller in the registry — silent skip on
+    # build-failure (no creds, no config). The registry order doesn't
+    # matter; ACTIVE_PRIORITY drives the chain.
+    for name, factory in ALL_CALLERS.items():
+        try:
+            caller = factory(providers)
+        except Exception as exc:
+            _log.warning("caller factory %r failed: %s", name, exc)
+            continue
+        if caller is not None:
+            callers[name] = caller
+
+    # Build the fallback chain in active-priority order; missing
+    # callers (factory returned None) drop silently.
+    #
+    # RAYXI_LLM_SKIP_PROVIDERS=name1,name2 — comma-separated provider
+    # names to EXCLUDE from the default chain. Useful on hosts where
+    # one provider's endpoint is unreachable (e.g. chat_service on
+    # aelimain) — without the skip, every LLM call pays the
+    # provider's full retry budget (~5-10s) before falling through
+    # to the next provider, ballooning pipeline wall-time. Skipped
+    # providers stay accessible by name for explicit override use.
+    _skip_raw = os.environ.get("RAYXI_LLM_SKIP_PROVIDERS", "")
+    _skip_set = {s.strip() for s in _skip_raw.split(",") if s.strip()}
+    chain = [
+        callers[name] for name in priority
+        if name in callers and name not in _skip_set
+    ]
+    if not chain:
+        raise RuntimeError(
+            "No LLM providers available. Configure at least one of: "
+            + ", ".join(priority)
+            + (f". Skipped via RAYXI_LLM_SKIP_PROVIDERS: {sorted(_skip_set)!r}" if _skip_set else "")
+        )
+    callers["default"] = FallbackCaller(chain)
+
+    # Z20: race caller — fires the active chain in parallel, returns
+    # first valid response. Used by content_pack generation where the
+    # failure rate is high enough that paying N× compute for non-
+    # determinism is worth it (cron data showed different failure
+    # modes per provider — racing gives the validator the best of N
+    # attempts).
+    callers["race"] = RaceCaller(list(chain))
+    return callers

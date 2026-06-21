@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# saddle runtime state (SQLite store defaults to ~/.saddle, but keep the
+# repo clean if SADDLE_HOME ever points inside the tree)
+*.db
+*.db-wal
+*.db-shm
+.saddle/
+
+# Secrets — API keys live in a SHARED file referenced by policy.keys_from
+# and are NEVER committed. Ignore any local key file dropped into the repo.
+config/llm_config.json
+config/tenants/**/keys*.json
+*.env
+.env
+
+# Editor / OS
+.DS_Store
+*.swp
+
+# Claude local-only settings (project-level settings.json IS tracked)
+.claude/settings.local.json

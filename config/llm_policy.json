@@ -1,0 +1,9 @@
+{
+  "keys_from": "/home/aeli/projects/rayxiv4/config/llm_config.json",
+  "priority": ["claude_agent", "minimax"],
+  "providers": {
+    "claude_agent": {"concurrent_request_cap": 4},
+    "minimax": {"concurrent_request_cap": 36}
+  },
+  "pool": {"max_procs": 24, "mem_ceiling_pct": 80, "mem_resume_pct": 70}
+}
