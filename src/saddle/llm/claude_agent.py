@@ -25,7 +25,7 @@ import logging
 import os
 from typing import TYPE_CHECKING, AsyncIterator
 
-from .json_tools import extract_json_text, strip_llm_wrappers
+from .json_tools import extract_json_text, strip_think
 from .pool import PoolSlot, get_pool
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -34,8 +34,23 @@ if TYPE_CHECKING:  # pragma: no cover
 _log = logging.getLogger("saddle.llm.claude_agent")
 
 
+# saddle's standard Agent-SDK model + effort. Opus 4.8 at xhigh effort.
+# The local `claude` CLI's --effort accepts low/medium/high/xhigh/max; the
+# Python SDK's Literal type lags (lists only up to "max") but the transport
+# passes the string straight through to the CLI, and we build options from an
+# untyped kwargs dict, so "xhigh" rides through unflagged. Both are
+# overridable per-provider (providers.claude_agent.{model,effort}) or via the
+# SADDLE_AGENT_MODEL / SADDLE_AGENT_EFFORT env vars; empty falls back here.
+_DEFAULT_MODEL = "claude-opus-4-8"
+_DEFAULT_EFFORT = "xhigh"
+
+
 def _env_model() -> str:
     return (os.environ.get("SADDLE_AGENT_MODEL", "") or "").strip()
+
+
+def _env_effort() -> str:
+    return (os.environ.get("SADDLE_AGENT_EFFORT", "") or "").strip()
 
 
 class ClaudeAgentCaller:
@@ -64,8 +79,15 @@ class ClaudeAgentCaller:
                 self.concurrent_request_cap = max(1, int(cap))
             except (TypeError, ValueError):
                 pass
-        # Empty string == "let the SDK/CLI pick its configured default".
-        self._model: str = (self._cfg.get("model") or _env_model()).strip()
+        # Resolve model + effort: explicit cfg > env var > saddle default
+        # (opus 4.8 / xhigh). Never empty — saddle pins the model rather than
+        # deferring to the CLI's configured default.
+        self._model: str = (
+            self._cfg.get("model") or _env_model() or _DEFAULT_MODEL
+        ).strip()
+        self._effort: str = (
+            self._cfg.get("effort") or _env_effort() or _DEFAULT_EFFORT
+        ).strip()
 
     def _options(self, system: str) -> "ClaudeAgentOptions":
         from claude_agent_sdk import ClaudeAgentOptions
@@ -80,6 +102,8 @@ class ClaudeAgentCaller:
             kwargs["system_prompt"] = system
         if self._model:
             kwargs["model"] = self._model
+        if self._effort:
+            kwargs["effort"] = self._effort
         return ClaudeAgentOptions(**kwargs)
 
     async def __call__(
@@ -108,10 +132,11 @@ class ClaudeAgentCaller:
                         if isinstance(block, TextBlock):
                             parts.append(block.text)
 
-        text = strip_llm_wrappers("".join(parts))
-        if json_mode:
-            text = extract_json_text(text)
-        text = text.strip()
+        joined = "".join(parts)
+        # JSON mode: scan for the committed JSON span. Prose mode: only strip
+        # <think> blocks — keep the body verbatim so an embedded code fence in a
+        # design write-up isn't truncated to its first fenced span.
+        text = (extract_json_text(joined) if json_mode else strip_think(joined)).strip()
         if not text:
             raise RuntimeError(
                 f"claude_agent empty response for {label or 'request'}"
@@ -137,12 +162,14 @@ class ChatSession:
         *,
         system_prompt: str | None = None,
         model: str | None = None,
+        effort: str | None = None,
         cwd: str | None = None,
         permission_mode: str = "bypassPermissions",
         setting_sources: list[str] | None = None,
     ) -> None:
         self._system_prompt = system_prompt
-        self._model = (model or _env_model()).strip()
+        self._model = (model or _env_model() or _DEFAULT_MODEL).strip()
+        self._effort = (effort or _env_effort() or _DEFAULT_EFFORT).strip()
         self._cwd = cwd
         self._permission_mode = permission_mode
         # Behave like Claude Code: honor the user's + project's settings,
@@ -166,6 +193,8 @@ class ChatSession:
             kwargs["system_prompt"] = self._system_prompt
         if self._model:
             kwargs["model"] = self._model
+        if self._effort:
+            kwargs["effort"] = self._effort
         if self._cwd:
             kwargs["cwd"] = self._cwd
         return ClaudeAgentOptions(**kwargs)

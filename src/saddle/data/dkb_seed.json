@@ -1,0 +1,244 @@
+{
+  "version": 1,
+  "note": "Global, pre-researched DKB seed corpus. Source=seed, scope=global. Loaded idempotently by saddle.seed. Extend offline by adding entries with new stable ids.",
+  "entries": [
+    {
+      "id": "kno_seed_root_cause",
+      "kind": "best_practice",
+      "title": "Diagnose the root cause before designing",
+      "body": "Trace every symptom to the underlying design problem and fix that cause, so the whole class of bug closes at once instead of the single instance in front of you. A fix that only addresses the surface report will let the same defect resurface elsewhere.",
+      "tags": ["diagnosis", "root-cause", "thinking"]
+    },
+    {
+      "id": "kno_seed_question_the_frame",
+      "kind": "best_practice",
+      "title": "Question whether the frame is even right",
+      "body": "Before optimizing inside an approach, ask whether the approach itself is correct: is this the right structure, the right kit, the right model of the problem? Most shallow designs come from optimizing within a frame that should have been replaced.",
+      "tags": ["reframe", "premise", "thinking", "high-level"]
+    },
+    {
+      "id": "kno_seed_structural_over_patch",
+      "kind": "best_practice",
+      "title": "Prefer a structural fix over a patch",
+      "body": "Redesign the mechanism so the failure cannot recur, rather than wrapping a guard around the symptom. Structural fixes shrink the system's defect surface; patches grow it.",
+      "tags": ["structure", "design", "no-bandaid"]
+    },
+    {
+      "id": "kno_seed_second_order",
+      "kind": "best_practice",
+      "title": "Reason about second-order effects",
+      "body": "A change that resolves the immediate issue can create downstream ones. Design for the consequences of the fix across the whole system, not just the local symptom it removes.",
+      "tags": ["second-order", "consequences", "systemic"]
+    },
+    {
+      "id": "kno_seed_single_source_of_truth",
+      "kind": "best_practice",
+      "title": "Keep a single source of truth",
+      "body": "Every fact lives in exactly one place and everything else derives from it, so values cannot drift out of sync. Duplicated state is a future inconsistency waiting to happen.",
+      "tags": ["sot", "duplication", "consistency", "abstraction"]
+    },
+    {
+      "id": "kno_seed_illegal_states",
+      "kind": "best_practice",
+      "title": "Make illegal states unrepresentable",
+      "body": "Encode invariants in the types and schema so wrong combinations cannot be constructed at all, instead of validating after the fact and hoping every call site remembers to check.",
+      "tags": ["invariants", "schema", "types", "correctness"]
+    },
+    {
+      "id": "kno_seed_general_case",
+      "kind": "best_practice",
+      "title": "Design for the general case",
+      "body": "Solve the whole class of problem (any tenant, any input, any genre), not the one example in front of you. A design that only works for the immediate instance is the wrong design.",
+      "tags": ["generality", "abstraction", "agnostic"]
+    },
+    {
+      "id": "kno_seed_fail_loud",
+      "kind": "best_practice",
+      "title": "Fail loud, never silent",
+      "body": "Surface errors where they happen with enough context to act on them. A silent fallback hides the real defect and ships a quietly worse product.",
+      "tags": ["errors", "observability", "loud-fail"]
+    },
+    {
+      "id": "kno_seed_classify_failure",
+      "kind": "best_practice",
+      "title": "Classify a failure before reacting to it",
+      "body": "Distinguish a genuine external limit (a provider rate limit) from a self-inflicted contract gap (oversized input or output, a schema or field-name mismatch) and fix the actual cause. Only a true external rate limit justifies a retry.",
+      "tags": ["llm", "retry", "failure-class", "contract"]
+    },
+    {
+      "id": "kno_seed_strategy_over_scalars",
+      "kind": "best_practice",
+      "title": "Fix the strategy before the numbers",
+      "body": "When output is weak, examine the sequence and strategy first (rotation, ordering, composition, kit), because bigger magnitudes rarely fix a broken approach. Tune scalars only once the structure is right.",
+      "tags": ["balance", "rotation", "strategy", "tuning"]
+    },
+    {
+      "id": "kno_seed_blind_retry",
+      "kind": "anti_pattern",
+      "title": "Blind retry on provider errors",
+      "body": "Retrying an LLM call on rate-limit or token-max without fixing the oversized input/output or the contract that caused it. Every retry that is not for a true external rate limit is a masked bug being papered over.",
+      "tags": ["llm", "retry", "rate-limit", "token-max"]
+    },
+    {
+      "id": "kno_seed_scalar_inflation",
+      "kind": "anti_pattern",
+      "title": "Scalar inflation instead of structural fix",
+      "body": "Multiplying all damage or values to hit a target number instead of asking whether the kit, the rotation, or the structure is what is actually wrong. It treats a design problem as an arithmetic one.",
+      "tags": ["balance", "multipliers", "shallow", "tuning"]
+    },
+    {
+      "id": "kno_seed_spam_one_action",
+      "kind": "anti_pattern",
+      "title": "Spamming one action with no rotation",
+      "body": "Repeating a single move with no rotation or strategy, optimizing one local number while the overall approach goes unexamined. The symptom of never asking whether the strategy itself is right.",
+      "tags": ["rotation", "strategy", "shallow", "gameplay"]
+    },
+    {
+      "id": "kno_seed_band_aid",
+      "kind": "anti_pattern",
+      "title": "Band-aid patch over a symptom",
+      "body": "Wrapping a guard around a symptom so it stops showing, leaving the root cause live to resurface elsewhere. Defers the real fix and adds debt that compounds.",
+      "tags": ["bandaid", "patch", "debt", "symptom"]
+    },
+    {
+      "id": "kno_seed_hard_coding",
+      "kind": "anti_pattern",
+      "title": "Hard-coding values, paths, or vocabulary",
+      "body": "Baking values, file paths, or domain-specific vocabulary into code or schema so it works for one case and breaks for the next. Derive these from config, data, or computation instead.",
+      "tags": ["hard-coding", "config", "generality"]
+    },
+    {
+      "id": "kno_seed_silent_fallback",
+      "kind": "anti_pattern",
+      "title": "Silent fallback that hides failure",
+      "body": "Swapping in a degraded or canned path on error without surfacing it, so a real defect ships looking healthy. For design generation there is no algorithmic fallback; the only fallback is another model.",
+      "tags": ["fallback", "silent", "loud-fail", "llm"]
+    },
+    {
+      "id": "kno_seed_budget_quality_away",
+      "kind": "anti_pattern",
+      "title": "Budgeting quality away for time or tokens",
+      "body": "Trading correctness for time, effort, or token savings. Shortcuts taken to fit a budget become the next bug; quality is the constraint, not the variable.",
+      "tags": ["budget", "shortcut", "quality"]
+    },
+    {
+      "id": "kno_seed_copy_paste",
+      "kind": "anti_pattern",
+      "title": "Copy-paste duplication instead of abstraction",
+      "body": "Duplicating logic across call sites instead of extracting a shared abstraction, which guarantees the copies drift apart over time. The opposite of a single source of truth.",
+      "tags": ["duplication", "abstraction", "drift"]
+    },
+    {
+      "id": "kno_seed_no_hand_waving",
+      "kind": "principle",
+      "title": "No hand-waving",
+      "body": "Every design decision is fully reasoned and concrete, with a real mechanism behind it. No vague gesture stands in for an actual design.",
+      "tags": ["principle", "rigor", "no-handwaving"]
+    },
+    {
+      "id": "kno_seed_no_band_aids",
+      "kind": "principle",
+      "title": "No band-aids",
+      "body": "Only proper, root-cause designs ship. Never a temporary patch that defers the real fix; if the proper design means rebuilding, rebuild.",
+      "tags": ["principle", "no-bandaid", "proper-fix"]
+    },
+    {
+      "id": "kno_seed_no_budgeting",
+      "kind": "principle",
+      "title": "Do not budget time, effort, or tokens against quality",
+      "body": "Quality is the binding constraint. Never compromise the design to save effort or tokens, and never include time or effort estimates in the work.",
+      "tags": ["principle", "quality", "no-budget"]
+    },
+    {
+      "id": "kno_seed_think_long_term",
+      "kind": "principle",
+      "title": "Always think long-term",
+      "body": "Design for where the system is going, not just the immediate ask. Favor choices that stay correct and clean as the system grows.",
+      "tags": ["principle", "long-term", "scalability"]
+    },
+    {
+      "id": "kno_seed_automation",
+      "kind": "principle",
+      "title": "Automate over manual steps",
+      "body": "Prefer a repeatable automated mechanism over a manual step. If something is done more than once, the harness should do it.",
+      "tags": ["principle", "automation"]
+    },
+    {
+      "id": "kno_seed_abstraction",
+      "kind": "principle",
+      "title": "Abstract recurring structure",
+      "body": "Factor recurring structure into clean, reusable abstractions instead of one-off implementations. Abstraction is how the system stays small as it grows.",
+      "tags": ["principle", "abstraction", "reuse"]
+    },
+    {
+      "id": "kno_seed_no_hard_coding",
+      "kind": "principle",
+      "title": "No hard-coding",
+      "body": "Values, paths, and vocabularies come from config, data, or derivation, never literals baked into logic. Hard-coding is how a general system silently becomes a single-case one.",
+      "tags": ["principle", "no-hard-coding", "config"]
+    },
+    {
+      "id": "kno_seed_verify_effect_not_declaration",
+      "kind": "lesson",
+      "title": "Verify effect, not declaration",
+      "body": "A gate that checks declarations, or that an artifact merely exists, will pass while the behavior is broken. A pipeline once had a system-interaction map, a requirements-traceability matrix, and a value-impact map, yet a new upgrade that lowered an ability's cooldown changed nothing on screen or in combat, because every check verified what the code DECLARED and never what it DID. Ground completeness checks in the actual dataflow (the reads, writes, and calls in the code) so they fail when an effect is missing, not only when a declaration is.",
+      "tags": ["completeness", "dataflow", "verification", "gate", "lesson"]
+    },
+    {
+      "id": "kno_seed_derived_value_one_accessor",
+      "kind": "lesson",
+      "title": "A value that varies needs one write-point and one accessor",
+      "body": "When a base value can be modified (a talent, a buff, a difficulty scalar), compute the effective value as base-combined-with-modifiers in exactly ONE accessor that every consumer reads, and land every modifier at ONE write-point. The talent-cooldown bug had both halves broken: the spent point landed where the resolver never read it, so the counter never moved, and most consumers still read the base field, so the menu, tooltip, hotbar sweep, and combat engine all ignored the change. Without a single accessor, 'make this value adjustable' silently means 'remember to adjust it in every place that reads it'.",
+      "tags": ["single-source-of-truth", "derived-value", "accessor", "propagation", "lesson"]
+    },
+    {
+      "id": "kno_seed_payload_validated_not_used",
+      "kind": "lesson",
+      "title": "A validated payload is not a used payload",
+      "body": "Validating that a message carries the right KEYS proves the schema, not that any consumer reads them. An event bus that checked payload key names still let a value travel to subscribers that never consumed it. Completeness for a piece of data means tracing it to a consumer that acts on it, not confirming it was published in the correct shape.",
+      "tags": ["events", "payload", "consumer", "dataflow", "lesson"]
+    },
+    {
+      "id": "kno_seed_map_value_level_code_derived",
+      "kind": "lesson",
+      "title": "A completeness map must be value-level, layer-complete, and code-derived",
+      "body": "A system-to-system wiring map is too coarse to catch a single value that fails to propagate; the map must track the individual DATA ELEMENT (one number, one name) across every layer it touches: visuals, engine, network, cache, storage, plus the animation, sound, and VFX timings that must rescale with it. And it must be DERIVED from the code (an AST walk), never declared, because a declaration is exactly the thing the code can silently diverge from.",
+      "tags": ["completeness-map", "value-level", "code-derived", "ast", "lesson"]
+    },
+    {
+      "id": "kno_seed_hand_over_impact_set",
+      "kind": "lesson",
+      "title": "Hand the implementer the full impact set",
+      "body": "Do not require a person to enumerate every place a change must touch; that is just coding by dictation, and they will miss a nook. Compute the impact set for a change from the map and present it, so adding or removing a feature automatically surfaces every site that must follow: the counter, the description, the UI timer, the engine, the replication, the persistence. The tool's job is to make completeness the default, not a feat of memory.",
+      "tags": ["impact-set", "change-completeness", "ergonomics", "lesson"]
+    },
+    {
+      "id": "kno_seed_instruction_is_not_enforcement",
+      "kind": "lesson",
+      "title": "A standing instruction is not enforcement",
+      "body": "Telling an assistant 'lock all the enums' or 'always use the canonical types' is a declaration of intent, and intent drifts; types and names kept slipping out of band despite many such reminders. The only thing that actually stops drift is a mechanical check that reads the code and rejects any literal used as an identity that is not in the canonical set. If a rule matters, encode it as an enforced check, not a reminder.",
+      "tags": ["enforcement", "enum-lock", "drift", "identity", "lesson"]
+    },
+    {
+      "id": "kno_seed_identities_fan_out_like_values",
+      "kind": "lesson",
+      "title": "Identities fan out like values",
+      "body": "A name, enum member, or key (a status type, an ability id, an event name) propagates through code exactly as a numeric value does and breaks the same way: it must live in ONE canonical set, be spelled only from that set, and reach every consumer. Drift hides in an `if x == \"freeze\"` comparison just as readily as in a `match` block, so the check must cover every comparison and assignment form, not just one syntax.",
+      "tags": ["identity", "enum", "canonical-set", "drift", "lesson"]
+    },
+    {
+      "id": "kno_seed_completeness_spans_domains",
+      "kind": "lesson",
+      "title": "Completeness spans every domain and substrate",
+      "body": "A change is not complete when the server is correct; the same value usually lives across the server, the client, the protocol between them, config, docs, schema, and stored data, and a fix that lands in one domain is invisible in the others. The talent change was applied server-side and never mirrored to the client, so the player saw nothing. Treat server/client (authoritative/replicated) as a first-class axis of the map, and check that an authoritative change is both replicated and read on the other side.",
+      "tags": ["server-client", "boundary", "replication", "domains", "lesson"]
+    },
+    {
+      "id": "kno_seed_static_vs_dynamic_completeness",
+      "kind": "lesson",
+      "title": "Static and dynamic substrates need different completeness",
+      "body": "Things you can read statically (server code, client code, the protocol, config, schema, docs, text and data files) need REFERENCE completeness: every site that mentions the thing is consistent. Things that hold runtime bytes (database rows, caches, live processes, save, dump, and serialized files) need MIGRATION or INVALIDATION completeness: existing data must be migrated or invalidated when the shape changes. A map that only checks source files will pass while stale saved data still carries the old value.",
+      "tags": ["static", "dynamic", "migration", "cache", "persistence", "lesson"]
+    }
+  ]
+}

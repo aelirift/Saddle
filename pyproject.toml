@@ -17,3 +17,8 @@ saddle = "saddle.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/saddle"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"

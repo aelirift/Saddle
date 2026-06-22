@@ -40,6 +40,8 @@ the ambient (env + cwd) context.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -229,3 +231,115 @@ def merged_config(ctx: Context | None = None) -> dict:
             entry.update(overlay)
         merged[name] = entry
     return {"providers": merged}
+
+
+# === Standing directives — the user's binding rules, per scope ===========
+#
+# A directive is a standing rule/preference/constraint the user stated once and
+# wants honored on every future design "without saying it each time". Layer 2's
+# audit stage enforces these. Unlike the rest of policy (where a project layer
+# REPLACES the base list on merge), directives ACCUMULATE up the ladder: the
+# effective set for a project is global ∪ tenant ∪ project, so a project rule
+# never silently drops a tenant- or org-wide one. They live in the same overlay
+# files under a ``"directives"`` key, written with a cross-process lock so two
+# concurrent promotions can't lose-update each other.
+
+_PROMOTE_SCOPES: frozenset[str] = frozenset({"global", "tenant", "project"})
+
+
+def _norm_directive(text: str) -> str:
+    return " ".join((text or "").split()).strip().lower()
+
+
+def _directive_layer_paths(ctx: Context) -> list[Path]:
+    """Policy files in scope order (base → tenant → project) for directives."""
+    cfg = _config_dir()
+    tenants = cfg / "tenants"
+    base = _policy_path() or (cfg / "llm_policy.json")
+    return [
+        base,
+        tenants / ctx.tenant / "policy.json",
+        tenants / ctx.tenant / "projects" / ctx.project / "policy.json",
+    ]
+
+
+def _overlay_path(ctx: Context, scope: str) -> Path:
+    """Target file for a directive at ``scope`` (global / tenant / project)."""
+    cfg = _config_dir()
+    if scope == "global":
+        return _policy_path() or (cfg / "llm_policy.json")
+    if scope == "tenant":
+        return cfg / "tenants" / ctx.tenant / "policy.json"
+    if scope == "project":
+        return cfg / "tenants" / ctx.tenant / "projects" / ctx.project / "policy.json"
+    raise ValueError(f"unknown directive scope {scope!r}")
+
+
+@contextlib.contextmanager
+def _file_lock(path: Path):
+    """Exclusive cross-process lock around a read-modify-write of ``path``."""
+    lock = Path(str(path) + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock, "w")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        fh.close()
+
+
+def directives(ctx: Context | None = None) -> list[str]:
+    """Effective standing directives for ``ctx`` — global ∪ tenant ∪ project.
+
+    Read per-layer and unioned (not via the list-replacing deep-merge), so the
+    full ladder applies. Order is global → tenant → project; duplicates (by
+    normalized text) are dropped, keeping the first occurrence.
+    """
+    c = ctx or _default_ctx()
+    seen: set[str] = set()
+    out: list[str] = []
+    for path in _directive_layer_paths(c):
+        if not path.exists():
+            continue
+        for raw in _read_json(path).get("directives", []) or []:
+            text = str(raw).strip()
+            key = _norm_directive(text)
+            if text and key not in seen:
+                seen.add(key)
+                out.append(text)
+    return out
+
+
+def promote_directive(
+    ctx: Context | None = None, text: str = "", scope: str = "project"
+) -> bool:
+    """Persist a standing directive at ``scope`` (default the project).
+
+    Idempotent: a directive already present at that scope is not re-added.
+    Returns True if newly written. Busts the policy cache so the next read
+    sees it.
+    """
+    c = ctx or _default_ctx()
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("cannot promote an empty directive")
+    if scope not in _PROMOTE_SCOPES:
+        raise ValueError(f"unknown directive scope {scope!r}")
+    path = _overlay_path(c, scope)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    added = False
+    with _file_lock(path):
+        data = _read_json(path) if path.exists() else {}
+        existing = data.get("directives")
+        lst = list(existing) if isinstance(existing, list) else []
+        if not any(_norm_directive(str(x)) == _norm_directive(text) for x in lst):
+            lst.append(text)
+            data["directives"] = lst
+            path.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            added = True
+    reset_policy_cache()
+    return added

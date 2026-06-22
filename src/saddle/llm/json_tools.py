@@ -4,15 +4,30 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # pragma: no cover
+    from saddle.llm.protocol import LLMCaller
 
 
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 
+def strip_think(text: str) -> str:
+    """Remove ``<think>…</think>`` reasoning blocks; keep everything else verbatim.
+
+    Safe for free-form prose. Unlike :func:`strip_llm_wrappers` it does NOT pull
+    the contents out of a ``` code fence, so a Markdown design body whose own
+    text contains a fenced code block survives intact rather than being
+    truncated to the first fenced span.
+    """
+    return _THINK_RE.sub("", text or "").strip()
+
+
 def strip_llm_wrappers(text: str) -> str:
-    clean = _THINK_RE.sub("", text or "").strip()
+    """Think-strip, then unwrap a single enclosing code fence (a JSON helper)."""
+    clean = strip_think(text)
     if not clean:
         return ""
     fence_match = _CODE_FENCE_RE.search(clean)
@@ -96,3 +111,18 @@ def parse_json_response(text: str) -> Any:
     if not candidate:
         raise json.JSONDecodeError("Empty JSON response", text or "", 0)
     return json.loads(candidate)
+
+
+async def call_json(
+    caller: "LLMCaller", system: str, prompt: str, *, label: str = ""
+) -> dict:
+    """Call an LLM in JSON mode and parse the reply to a dict.
+
+    The shared primitive for every staged LLM step (intake, design): a
+    non-dict or unparseable reply is surfaced loudly (the parse raises) rather
+    than silently swallowed — a malformed structured reply is a contract bug to
+    fix, not to paper over.
+    """
+    text = await caller(system, prompt, json_mode=True, label=label)
+    payload = parse_json_response(text)
+    return payload if isinstance(payload, dict) else {}

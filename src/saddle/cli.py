@@ -2,13 +2,22 @@
 
 A small subcommand dispatcher over saddle's surfaces:
 
-    saddle                      # interactive agentic chat (default)
-    saddle chat                 # same, explicit
-    saddle intake "<prompt>"    # Layer 1: decompose + record a prompt
-    saddle todos                # show the open todo backlog
+    saddle                          # interactive agentic chat (default)
+    saddle chat                     # same, explicit
+    saddle intake "<prompt>"        # Layer 1: decompose + record a prompt
+    saddle design "<prompt>"        # Layer 1 + Layer 2: decompose → fold → design
+    saddle todos                    # show the open todo backlog
+    saddle directives               # list this project's standing rules
+    saddle directives --add "<r>"   # promote a standing rule (--scope global/tenant/project)
+    saddle lesson "<text>"          # record a DKB entry by hand
+    saddle kb                       # list visible DKB entries
+    saddle kb --search "<query>"    # hybrid-search the DKB
+    saddle kb --seed                # load the global seed corpus (idempotent)
+    saddle codemap <design_id>      # Layer 3: gate a design's surface against code
+    saddle codemap --symbols        # dump the project's grounding symbol menu
 
-``intake`` / ``todos`` take ``--tenant`` / ``--project`` to address a
-specific tenant+project; omitted, they resolve from the environment
+Addressing: every non-chat command takes ``--tenant`` / ``--project`` to
+address a specific tenant+project; omitted, they resolve from the environment
 (SADDLE_TENANT / SADDLE_PROJECT) and the current working directory.
 """
 
@@ -20,7 +29,10 @@ import dataclasses
 import json
 import sys
 
-from saddle.context import resolve
+from saddle.context import Context, resolve
+
+_KB_KINDS = ["best_practice", "anti_pattern", "lesson", "principle"]
+_SCOPES = ["global", "tenant", "project"]
 
 
 def _run_chat() -> int:
@@ -28,16 +40,32 @@ def _run_chat() -> int:
     return chat_main()
 
 
-def _read_prompt(arg: str | None) -> str:
+def _read_text(arg: str | None) -> str:
     if arg is None or arg == "-":
         return sys.stdin.read().strip()
     return arg.strip()
 
 
+def _add_ctx_flags(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--tenant", default=None)
+    p.add_argument("--project", default=None)
+
+
+def _scope_pair(ctx: Context, scope: str) -> tuple[str, str]:
+    """(scope_tenant, scope_project) for a DKB entry placed at ``scope``."""
+    if scope == "global":
+        return ("", "")
+    if scope == "tenant":
+        return (ctx.tenant, "")
+    return (ctx.tenant, ctx.project)
+
+
+# -- Layer 1 -----------------------------------------------------------------
+
 def _run_intake(args: argparse.Namespace) -> int:
     from saddle.intake import decompose, format_intake
 
-    prompt = _read_prompt(args.prompt)
+    prompt = _read_text(args.prompt)
     if not prompt:
         print("intake: empty prompt (pass text or pipe via stdin)", file=sys.stderr)
         return 2
@@ -49,6 +77,33 @@ def _run_intake(args: argparse.Namespace) -> int:
         print(format_intake(intake))
     return 0
 
+
+# -- Layer 1 + Layer 2 (the orchestrator) ------------------------------------
+
+def _run_design(args: argparse.Namespace) -> int:
+    from saddle.orchestrator import orchestrate, format_orchestration
+
+    prompt = _read_text(args.prompt)
+    if not prompt:
+        print("design: empty prompt (pass text or pipe via stdin)", file=sys.stderr)
+        return 2
+    ctx = resolve(args.tenant, args.project)
+    orc = asyncio.run(
+        orchestrate(
+            prompt, ctx,
+            run_designs=not args.no_designs,
+            max_audits=args.audits,
+            retrieve_k=args.retrieve_k,
+        )
+    )
+    if args.json:
+        print(json.dumps(dataclasses.asdict(orc), indent=2))
+    else:
+        print(format_orchestration(orc))
+    return 0
+
+
+# -- todo backlog ------------------------------------------------------------
 
 def _run_todos(args: argparse.Namespace) -> int:
     from saddle.store import get_store
@@ -64,6 +119,154 @@ def _run_todos(args: argparse.Namespace) -> int:
     return 0
 
 
+# -- standing directives -----------------------------------------------------
+
+def _run_directives(args: argparse.Namespace) -> int:
+    from saddle.llm import policy
+
+    ctx = resolve(args.tenant, args.project)
+    if args.add is not None:
+        text = _read_text(args.add)
+        if not text:
+            print("directives --add: empty text", file=sys.stderr)
+            return 2
+        added = policy.promote_directive(ctx, text, scope=args.scope)
+        verb = "added" if added else "already present"
+        print(f"{verb} [{args.scope}]: {text}")
+        return 0
+    rules = policy.directives(ctx)
+    if not rules:
+        print(f"no standing directives for {ctx.key}")
+        return 0
+    print(f"{len(rules)} standing directive(s) for {ctx.key}:")
+    for d in rules:
+        print(f"  - {d}")
+    return 0
+
+
+# -- DKB: record a lesson by hand --------------------------------------------
+
+def _run_lesson(args: argparse.Namespace) -> int:
+    from saddle.dkb import get_dkb
+    from saddle.models import MANUAL, Knowledge
+
+    ctx = resolve(args.tenant, args.project)
+    body = _read_text(args.text)
+    if not body:
+        print("lesson: empty text (pass text or pipe via stdin)", file=sys.stderr)
+        return 2
+    title = (args.title or body).strip()
+    if len(title) > 80:
+        title = title[:79].rstrip() + "…"
+    tags = [t.strip() for t in (args.tags or "").split(",") if t.strip()]
+    scope_tenant, scope_project = _scope_pair(ctx, args.scope)
+    kn = Knowledge(
+        kind=args.kind, title=title, body=body, tags=tags,
+        scope_tenant=scope_tenant, scope_project=scope_project, source=MANUAL,
+    )
+    get_dkb().add_knowledge(kn)
+    print(f"recorded {kn.kind} [{kn.scope}] {kn.id}: {title}")
+    return 0
+
+
+# -- DKB: list / search / seed -----------------------------------------------
+
+def _run_kb(args: argparse.Namespace) -> int:
+    from saddle.dkb import get_dkb
+
+    ctx = resolve(args.tenant, args.project)
+    if args.seed:
+        from saddle.seed import seed_dkb
+        r = seed_dkb()
+        print(
+            f"seed: {r['total']} entries — {r['added']} added, "
+            f"{r['skipped']} already present"
+        )
+        return 0
+    if args.search is not None:
+        query = _read_text(args.search)
+        if not query:
+            print("kb --search: empty query", file=sys.stderr)
+            return 2
+        hits = get_dkb().search_knowledge(ctx, query, k=args.k)
+        if not hits:
+            print(f"no matches for {query!r} in {ctx.key}")
+            return 0
+        print(f"{len(hits)} hit(s) for {query!r} in {ctx.key}:")
+        for kn, score in hits:
+            print(f"  [{kn.kind:<13}] {score:.4f}  {kn.title}  <{kn.scope}>")
+        return 0
+    kinds = [args.kind] if args.kind else None
+    items = get_dkb().list_knowledge(ctx, kinds=kinds, limit=args.limit)
+    if not items:
+        print(f"DKB empty for {ctx.key} (try: saddle kb --seed)")
+        return 0
+    print(f"{len(items)} DKB entr{'y' if len(items) == 1 else 'ies'} for {ctx.key}:")
+    for kn in items:
+        print(f"  [{kn.kind:<13}] {kn.title}  <{kn.scope}> ({kn.source})")
+    return 0
+
+
+# -- Layer 3: code-completeness gate -----------------------------------------
+
+def _run_codemap(args: argparse.Namespace) -> int:
+    from saddle.codemap import SurfaceManifest, refs
+    from saddle.context import code_root
+
+    root = args.root or str(code_root())
+
+    # Inspect mode: the symbol menu a design's surface must be grounded in.
+    if args.symbols:
+        mods = refs.parse_project(root)
+        menu = refs.symbols(mods).top()
+        if args.json:
+            print(json.dumps(menu, indent=2))
+            return 0
+        print(f"symbol menu for {root} ({len(mods)} module(s)):")
+        for bucket in ("fields", "funcs", "calls"):
+            print(f"\n{bucket}:")
+            for name, cnt in menu[bucket].items():
+                print(f"  {cnt:>5}  {name}")
+        if menu["collections"]:
+            print("\ncollections:")
+            for name, members in menu["collections"].items():
+                print(f"  {name} = {members}")
+        return 0
+
+    # Gate mode: re-run a persisted design's DECLARED surface against the code as
+    # it stands now. Nonzero exit on any gap, so this drops straight into a
+    # commit hook / CI step (the WIRED gate RayXI's value_impact_map never had).
+    if not args.design:
+        print("codemap: pass a design id to gate, or --symbols to inspect the menu",
+              file=sys.stderr)
+        return 2
+    from saddle.dkb import get_dkb
+
+    ctx = resolve(args.tenant, args.project)
+    design = get_dkb().get_design(ctx, args.design)
+    if design is None:
+        print(f"codemap: no design {args.design!r} in {ctx.key}", file=sys.stderr)
+        return 2
+    manifest = SurfaceManifest.from_dict(design.meta.get("surface"))
+    if manifest.is_empty():
+        print(f"codemap: design {args.design} declared no surface — nothing to gate")
+        return 0
+    mods = refs.parse_project(root)
+    findings = manifest.gate(mods, root=root)
+    if args.json:
+        print(json.dumps([dataclasses.asdict(f) for f in findings], indent=2))
+    elif not findings:
+        print(f"codemap: design {args.design} surface COMPLETE against {root} "
+              f"({len(mods)} module(s)) — no gaps")
+    else:
+        print(f"codemap: {len(findings)} gap(s) for design {args.design} against {root}:")
+        for f in findings:
+            print(f"  {f}")
+    return 1 if findings else 0
+
+
+# -- parser ------------------------------------------------------------------
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="saddle", description="saddle LLM harness")
     sub = parser.add_subparsers(dest="cmd")
@@ -72,28 +275,82 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_in = sub.add_parser("intake", help="decompose + record a prompt (Layer 1)")
     p_in.add_argument("prompt", nargs="?", help="prompt text; omit or '-' to read stdin")
-    p_in.add_argument("--tenant", default=None)
-    p_in.add_argument("--project", default=None)
+    _add_ctx_flags(p_in)
     p_in.add_argument("--audits", type=int, default=2,
                       help="max coverage-audit passes (default 2)")
     p_in.add_argument("--json", action="store_true", help="dump the raw intake as JSON")
 
+    p_dg = sub.add_parser("design", help="decompose → fold → design (Layer 1 + 2)")
+    p_dg.add_argument("prompt", nargs="?", help="prompt text; omit or '-' to read stdin")
+    _add_ctx_flags(p_dg)
+    p_dg.add_argument("--audits", type=int, default=2,
+                      help="max design audit passes per goal (default 2)")
+    p_dg.add_argument("--retrieve-k", type=int, default=8, dest="retrieve_k",
+                      help="DKB hits to retrieve per design (default 8)")
+    p_dg.add_argument("--no-designs", action="store_true", dest="no_designs",
+                      help="stop after folding; don't run the design pipeline")
+    p_dg.add_argument("--json", action="store_true", help="dump the orchestration as JSON")
+
     p_td = sub.add_parser("todos", help="show the open todo backlog")
-    p_td.add_argument("--tenant", default=None)
-    p_td.add_argument("--project", default=None)
+    _add_ctx_flags(p_td)
+
+    p_dir = sub.add_parser("directives", help="list / promote standing rules")
+    _add_ctx_flags(p_dir)
+    p_dir.add_argument("--add", nargs="?", const="-", default=None,
+                       metavar="TEXT", help="promote a directive (text or '-'/omit for stdin)")
+    p_dir.add_argument("--scope", choices=_SCOPES, default="project",
+                       help="scope to promote at (default project)")
+
+    p_les = sub.add_parser("lesson", help="record a DKB entry by hand")
+    p_les.add_argument("text", nargs="?", help="lesson text; omit or '-' to read stdin")
+    _add_ctx_flags(p_les)
+    p_les.add_argument("--kind", choices=_KB_KINDS, default="lesson",
+                       help="DKB kind (default lesson)")
+    p_les.add_argument("--title", default=None, help="title (defaults to the text)")
+    p_les.add_argument("--tags", default="", help="comma-separated tags")
+    p_les.add_argument("--scope", choices=_SCOPES, default="project",
+                       help="visibility scope (default project)")
+
+    p_kb = sub.add_parser("kb", help="Design Knowledge Base: list / search / seed")
+    _add_ctx_flags(p_kb)
+    p_kb.add_argument("--search", nargs="?", const="-", default=None,
+                      metavar="QUERY", help="hybrid-search the DKB (text or '-'/omit for stdin)")
+    p_kb.add_argument("--seed", action="store_true", help="load the global seed corpus")
+    p_kb.add_argument("--kind", choices=_KB_KINDS, default=None, help="filter list by kind")
+    p_kb.add_argument("-k", type=int, default=8, dest="k", help="search hits to return")
+    p_kb.add_argument("--limit", type=int, default=50, help="max entries to list")
+
+    p_cm = sub.add_parser("codemap", help="Layer 3: gate a design's completeness surface against code")
+    p_cm.add_argument("design", nargs="?", help="design id to gate (omit when using --symbols)")
+    _add_ctx_flags(p_cm)
+    p_cm.add_argument("--symbols", action="store_true",
+                      help="dump the project's grounding symbol menu instead of gating")
+    p_cm.add_argument("--root", default=None,
+                      help="code root to parse (default: $SADDLE_CODE_ROOT, else git root / cwd)")
+    p_cm.add_argument("--json", action="store_true", help="machine-readable output")
 
     return parser
+
+
+_DISPATCH = {
+    "intake": _run_intake,
+    "design": _run_design,
+    "todos": _run_todos,
+    "directives": _run_directives,
+    "lesson": _run_lesson,
+    "kb": _run_kb,
+    "codemap": _run_codemap,
+}
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.cmd is None or args.cmd == "chat":
         return _run_chat()
-    if args.cmd == "intake":
-        return _run_intake(args)
-    if args.cmd == "todos":
-        return _run_todos(args)
-    return 1  # unreachable — argparse rejects unknown subcommands
+    handler = _DISPATCH.get(args.cmd)
+    if handler is None:
+        return 1  # unreachable — argparse rejects unknown subcommands
+    return handler(args)
 
 
 if __name__ == "__main__":

@@ -81,6 +81,11 @@ def _default_db_path() -> Path:
     return base / "saddle.db"
 
 
+def default_db_path() -> Path:
+    """Public accessor for the saddle db location (shared with the DKB)."""
+    return _default_db_path()
+
+
 def _row_to_item(row: sqlite3.Row) -> Item:
     return Item(
         kind=row["kind"],

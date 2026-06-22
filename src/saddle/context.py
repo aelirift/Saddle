@@ -123,3 +123,21 @@ def resolve(
 def default() -> Context:
     """The ambient Context (env + cwd) used where no ctx is passed in."""
     return resolve()
+
+
+def code_root(cwd: str | Path | None = None) -> Path:
+    """The target project's CODE root — what Layer 3 (codemap) parses.
+
+    Resolution: ``$SADDLE_CODE_ROOT`` -> nearest enclosing git repo -> cwd.
+
+    Deliberately resolved SEPARATELY from the :class:`Context` identity: a code
+    path is per-project configuration, not part of ``(tenant, project)``, so
+    folding it into the frozen Context would perturb its hash/equality and every
+    ``lru_cache`` / DB key built on it. Layer 2 calls this only when it needs to
+    look at the project's actual code.
+    """
+    env = os.environ.get("SADDLE_CODE_ROOT")
+    if env and env.strip():
+        return Path(env).expanduser().resolve()
+    base = (Path(cwd) if cwd is not None else Path.cwd()).resolve()
+    return _git_root(base) or base

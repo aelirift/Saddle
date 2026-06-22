@@ -26,7 +26,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from saddle.context import Context, default as _default_ctx
-from saddle.llm.json_tools import parse_json_response
+from saddle.llm.json_tools import call_json as _call_json
 from saddle.llm.pool import tenant_gate
 from saddle.models import (
     CONTEXT,
@@ -148,12 +148,6 @@ def _audit_prompt(prompt: str, items: list[Item]) -> str:
     )
 
 
-async def _call_json(caller: "LLMCaller", system: str, prompt: str, label: str) -> dict:
-    text = await caller(system, prompt, json_mode=True, label=label)
-    payload = parse_json_response(text)
-    return payload if isinstance(payload, dict) else {}
-
-
 async def decompose(
     prompt: str,
     ctx: Context | None = None,
@@ -184,7 +178,7 @@ async def decompose(
     audit_complete = False
     async with tenant_gate(ctx):
         first = await _call_json(
-            caller, _SYSTEM_ITEMIZE, _itemize_prompt(text), "intake/itemize"
+            caller, _SYSTEM_ITEMIZE, _itemize_prompt(text), label="intake/itemize"
         )
         summary = str(first.get("summary", "")).strip()
         items = _items_from_list(first.get("items"))
@@ -195,7 +189,7 @@ async def decompose(
         # re-audit until the auditor says complete or the bound is hit.
         for _ in range(max(0, max_audits)):
             audit = await _call_json(
-                caller, _SYSTEM_AUDIT, _audit_prompt(text, items), "intake/audit"
+                caller, _SYSTEM_AUDIT, _audit_prompt(text, items), label="intake/audit"
             )
             audits_run += 1
             missed = _items_from_list(audit.get("missed"))

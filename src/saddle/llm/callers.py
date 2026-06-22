@@ -33,7 +33,7 @@ from pathlib import Path
 
 import httpx
 
-from .json_tools import extract_json_text, strip_llm_wrappers
+from .json_tools import extract_json_text, strip_think
 from .pool import PoolSlot, get_pool
 from .protocol import LLMCaller
 from .retry_category import categorize_retry
@@ -154,10 +154,11 @@ def _retry_same_provider(category: str) -> bool:
 
 
 def _normalize_content(text: str, *, json_mode: bool) -> str:
-    clean = strip_llm_wrappers(text)
     if json_mode:
-        clean = extract_json_text(clean)
-    return clean.strip()
+        return extract_json_text(text).strip()
+    # Prose: think-strip only — never fence-unwrap, so a code block inside the
+    # body survives instead of being mistaken for the whole payload.
+    return strip_think(text).strip()
 
 
 def _load_config(ctx: "Context | None" = None) -> dict:
