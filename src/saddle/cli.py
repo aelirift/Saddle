@@ -15,6 +15,7 @@ A small subcommand dispatcher over saddle's surfaces:
     saddle kb --seed                # load the global seed corpus (idempotent)
     saddle codemap <design_id>      # Layer 3: gate a design's surface against code
     saddle codemap --symbols        # dump the project's grounding symbol menu
+    saddle converge <design_id>     # Layer 4: drive the coder to satisfy the design's surface
 
 Addressing: every non-chat command takes ``--tenant`` / ``--project`` to
 address a specific tenant+project; omitted, they resolve from the environment
@@ -265,6 +266,43 @@ def _run_codemap(args: argparse.Namespace) -> int:
     return 1 if findings else 0
 
 
+# -- Layer 4: drive the coder to satisfy a design's surface ------------------
+
+def _run_converge(args: argparse.Namespace) -> int:
+    from saddle.context import code_root
+    from saddle.converge import converge_design, format_result
+    from saddle.dkb import get_dkb
+
+    ctx = resolve(args.tenant, args.project)
+    design = get_dkb().get_design(ctx, args.design)
+    if design is None:
+        print(f"converge: no design {args.design!r} in {ctx.key}", file=sys.stderr)
+        return 2
+    root = args.root or str(code_root())
+    result = asyncio.run(
+        converge_design(
+            design, code_root=root, ctx=ctx,
+            max_rounds=args.max_rounds, turn_retries=args.turn_retries,
+            persist=not args.no_persist,
+        )
+    )
+    if args.json:
+        print(json.dumps({
+            "design_id": result.design_id,
+            "status": result.status,
+            "rounds": [
+                {"n": r.n, "gaps_before": r.gaps_before,
+                 "gaps_after": r.gaps_after, "closed": r.closed}
+                for r in result.rounds
+            ],
+            "final_gaps": [str(f) for f in result.final_gaps],
+            "error": result.error,
+        }, indent=2))
+    else:
+        print(format_result(result, root))
+    return 0 if result.ok else 1
+
+
 # -- parser ------------------------------------------------------------------
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -329,6 +367,21 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="code root to parse (default: $SADDLE_CODE_ROOT, else git root / cwd)")
     p_cm.add_argument("--json", action="store_true", help="machine-readable output")
 
+    p_cv = sub.add_parser(
+        "converge",
+        help="Layer 4: drive the coder to implement a design until its surface is satisfied")
+    p_cv.add_argument("design", help="design id to implement and converge")
+    _add_ctx_flags(p_cv)
+    p_cv.add_argument("--root", default=None,
+                      help="code root the coder edits (default: $SADDLE_CODE_ROOT, else git root / cwd)")
+    p_cv.add_argument("--max-rounds", type=int, default=8, dest="max_rounds",
+                      help="hard cap on coder-turn + re-gate cycles (default 8)")
+    p_cv.add_argument("--turn-retries", type=int, default=2, dest="turn_retries",
+                      help="bounded retries on a crashed coder turn before halting (default 2)")
+    p_cv.add_argument("--no-persist", action="store_true", dest="no_persist",
+                      help="don't record the convergence trail onto the design")
+    p_cv.add_argument("--json", action="store_true", help="machine-readable output")
+
     return parser
 
 
@@ -340,6 +393,7 @@ _DISPATCH = {
     "lesson": _run_lesson,
     "kb": _run_kb,
     "codemap": _run_codemap,
+    "converge": _run_converge,
 }
 
 

@@ -21,6 +21,12 @@ env/
 *.db-shm
 .saddle/
 
+# Per-tenant/project policy is written at runtime by `saddle directive`
+# (policy.promote_directive) with a sibling lock file — machine-local
+# state, not source. The shared default config/llm_policy.json IS tracked.
+config/tenants/**/policy.json
+config/tenants/**/policy.json.lock
+
 # Secrets — API keys live in a SHARED file referenced by policy.keys_from
 # and are NEVER committed. Ignore any local key file dropped into the repo.
 config/llm_config.json

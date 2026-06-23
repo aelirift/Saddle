@@ -443,6 +443,33 @@ class DKB:
             self._conn.commit()
             return cur.rowcount > 0
 
+    def update_design_meta(self, ctx: Context, did: str, patch: dict) -> bool:
+        """Merge ``patch`` into a design's ``meta`` JSON in place; return False if
+        no such design exists. Lets a later stage record a post-design outcome —
+        e.g. the convergence trail (:mod:`saddle.converge`) — onto the design it
+        belongs to, without rewriting the row or disturbing ``status`` (an
+        implementation outcome is not a re-verdict on the design's quality)."""
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT meta FROM design WHERE id=? AND tenant=? AND project=?",
+                (did, ctx.tenant, ctx.project),
+            ).fetchone()
+            if r is None:
+                return False
+            try:
+                meta = json.loads(r["meta"]) if r["meta"] else {}
+            except (TypeError, ValueError):
+                meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            meta.update(patch)
+            self._conn.execute(
+                "UPDATE design SET meta=? WHERE id=? AND tenant=? AND project=?",
+                (json.dumps(meta), did, ctx.tenant, ctx.project),
+            )
+            self._conn.commit()
+        return True
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
