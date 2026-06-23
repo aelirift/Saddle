@@ -53,6 +53,24 @@ def _env_effort() -> str:
     return (os.environ.get("SADDLE_AGENT_EFFORT", "") or "").strip()
 
 
+class ClaudeAgentUnavailable(RuntimeError):
+    """The local ``claude`` CLI subprocess failed for one call.
+
+    The Agent SDK surfaces a CLI crash as an opaque ``Exception`` —
+    *"Command failed with exit code 1 — Check stderr output for details"* —
+    folding the real cause (rate-limit, overload, transport, auth) into the
+    subprocess stderr it then drops. :class:`ClaudeAgentCaller` captures that
+    stderr (via the SDK's ``stderr`` callback) and re-raises it as this typed
+    error so two things hold:
+
+      1. The real reason is visible in the message + logs, not swallowed.
+      2. A subprocess-level crash means the LEAD provider is unavailable for
+         THIS call — a routing failure, not a bad prompt — so
+         :class:`~saddle.llm.callers.FallbackCaller` always degrades to the
+         next provider (e.g. minimax) instead of aborting the whole run.
+    """
+
+
 class ClaudeAgentCaller:
     """One-shot ``LLMCaller`` backed by the Claude Agent SDK.
 
@@ -89,7 +107,9 @@ class ClaudeAgentCaller:
             self._cfg.get("effort") or _env_effort() or _DEFAULT_EFFORT
         ).strip()
 
-    def _options(self, system: str) -> "ClaudeAgentOptions":
+    def _options(
+        self, system: str, *, stderr_sink: list[str] | None = None
+    ) -> "ClaudeAgentOptions":
         from claude_agent_sdk import ClaudeAgentOptions
 
         kwargs: dict = {
@@ -104,6 +124,11 @@ class ClaudeAgentCaller:
             kwargs["model"] = self._model
         if self._effort:
             kwargs["effort"] = self._effort
+        if stderr_sink is not None:
+            # Capture the `claude` CLI subprocess stderr. The SDK otherwise
+            # drops it on a crash, leaving only the opaque "Check stderr
+            # output for details" — see ClaudeAgentUnavailable.
+            kwargs["stderr"] = stderr_sink.append
         return ClaudeAgentOptions(**kwargs)
 
     async def __call__(
@@ -122,15 +147,29 @@ class ClaudeAgentCaller:
                 "schema. No prose, no markdown fences, no commentary.)"
             )
 
-        options = self._options(system)
+        stderr_lines: list[str] = []
+        options = self._options(system, stderr_sink=stderr_lines)
         slot_label = f"claude_agent/{label}" if label else "claude_agent"
         parts: list[str] = []
-        async with PoolSlot(get_pool(), slot_label):
-            async for message in query(prompt=prompt, options=options):
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            parts.append(block.text)
+        try:
+            async with PoolSlot(get_pool(), slot_label):
+                async for message in query(prompt=prompt, options=options):
+                    if isinstance(message, AssistantMessage):
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                parts.append(block.text)
+        except ClaudeAgentUnavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001 — re-typed as ClaudeAgentUnavailable
+            # A `claude` CLI subprocess crash. Re-raise as the typed error
+            # carrying the captured stderr so the real cause is visible AND the
+            # fallback chain routes past it to the next provider (see
+            # ClaudeAgentUnavailable) rather than aborting the run.
+            detail = "\n".join(s.rstrip() for s in stderr_lines if s and s.strip())
+            msg = f"claude CLI failed for {label or 'request'}: {exc}"
+            if detail:
+                msg += f"\n--- claude stderr ---\n{detail}"
+            raise ClaudeAgentUnavailable(msg) from exc
 
         joined = "".join(parts)
         # JSON mode: scan for the committed JSON span. Prose mode: only strip

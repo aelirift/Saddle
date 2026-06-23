@@ -36,6 +36,9 @@ import httpx
 from .json_tools import extract_json_text, strip_think
 from .pool import PoolSlot, get_pool
 from .protocol import LLMCaller
+# Module-level safe: claude_agent.py imports the Agent SDK lazily (inside
+# methods), so importing just the exception type pulls no SDK on SDK-less hosts.
+from .claude_agent import ClaudeAgentUnavailable
 from .retry_category import categorize_retry
 from .policy import active_priority, merged_config
 from saddle.context import Context
@@ -992,7 +995,13 @@ class FallbackCaller:
                     "content_filter", "content filter", "high risk",
                     "request was rejected",
                 ))
-                if is_transient or "timeout" in type(exc).__name__.lower():
+                # A lead-provider subprocess crash (the local `claude` CLI
+                # exiting non-zero) means that provider is unavailable for THIS
+                # call — a routing failure, not a prompt error — regardless of
+                # whether its captured stderr happens to contain a known
+                # transient marker. Always degrade to the next provider.
+                is_provider_down = isinstance(exc, ClaudeAgentUnavailable)
+                if is_provider_down or is_transient or "timeout" in type(exc).__name__.lower():
                     _log.warning("FallbackCaller: %s failed (%s), trying next…", type(caller).__name__, str(exc)[:120])
                     last_exc = exc
                 else:
