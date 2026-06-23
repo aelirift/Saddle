@@ -106,7 +106,7 @@ _SYS_SURFACE = (
     "string-set declarations, ranked by how often they appear. GROUND EVERY NAME "
     "you emit in that menu; never invent one. If the code says `cooldown_s`, write "
     "`cooldown_s`, not `cooldown`.\n"
-    "Declare five kinds (ANY may be empty — only include a thing the GOAL "
+    "Declare eight kinds (ANY may be empty — only include a thing the GOAL "
     "actually touches):\n"
     "- values: a number whose effective value is base (+) modifiers and must "
     "reach every consumer through a resolver. Fields: name; field (the menu "
@@ -132,13 +132,40 @@ _SYS_SURFACE = (
     "name; key (the field); save_func (the function that writes the save); "
     "load_func (the function that reads it back). It must be referenced in BOTH "
     "or it silently resets / loads garbage.\n"
+    "- lifecycle: a DECLARED knob that must be READ to mean anything — an exported "
+    "setting, a constant, a signal, a script-scope field. Fields: name; symbol "
+    "(the declared identifier from the menu). A declaration nothing reads is a DEAD "
+    "knob: it looks adjustable but changes nothing. Declare this for any setting "
+    "the GOAL adds or relies on, so the gate proves some code actually consumes "
+    "it.\n"
+    "- authority: a function that MUTATES server-authoritative state and must "
+    "check an authority guard before it writes, or a client can invoke it and "
+    "desync / cheat. Fields: name; guard (the authority-check function(s) from the "
+    "menu, e.g. `is_server`, `is_multiplayer_authority`); mutators (the function "
+    "names that perform the authoritative write). The WRITE side of the trust "
+    "boundary — declare it for any state a client must not set directly.\n"
+    "- bindings: an INPUT keymap that must be unambiguous and fully reachable — "
+    "every physical input does exactly ONE intended thing and every declared "
+    "action is invocable, or a key opens a panel when the player meant to act (the "
+    "number-row-fires-a-menu bug). Fields: name; keymap (the serialized keymap "
+    "file relative to root, e.g. `project.godot`); families (a map of intent-family "
+    "-> the action-name prefixes in that family, e.g. `{\"ability\": [\"ability_\"], "
+    "\"panel\": [\"open_\"]}`); compatible (family pairs allowed to share one input, "
+    "e.g. `[[\"ability\", \"card\"]]`; a family paired with itself permits same-"
+    "family co-binds); programmatic (actions fired from code that need no key, so "
+    "they aren't flagged dead). A trigger firing two incompatible families, or an "
+    "action with no trigger, is the gap.\n"
     "Respond with ONLY JSON: "
     '{"values": [{"name": "...", "field": "...", "accessor": ["..."], '
     '"producers": ["..."]}], "identities": [{"name": "...", "canonical": ["..."], '
     '"source_symbol": "...", "carriers": ["..."]}], "boundaries": [{"name": "...", '
     '"key": "...", "replication_func": "..."}], "references": [{"name": "...", '
     '"key": "...", "substrates": ["..."]}], "persistence": [{"name": "...", '
-    '"key": "...", "save_func": "...", "load_func": "..."}]}'
+    '"key": "...", "save_func": "...", "load_func": "..."}], "lifecycle": '
+    '[{"name": "...", "symbol": "..."}], "authority": [{"name": "...", '
+    '"guard": ["..."], "mutators": ["..."]}], "bindings": [{"name": "...", '
+    '"keymap": "...", "families": {"fam": ["prefix_"]}, "compatible": '
+    '[["famA", "famB"]], "programmatic": ["..."]}]}'
 )
 
 _SYS_BODY = (

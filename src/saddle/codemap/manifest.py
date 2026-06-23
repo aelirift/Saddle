@@ -31,26 +31,37 @@ from dataclasses import dataclass, field
 
 from .finding import Finding
 from .impact import (
+    AuthorityImpact,
     BoundaryImpact,
     IdentityImpact,
+    LifecycleImpact,
     ValueImpact,
+    format_authority_impact,
     format_boundary_impact,
     format_identity_impact,
+    format_lifecycle_impact,
     format_value_impact,
+    impact_authority,
     impact_boundary,
     impact_identity,
+    impact_lifecycle,
     impact_value,
 )
 from .specs import (
+    AuthoritySpec,
+    BindingSpec,
     BoundarySpec,
     IdentitySpec,
+    LifecycleSpec,
     PersistenceSpec,
     ReferenceSpec,
     ValueSpec,
 )
 from .substrate import (
+    format_binding_impact,
     format_persistence_impact,
     format_reference_impact,
+    impact_binding,
     impact_persistence,
     impact_reference,
 )
@@ -107,6 +118,40 @@ def _persistence_from_dict(d: dict) -> PersistenceSpec:
                            save_func=d["save_func"], load_func=d["load_func"])
 
 
+def _lifecycle_to_dict(s: LifecycleSpec) -> dict:
+    return {"name": s.name, "symbol": s.symbol}
+
+
+def _lifecycle_from_dict(d: dict) -> LifecycleSpec:
+    return LifecycleSpec(name=d["name"], symbol=d["symbol"])
+
+
+def _authority_to_dict(s: AuthoritySpec) -> dict:
+    return {"name": s.name, "guard": list(s.guards), "mutators": list(s.mutators)}
+
+
+def _authority_from_dict(d: dict) -> AuthoritySpec:
+    g = d.get("guard")
+    guard = tuple(g) if isinstance(g, (list, tuple)) else g
+    return AuthoritySpec(name=d["name"], guard=guard,
+                         mutators=tuple(d.get("mutators", ())))
+
+
+def _binding_to_dict(s: BindingSpec) -> dict:
+    return {"name": s.name, "keymap": s.keymap,
+            "families": {k: list(v) for k, v in s.families.items()},
+            "compatible": [list(p) for p in s.compatible],
+            "programmatic": list(s.programmatic)}
+
+
+def _binding_from_dict(d: dict) -> BindingSpec:
+    return BindingSpec(
+        name=d["name"], keymap=d["keymap"],
+        families={k: tuple(v) for k, v in d.get("families", {}).items()},
+        compatible=tuple(tuple(p) for p in d.get("compatible", ())),
+        programmatic=tuple(d.get("programmatic", ())))
+
+
 @dataclass
 class SurfaceManifest:
     """The full set of things a design commits to touch. Serialises to plain
@@ -117,10 +162,14 @@ class SurfaceManifest:
     boundaries: list[BoundarySpec] = field(default_factory=list)
     references: list[ReferenceSpec] = field(default_factory=list)
     persistence: list[PersistenceSpec] = field(default_factory=list)
+    lifecycle: list[LifecycleSpec] = field(default_factory=list)
+    authority: list[AuthoritySpec] = field(default_factory=list)
+    bindings: list[BindingSpec] = field(default_factory=list)
 
     def is_empty(self) -> bool:
         return not (self.values or self.identities or self.boundaries
-                    or self.references or self.persistence)
+                    or self.references or self.persistence or self.lifecycle
+                    or self.authority or self.bindings)
 
     def to_dict(self) -> dict:
         return {
@@ -129,6 +178,9 @@ class SurfaceManifest:
             "boundaries": [_boundary_to_dict(s) for s in self.boundaries],
             "references": [_reference_to_dict(s) for s in self.references],
             "persistence": [_persistence_to_dict(s) for s in self.persistence],
+            "lifecycle": [_lifecycle_to_dict(s) for s in self.lifecycle],
+            "authority": [_authority_to_dict(s) for s in self.authority],
+            "bindings": [_binding_to_dict(s) for s in self.bindings],
         }
 
     @classmethod
@@ -140,6 +192,9 @@ class SurfaceManifest:
             boundaries=[_boundary_from_dict(x) for x in d.get("boundaries", [])],
             references=[_reference_from_dict(x) for x in d.get("references", [])],
             persistence=[_persistence_from_dict(x) for x in d.get("persistence", [])],
+            lifecycle=[_lifecycle_from_dict(x) for x in d.get("lifecycle", [])],
+            authority=[_authority_from_dict(x) for x in d.get("authority", [])],
+            bindings=[_binding_from_dict(x) for x in d.get("bindings", [])],
         )
 
     # --- the gate the design's own specs power ----------------------------
@@ -152,10 +207,14 @@ class SurfaceManifest:
             "identities": [impact_identity(mods, s) for s in self.identities],
             "boundaries": [impact_boundary(mods, s) for s in self.boundaries],
             "persistence": [impact_persistence(mods, s) for s in self.persistence],
+            "lifecycle": [impact_lifecycle(mods, s) for s in self.lifecycle],
+            "authority": [impact_authority(mods, s) for s in self.authority],
             "references": [],
+            "bindings": [],
         }
         if root is not None:
             out["references"] = [impact_reference(root, s) for s in self.references]
+            out["bindings"] = [impact_binding(root, s) for s in self.bindings]
         return out
 
     def gate(self, mods: list, root=None) -> list[Finding]:
@@ -186,4 +245,10 @@ class SurfaceManifest:
             blocks.append(format_reference_impact(imp))
         for imp in imps["persistence"]:
             blocks.append(format_persistence_impact(imp))
+        for imp in imps["lifecycle"]:
+            blocks.append(format_lifecycle_impact(imp))
+        for imp in imps["authority"]:
+            blocks.append(format_authority_impact(imp))
+        for imp in imps["bindings"]:
+            blocks.append(format_binding_impact(imp))
         return "\n\n".join(blocks) if blocks else "(empty manifest)"

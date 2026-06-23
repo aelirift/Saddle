@@ -144,6 +144,7 @@ def test_surface_off_still_designs_without_code(tmp_path):
     assert "design/surface" not in caller.prompts   # stage skipped entirely
     assert design.meta["surface"] == {
         "values": [], "identities": [], "boundaries": [],
-        "references": [], "persistence": [],
+        "references": [], "persistence": [], "lifecycle": [], "authority": [],
+        "bindings": [],
     }
     assert "COMPLETENESS SURFACE" not in caller.prompts["design/body"]

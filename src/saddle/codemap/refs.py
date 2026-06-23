@@ -58,6 +58,18 @@ def resolved_arg_callees(mod, resolvers):
     return _adapter(mod).resolved_arg_callees(mod, resolvers)
 
 
+def name_decls(mod, name):
+    return _adapter(mod).name_decls(mod, name)
+
+
+def name_uses(mod, name):
+    return _adapter(mod).name_uses(mod, name)
+
+
+def function_defs(mod, name):
+    return _adapter(mod).function_defs(mod, name)
+
+
 def _ranked(counts: dict[str, int], n: int) -> dict[str, int]:
     """Most load-bearing first, ties broken by name so the menu is deterministic."""
     items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))

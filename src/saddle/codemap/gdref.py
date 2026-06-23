@@ -251,21 +251,43 @@ def _paren_span(text: str, open_idx: int) -> str | None:
 _GD_DIRECT_CALL = re.compile(r"(?<![\w.])([A-Za-z_]\w*)\s*\(")
 _GD_METHOD_CALL = re.compile(r"\.([A-Za-z_]\w*)\s*\(")
 _GD_IDENT = re.compile(r"[A-Za-z_]\w*")
+# Dynamic-dispatch methods: a resolved value sitting in their argument list is
+# being dispatched THROUGH them (the real callee is the string they take), not
+# handed to a consumer named after the method, so they are never the "covered"
+# callee. (`def = obj.call("resolve_def", aid, def)` must not mark `call` covered.)
+_GD_DISPATCH_METHODS = frozenset({"call", "call_deferred", "callv", "rpc", "rpc_id"})
 
 
 def resolved_arg_callees(mod: GDModule, resolvers: set[str]) -> set[str]:
     """GDScript counterpart to :func:`saddle.codemap.pyref.resolved_arg_callees`
     — one-hop interprocedural coverage, regex-derived. Within each function body
-    it tracks locals bound to a resolver result (`var cd = resolve_cd(inst)`),
-    then for every call collects the callee whose argument list contains a
-    resolver call OR one of those resolved locals. Same deliberate trade as the
-    Python path: a callee that also reads the base for another purpose is treated
-    as covered. Lower fidelity (line-scoped, balanced-paren args) by design."""
+    it tracks locals bound to a resolver result, then for every call collects the
+    callee whose argument list contains a resolver call OR one of those resolved
+    locals. Same deliberate trade as the Python path: a callee that also reads the
+    base for another purpose is treated as covered. Lower fidelity (line-scoped,
+    balanced-paren args) by design.
+
+    Both call forms count as a resolver invocation: a direct/method call
+    ``resolve_def(...)`` / ``obj.resolve_def(...)`` AND the DYNAMIC dispatch
+    RayXI's runtime actually uses, ``obj.call("resolve_def", ...)`` /
+    ``obj.call_deferred("resolve_def", ...)``. Recognising only the direct form
+    (the original gap) read ``def = _talents.call("resolve_def", aid, def)`` as
+    unresolved, so every helper handed that ``def`` was a false positive — the
+    noise that buried the real HUD/tooltip gaps on RayXI."""
     if not resolvers:
         return set()
     res_alt = "|".join(re.escape(r) for r in resolvers)
-    assign_re = re.compile(r"^\s*(?:var\s+)?(\w+)\s*=\s*(?:%s)\s*\(" % res_alt)
-    res_call_re = re.compile(r"(?:%s)\s*\(" % res_alt)
+    # A resolver invocation in either form, used to spot an inline resolve inside
+    # a callee's argument list (`helper(x, resolve_def(x))` / the dynamic form).
+    res_call_re = re.compile(
+        r'(?:(?:%s)\s*\(|\.call\w*\(\s*["\'](?:%s)["\'])' % (res_alt, res_alt)
+    )
+    # A local bound to a resolver result, either call form. The optional `: Type`
+    # annotation is tolerated (`var cd: float = resolve_cd(inst)`).
+    assign_re = re.compile(
+        r'^\s*(?:var\s+)?(\w+)\s*(?::\s*[^=]+?)?\s*=\s*'
+        r'(?:(?:%s)\s*\(|[\w.]+\.call\w*\(\s*["\'](?:%s)["\'])' % (res_alt, res_alt)
+    )
 
     per_func: dict[str | None, list[str]] = {}
     for lineno, ln in _code_lines(mod):
@@ -285,7 +307,8 @@ def resolved_arg_callees(mod: GDModule, resolvers: set[str]) -> set[str]:
                 _GD_METHOD_CALL.finditer(code)
             ):
                 callee = cm.group(1)
-                if callee in resolvers or callee in _GD_KEYWORDS:
+                if (callee in resolvers or callee in _GD_KEYWORDS
+                        or callee in _GD_DISPATCH_METHODS):
                     continue
                 args = _paren_span(code, cm.end() - 1)
                 if args is None:
@@ -365,6 +388,63 @@ def collection_decls(mod: GDModule, name: str) -> list[tuple[set[str], Ref]]:
             vals = lit.findall(m.group(1))
             if vals:
                 out.append((set(vals), _mk(mod, lineno, "assign", name)))
+    return out
+
+
+def name_decls(mod: GDModule, name: str) -> list[Ref]:
+    """Declaration sites of a script-scope symbol `name`: an `@export var NAME`,
+    a script-scope (indent-0) `var NAME`, a `const NAME`, or a `signal NAME` —
+    GDScript's design knobs (a value a designer or other code is meant to consume).
+    Indent-0 only: a `var NAME` inside a function is a local, a different binding,
+    not the knob (mirrors pyref's module/class-scope rule). Leading annotations
+    (`@export`, `@export_range(...)`, `@onready`) are tolerated before the keyword."""
+    ne = re.escape(name)
+    decl_re = re.compile(
+        r"^(?:@\w+(?:\([^)]*\))?\s+)*(?:const|signal|var)\s+%s\b" % ne
+    )
+    out: list[Ref] = []
+    for lineno, ln in _code_lines(mod):
+        if decl_re.match(_strip_inline_comment(ln)):
+            out.append(_mk(mod, lineno, "declaration", name))
+    return out
+
+
+def name_uses(mod: GDModule, name: str) -> list[Ref]:
+    r"""Every READ of `name` — any ``\bNAME\b`` token that is NOT the declaration's
+    own LHS target. Deliberately permissive (matches bare `NAME`, `self.NAME`,
+    `obj.NAME`, and a signal referenced by string in `emit_signal("NAME")`): the
+    conservative bias for a liveness check is to over-count reads so a symbol is
+    flagged DEAD only when truly nothing references it — a false 'dead' is worse
+    than a missed one. The declaration's own target token is excluded so a knob
+    isn't counted as its own reader (which would make the check a no-op)."""
+    ne = re.escape(name)
+    tok = re.compile(r"\b%s\b" % ne)
+    decl_re = re.compile(
+        r"^(?:@\w+(?:\([^)]*\))?\s+)*(?:const|signal|var)\s+(%s)\b" % ne
+    )
+    decl_at: dict[int, int] = {}  # lineno -> start offset of the declared token
+    for lineno, ln in _code_lines(mod):
+        m = decl_re.match(_strip_inline_comment(ln))
+        if m:
+            decl_at[lineno] = m.start(1)
+    out: list[Ref] = []
+    for lineno, ln in _code_lines(mod):
+        code = _strip_inline_comment(ln)
+        skip = decl_at.get(lineno)
+        for m in tok.finditer(code):
+            if skip is not None and m.start() == skip:
+                continue
+            out.append(_mk(mod, lineno, "use", name))
+    return out
+
+
+def function_defs(mod: GDModule, name: str) -> list[Ref]:
+    """Definition site(s) of a function named `name` (`func name(...)`)."""
+    out: list[Ref] = []
+    for lineno, ln in _code_lines(mod):
+        m = _FUNC_RE.match(ln)
+        if m and m.group(1) == name:
+            out.append(_mk(mod, lineno, "func_def", name))
     return out
 
 

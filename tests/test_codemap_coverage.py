@@ -22,8 +22,11 @@ import json
 
 import saddle.codemap as cm
 from saddle.codemap import (
+    AuthoritySpec,
+    BindingSpec,
     BoundarySpec,
     IdentitySpec,
+    LifecycleSpec,
     PersistenceSpec,
     ReferenceSpec,
     SurfaceManifest,
@@ -46,10 +49,11 @@ def _singular(field: str) -> str:
     return field
 
 
-def test_kinds_are_the_expected_five():
+def test_kinds_are_the_expected_eight():
     # The ONE deliberate count. If a kind is added/removed this fails on purpose,
     # forcing every other seam below to be re-checked rather than drifting.
-    assert _kinds() == {"value", "identity", "boundary", "reference", "persistence"}
+    assert _kinds() == {"value", "identity", "boundary", "reference",
+                        "persistence", "lifecycle", "authority", "binding"}
 
 
 def test_every_kind_is_exported_across_all_seams():
@@ -95,12 +99,17 @@ def test_manifest_round_trips_and_dispatches_one_spec_per_kind(tmp_path):
         boundaries=[BoundarySpec("b", "bk", "rep")],
         references=[ReferenceSpec("ref", "tok", ("docs/*.md",))],
         persistence=[PersistenceSpec("p", "pk", "save", "load")],
+        lifecycle=[LifecycleSpec("l", "sym")],
+        authority=[AuthoritySpec("a", "is_server", ("set_x",))],
+        bindings=[BindingSpec("bind", "project.godot", {"ability": ("ability_",)},
+                              compatible=(("ability", "card"),),
+                              programmatic=("debug_toggle",))],
     )
     back = SurfaceManifest.from_dict(json.loads(json.dumps(m.to_dict())))
     d = back.to_dict()
     assert {k: len(v) for k, v in d.items()} == {
-        "values": 1, "identities": 1, "boundaries": 1,
-        "references": 1, "persistence": 1,
+        "values": 1, "identities": 1, "boundaries": 1, "references": 1,
+        "persistence": 1, "lifecycle": 1, "authority": 1, "bindings": 1,
     }
     # impacts() returns a fan-out bucket for every kind ...
     imps = back.impacts([], root=tmp_path)

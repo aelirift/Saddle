@@ -307,6 +307,54 @@ def resolved_arg_callees(mod: Module, resolvers: set[str]) -> set[str]:
     return out
 
 
+def name_decls(mod: Module, name: str) -> list[Ref]:
+    """Declaration sites of a script-scope symbol `name`: a module/class-level
+    assignment (`NAME = ...`) or annotated assignment (`NAME: T = ...`). A
+    declaration is at module or CLASS scope, never inside a function — a local of
+    the same name is a different binding, not the design knob. (Python has no
+    `@export`; a module/class constant is its analogue.)"""
+    out: list[Ref] = []
+    for node in ast.walk(mod.tree):
+        target = None
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id == name:
+                    target = t
+                    break
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == name:
+                target = node.target
+        if target is not None and mod.enclosing_func(target) is None:
+            out.append(_mk(mod, target, "declaration", name))
+    return out
+
+
+def name_uses(mod: Module, name: str) -> list[Ref]:
+    """Every READ of `name`: a Load-context bare `ast.Name` (a module/class
+    constant read by name) OR a Load-context `obj.NAME` attribute (a class field
+    read through `self`/an instance). Deliberately permissive over the attribute
+    base — the conservative bias for a liveness check is to over-count reads so a
+    symbol is flagged DEAD only when truly nothing references it (a false 'dead' is
+    worse than a missed one). A Store target is not a read, so a symbol with
+    declarations but zero name_uses is dead."""
+    out: list[Ref] = []
+    for node in ast.walk(mod.tree):
+        if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Load):
+            out.append(_mk(mod, node, "use", name))
+        elif isinstance(node, ast.Attribute) and node.attr == name and isinstance(node.ctx, ast.Load):
+            out.append(_mk(mod, node, "use", name))
+    return out
+
+
+def function_defs(mod: Module, name: str) -> list[Ref]:
+    """Definition site(s) of a function named `name` (`def name(...)`)."""
+    out: list[Ref] = []
+    for node in ast.walk(mod.tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            out.append(_mk(mod, node, "func_def", name))
+    return out
+
+
 def symbols(mod: Module) -> dict:
     """Deterministic symbol inventory for ONE module — the raw vocabulary any
     spec must be grounded in, so the LLM names `cooldown_s` (what the code uses)

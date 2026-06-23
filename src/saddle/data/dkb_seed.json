@@ -239,6 +239,76 @@
       "title": "Static and dynamic substrates need different completeness",
       "body": "Things you can read statically (server code, client code, the protocol, config, schema, docs, text and data files) need REFERENCE completeness: every site that mentions the thing is consistent. Things that hold runtime bytes (database rows, caches, live processes, save, dump, and serialized files) need MIGRATION or INVALIDATION completeness: existing data must be migrated or invalidated when the shape changes. A map that only checks source files will pass while stale saved data still carries the old value.",
       "tags": ["static", "dynamic", "migration", "cache", "persistence", "lesson"]
+    },
+    {
+      "id": "kno_seed_declared_must_be_read",
+      "kind": "lesson",
+      "title": "A declared knob nothing reads is a promise the code never keeps",
+      "body": "An exported setting, a constant, or a config field that is declared but read by no code is dead: it looks like a control a designer can turn, yet turning it changes nothing. An audit of a status-effect system found six such knobs (a max-stacks cap, an armor-ignore flag, three crowd-control toggles) wired to nobody, plus a payload field written into a dict that no consumer ever read back. Treat 'declared but unread anywhere in the project' as a completeness gap of its own, distinct from value propagation: propagation asks whether a read sees modifiers, this asks whether the declaration has any read at all.",
+      "tags": ["dead-code", "declared-not-read", "completeness", "lifecycle", "audit", "lesson"]
+    },
+    {
+      "id": "kno_seed_dead_export",
+      "kind": "anti_pattern",
+      "title": "Exported setting that no code reads",
+      "body": "Adding an exported field, a constant, or a config knob (or writing a key into a payload) and never reading it anywhere, so the control is inert. It silently widens the apparent design surface while doing nothing and misleads every later reader into believing the behavior exists. Either wire the declaration to a real read or delete it.",
+      "tags": ["dead-code", "export", "config", "anti-pattern", "audit"]
+    },
+    {
+      "id": "kno_seed_boundary_enforced_in_code",
+      "kind": "lesson",
+      "title": "A trust boundary lives in code, never in a comment",
+      "body": "A save/replication system documented a mirror contract in a comment block ('mutators no-op on the client so the mirror never drifts from server authority'), yet not one of its public mutators actually called the authority guard, so a client could mutate and persist divergent state. A comment describing an invariant is not the invariant; only a guard the code executes enforces it. When a function must run on the authoritative side only, gate it with an explicit authority check at the top, and verify that gate mechanically rather than trusting the prose beside it.",
+      "tags": ["authority", "server-client", "trust-boundary", "enforcement", "replication", "audit", "lesson"]
+    },
+    {
+      "id": "kno_seed_ungated_mutator",
+      "kind": "anti_pattern",
+      "title": "Authoritative mutator with no authority guard",
+      "body": "A state-mutating method that must run only on the server or owner but carries no is-authority guard, so any peer can call it and corrupt shared or persisted state. Doubly dangerous when a nearby comment claims the guard exists: the documentation reassures while the code omits it.",
+      "tags": ["authority", "mutator", "replication", "anti-pattern", "audit"]
+    },
+    {
+      "id": "kno_seed_every_read_surface_is_a_consumer",
+      "kind": "lesson",
+      "title": "Every display and gate surface is a consumer of the effective value",
+      "body": "When a value can be modified, the engine is not its only consumer: the tooltip, the range indicator, the affordability grey-out, the charge counter, and the slot label all read it too, and each must read the RESOLVED value, not the base. An audit found a HUD where the out-of-range dim, the cost gate, and the tooltip each read base fields, so a talent that extended range or cut cost changed the cast while the UI kept showing and gating on the old numbers. A read-only surface that shows or gates on a stale base value is as broken as an engine that ignores the modifier.",
+      "tags": ["accessor", "hud", "tooltip", "consumer", "propagation", "audit", "lesson"]
+    },
+    {
+      "id": "kno_seed_closed_match_must_be_exhaustive",
+      "kind": "lesson",
+      "title": "A closed match over an identity must be exhaustive or fail loud",
+      "body": "Dispatching on an identity (an effect kind, a status type, a message name) with a catch-all default that silently returns nothing means every member added later is dropped without a trace. An audit found an ability dispatcher whose match handled a fixed handful of effect kinds and let any unrecognized kind fall through to a silent failure. Either enumerate every canonical member, or make the default branch fail loud so a new, unhandled member is impossible to ship unnoticed.",
+      "tags": ["exhaustiveness", "match", "identity", "loud-fail", "dispatch", "audit", "lesson"]
+    },
+    {
+      "id": "kno_seed_two_sets_that_must_agree_are_one",
+      "kind": "lesson",
+      "title": "If two collections must stay in sync, they are one collection",
+      "body": "An audit found two separate constant sets enumerating the same crowd-control kinds for two different purposes; keeping both is a standing invitation for one to gain a member the other lacks. Whenever two lists, maps, or sets are required to hold the same membership, derive one from the other or build both from a single canonical source. Duplicated membership is drift waiting to happen, the identity-level form of copy-paste.",
+      "tags": ["single-source-of-truth", "identity", "duplication", "drift", "audit", "lesson"]
+    },
+    {
+      "id": "kno_seed_signal_needs_listener_and_clear_contract",
+      "kind": "lesson",
+      "title": "An emitted signal needs a listener and an unambiguous contract",
+      "body": "A signal emitted but connected by nobody is a dead wire; a signal reused for a second meaning by emitting it with empty or placeholder arguments overloads its contract so listeners cannot tell the two cases apart. An audit found a save event re-emitted with a blank id purely to nudge a view repaint, conflating 'a specific thing was saved' with 'the view changed'. Give each distinct event its own signal, and check that every emitted signal has at least one connection.",
+      "tags": ["signals", "emit-connect", "contract", "events", "audit", "lesson"]
+    },
+    {
+      "id": "kno_seed_audit_findings_need_verification",
+      "kind": "principle",
+      "title": "Treat every audit finding as a hypothesis until traced to live code",
+      "body": "An automated or model-driven audit reads code in isolation and reports symptoms, so a large fraction of its findings are false positives, stale, or design opinions stated as defects. Before acting on any finding, trace it to the actual dataflow and runtime semantics and classify it true or false; fold only the verified ones into knowledge, and record the rejected ones so the same noise is not re-raised next time. An unverified finding acted on as fact is how a 'fix' breaks working code.",
+      "tags": ["audit", "verification", "false-positive", "discipline", "principle"]
+    },
+    {
+      "id": "kno_seed_common_audit_false_positives",
+      "kind": "lesson",
+      "title": "Common audit false positives: runtime handles, spec-file metadata, intentional markers",
+      "body": "Recurring non-issues an audit raises that are not bugs: a runtime instance handle (an opaque per-instance id) flagged for not following a human-readable naming scheme, when the opaque handle is the correct runtime key; cross-system metadata (provides/reads-from wiring, a system's type) reported as missing from a code template, when that metadata legitimately lives in the spec the template is generated from, not in the template; an underscore-prefixed unused parameter called dead, when the prefix is the language's deliberate 'intentionally unused' marker; and a signal or field reuse flagged as a bug when a comment documents it as intended behavior. Verify the substrate and the convention before treating any of these as a defect.",
+      "tags": ["audit", "false-positive", "runtime-handle", "spec-metadata", "convention", "lesson"]
     }
   ]
 }

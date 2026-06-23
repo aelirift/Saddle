@@ -1,9 +1,14 @@
-"""The impact set — the COMPLETE code fan-out of one value / identity / boundary.
+"""The impact set — the COMPLETE code fan-out of one value / identity / boundary
+/ lifecycle / authority.
 
-These are the three DATAFLOW kinds. The two substrate kinds — cross-substrate
+These are the AST-derived kinds. value/identity/boundary fan out a value through
+the code's dataflow; lifecycle asks the orthogonal question — does a declared
+symbol have ANY read at all (a dead knob looks adjustable but changes nothing);
+authority asks the trust-boundary WRITE question — does a mutator of server state
+guard against a client invoking it. The two substrate kinds — cross-substrate
 references and save/load persistence — fan out the same way in substrate.py
-(their ``gaps()`` is likewise their ``check_*``); this module is not the whole
-map, just its dataflow third.
+(their ``gaps()`` is likewise their ``check_*``); this module is the code-derived
+portion of the map.
 
 WHY THIS EXISTS
 ---------------
@@ -29,7 +34,7 @@ from dataclasses import dataclass, field
 from . import refs
 from .finding import Finding
 from .pyref import Ref
-from .specs import BoundarySpec, IdentitySpec, ValueSpec
+from .specs import AuthoritySpec, BoundarySpec, IdentitySpec, LifecycleSpec, ValueSpec
 
 
 @dataclass
@@ -214,6 +219,89 @@ class BoundaryImpact:
         return out
 
 
+@dataclass
+class LifecycleImpact:
+    """Every site that touches a declared symbol: ``decls`` is each declaration
+    (the ``@export``/const/signal/script-scope field), ``uses`` is every read of
+    it anywhere in the project. The completeness question is the simplest of all —
+    a symbol with declarations and ZERO uses is a DEAD knob: it looks adjustable
+    but consumes into nothing. This is orthogonal to value propagation: that asks
+    whether a read sees the modifier; this asks whether the declaration has any
+    read at all."""
+    spec: LifecycleSpec
+    decls: list[Ref] = field(default_factory=list)
+    uses: list[Ref] = field(default_factory=list)
+
+    @property
+    def domains(self) -> list[str]:
+        return sorted({r.domain for r in self.decls + self.uses})
+
+    def gaps(self) -> list[Finding]:
+        # Only a DECLARED symbol can be dead — no declaration means the spec names
+        # nothing in this code (a naming/spec error, not a liveness gap), so stay
+        # silent rather than cry. A declaration with any read is alive.
+        if not self.decls or self.uses:
+            return []
+        d = self.decls[0]
+        return [Finding(
+            check="lifecycle_liveness",
+            severity="error",
+            node_kind="lifecycle",
+            thing=self.spec.name,
+            message=(
+                f"{self.spec.symbol!r} is declared but never read anywhere — a "
+                f"DEAD knob: it looks adjustable (a designer can set it) but "
+                f"changes nothing, because no code consumes it"
+            ),
+            location=d.location,
+            detail={"symbol": self.spec.symbol,
+                    "declarations": [x.location for x in self.decls]},
+        )]
+
+
+@dataclass
+class AuthorityImpact:
+    """Every site that bears on a set of authoritative mutators: ``mutator_defs``
+    is each mutator's definition; ``guard_calls`` is every authority-guard call
+    that sits INSIDE one of those mutators. A mutator defined with no guard call in
+    its body is unguarded — a client can invoke it and desync / cheat. This is the
+    write-side trust boundary, the mirror of BoundaryImpact's read side."""
+    spec: AuthoritySpec
+    mutator_defs: list[Ref] = field(default_factory=list)
+    guard_calls: list[Ref] = field(default_factory=list)
+
+    @property
+    def guarded_funcs(self) -> set[str]:
+        return {r.func for r in self.guard_calls if r.func is not None}
+
+    @property
+    def unguarded(self) -> list[Ref]:
+        g = self.guarded_funcs
+        return [r for r in self.mutator_defs if r.name not in g]
+
+    @property
+    def domains(self) -> list[str]:
+        return sorted({r.domain for r in self.mutator_defs + self.guard_calls})
+
+    def gaps(self) -> list[Finding]:
+        out: list[Finding] = []
+        for r in self.unguarded:
+            out.append(Finding(
+                check="authority_guard",
+                severity="error",
+                node_kind="authority",
+                thing=self.spec.name,
+                message=(
+                    f"{r.name!r} mutates authoritative state but calls no authority "
+                    f"guard ({' / '.join(self.spec.guards)}) in its body — a client "
+                    f"can invoke it and desync / cheat (server trusts the caller)"
+                ),
+                location=r.location,
+                detail={"func": r.name, "domain": r.domain},
+            ))
+        return out
+
+
 def impact_value(mods: list, spec: ValueSpec) -> ValueImpact:
     imp = ValueImpact(spec=spec)
     resolver_set = set(spec.resolvers)
@@ -241,6 +329,29 @@ def impact_boundary(mods: list, spec: BoundarySpec) -> BoundaryImpact:
     for m in mods:
         imp.all_writes.extend(refs.field_writes(m, spec.key))
         imp.all_reads.extend(refs.field_reads(m, spec.key))
+    return imp
+
+
+def impact_lifecycle(mods: list, spec: LifecycleSpec) -> LifecycleImpact:
+    imp = LifecycleImpact(spec=spec)
+    for m in mods:
+        imp.decls.extend(refs.name_decls(m, spec.symbol))
+        imp.uses.extend(refs.name_uses(m, spec.symbol))
+    return imp
+
+
+def impact_authority(mods: list, spec: AuthoritySpec) -> AuthorityImpact:
+    imp = AuthorityImpact(spec=spec)
+    mutators = set(spec.mutators)
+    for m in mods:
+        for name in spec.mutators:
+            imp.mutator_defs.extend(refs.function_defs(m, name))
+        for g in spec.guards:
+            # A guard call counts only when it sits inside one of the mutators —
+            # the guard must protect THIS write, not merely exist somewhere.
+            for r in refs.calls_to(m, g):
+                if r.func in mutators:
+                    imp.guard_calls.append(r)
     return imp
 
 
@@ -284,6 +395,34 @@ def format_identity_impact(imp: IdentityImpact) -> str:
     out.append(f"  DRIFT uses (NOT in canonical — fix these): {len(imp.drift_refs)}")
     for lit, r in imp.drift_refs:
         out.append(f"      {r.location}  [{r.domain}] {lit!r}")
+    return "\n".join(out)
+
+
+def format_lifecycle_impact(imp: LifecycleImpact) -> str:
+    s = imp.spec
+    out = [f"LIFECYCLE {s.name!r}  (symbol {s.symbol!r})",
+           f"  declarations: {len(imp.decls)}"]
+    for r in imp.decls:
+        out.append(_loc_line(r))
+    out.append(f"  reads: {len(imp.uses)}")
+    for r in imp.uses:
+        out.append(_loc_line(r))
+    if imp.decls and not imp.uses:
+        out.append("  DEAD: declared but read by nobody — fix or remove the knob")
+    return "\n".join(out)
+
+
+def format_authority_impact(imp: AuthorityImpact) -> str:
+    s = imp.spec
+    guarded = imp.guarded_funcs
+    out = [f"AUTHORITY {s.name!r}  (guards: {' / '.join(s.guards)})",
+           f"  mutators: {len(imp.mutator_defs)}"]
+    for r in imp.mutator_defs:
+        mark = "GUARDED" if r.name in guarded else "UNGUARDED — fix this"
+        out.append(f"      [{mark}] {r.location}  [{r.domain}] {r.name}()")
+    out.append(f"  guard calls inside mutators: {len(imp.guard_calls)}")
+    for r in imp.guard_calls:
+        out.append(_loc_line(r))
     return "\n".join(out)
 
 

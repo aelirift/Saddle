@@ -12,13 +12,19 @@ from collections.abc import Iterable
 
 from . import refs
 from .checks import (
+    AuthoritySpec,
+    BindingSpec,
     BoundarySpec,
     IdentitySpec,
+    LifecycleSpec,
     PersistenceSpec,
     ReferenceSpec,
     ValueSpec,
+    check_authority,
+    check_binding,
     check_boundary,
     check_identity,
+    check_lifecycle,
     check_persistence,
     check_reference,
     check_value,
@@ -34,6 +40,9 @@ def run_checks(
     boundaries: Iterable[BoundarySpec] = (),
     persistence: Iterable[PersistenceSpec] = (),
     references: Iterable[ReferenceSpec] = (),
+    lifecycle: Iterable[LifecycleSpec] = (),
+    authority: Iterable[AuthoritySpec] = (),
+    bindings: Iterable[BindingSpec] = (),
     root=None,
 ) -> list[Finding]:
     findings: list[Finding] = []
@@ -45,9 +54,15 @@ def run_checks(
         findings.extend(check_boundary(mods, b))
     for p in persistence:
         findings.extend(check_persistence(mods, p))
+    for lc in lifecycle:
+        findings.extend(check_lifecycle(mods, lc))
+    for a in authority:
+        findings.extend(check_authority(mods, a))
     if root is not None:
         for r in references:
             findings.extend(check_reference(root, r))
+        for bd in bindings:
+            findings.extend(check_binding(root, bd))
     return findings
 
 

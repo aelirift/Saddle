@@ -12,9 +12,10 @@ from __future__ import annotations
 import json
 
 from saddle.codemap import gdref, pyref
-from saddle.codemap.checks import check_persistence, check_reference
+from saddle.codemap.checks import check_binding, check_persistence, check_reference
 from saddle.codemap.manifest import SurfaceManifest
-from saddle.codemap.specs import PersistenceSpec, ReferenceSpec
+from saddle.codemap.specs import BindingSpec, PersistenceSpec, ReferenceSpec
+from saddle.codemap.substrate import impact_binding
 from saddle.codemap.substrate import impact_persistence, impact_reference
 
 
@@ -133,3 +134,161 @@ def test_manifest_gate_references_need_root(tmp_path):
     # with a root, the missing doc reference is gated
     gaps = m.gate(mods, root=tmp_path)
     assert [g.check for g in gaps] == ["reference_presence"]
+
+
+# --- #9c input_binding ----------------------------------------------------
+def _ev_key(code: int) -> str:
+    return (f'Object(InputEventKey,"resource_local_to_scene":false,"device":-1,'
+            f'"pressed":false,"keycode":{code},"physical_keycode":0,"script":null)')
+
+
+def _ev_pad(button: int) -> str:
+    return (f'Object(InputEventJoypadButton,"resource_local_to_scene":false,'
+            f'"device":-1,"button_index":{button},"pressure":0.0,"script":null)')
+
+
+def _ev_mouse(button: int) -> str:
+    # Faithful to Godot's serialization: the nested-paren Vector2(0, 0) fields land
+    # BEFORE button_index. A naive `[^)]*` event regex stops at the inner ')' and
+    # never sees button_index, so a mouse-only action parses as dead. This locks the
+    # split-on-Object( parser that fixes that.
+    return (f'Object(InputEventMouseButton,"resource_local_to_scene":false,'
+            f'"device":-1,"position":Vector2(0, 0),"global_position":Vector2(0, 0),'
+            f'"factor":1.0,"button_index":{button},"pressed":false,"script":null)')
+
+
+def _keymap(actions: dict[str, list[str]]) -> str:
+    """A minimal project.godot with just an [input] section. Each action maps to a
+    list of pre-rendered event strings (empty list -> a dead action)."""
+    lines = ["[application]", 'config/name="t"', "", "[input]", ""]
+    for name, events in actions.items():
+        lines.append(f'{name}={{"deadzone": 0.5, "events": [{", ".join(events)}]}}')
+    return "\n".join(lines) + "\n"
+
+
+# The RayXI bug, distilled: the number row '1' fires the first ability AND a menu
+# panel AND a class-gated card. ability×card is context-exclusive (compatible);
+# ability×panel is the gap.
+_FAMILIES = {"ability": ("ability_",), "card": ("card_play_",),
+             "panel": ("collection_panel", "world_map"),
+             "move": ("forward", "jump"), "dismiss": ("cancel", "pause")}
+_SPEC = BindingSpec(
+    name="wow_keymap", keymap="project.godot", families=_FAMILIES,
+    compatible=(("ability", "card"), ("dismiss", "dismiss")),
+    programmatic=("debug_only",))
+
+
+def test_binding_flags_number_row_panel_collision(tmp_path):
+    (tmp_path / "project.godot").write_text(_keymap({
+        "ability_U": [_ev_key(49)],          # '1'
+        "card_play_1": [_ev_key(49)],         # '1' — compatible with ability
+        "collection_panel": [_ev_key(49)],    # '1' — the BUG: a panel on a cast key
+        "forward": [_ev_key(87)],             # 'W' — clean
+    }))
+    findings = check_binding(tmp_path, _SPEC)
+    assert findings == impact_binding(tmp_path, _SPEC).gaps()
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.check == "input_binding" and f.node_kind == "binding"
+    assert f.detail["trigger"] == "key:49"
+    assert set(f.detail["actions"]) == {"ability_U", "card_play_1", "collection_panel"}
+    # ability×card is tolerated; every flagged pair involves the panel
+    pairs = [tuple(p) for p in f.detail["incompatible_pairs"]]
+    assert pairs == [("ability_U", "collection_panel"), ("card_play_1", "collection_panel")]
+
+
+def test_binding_same_family_overflow_collision(tmp_path):
+    # Two DIFFERENT abilities on one key is a real gap — same-family co-binds are
+    # not tolerated unless ("ability","ability") is declared compatible.
+    (tmp_path / "project.godot").write_text(_keymap({
+        "ability_P": [_ev_key(55)],       # '7'
+        "ability_DIGIT7": [_ev_key(55)],  # '7' — overflow ability re-uses the slot
+    }))
+    findings = check_binding(tmp_path, _SPEC)
+    assert len(findings) == 1
+    assert findings[0].detail["families"] == ["ability"]
+
+
+def test_binding_ability_on_map_key(tmp_path):
+    # The residual overflow case: ability_M and world_map both on 'M' (77).
+    (tmp_path / "project.godot").write_text(_keymap({
+        "ability_M": [_ev_key(77)],
+        "world_map": [_ev_key(77)],
+    }))
+    findings = check_binding(tmp_path, _SPEC)
+    assert len(findings) == 1
+    assert set(findings[0].detail["families"]) == {"ability", "panel"}
+
+
+def test_binding_tolerates_compatible_and_dismiss_cluster(tmp_path):
+    (tmp_path / "project.godot").write_text(_keymap({
+        "ability_U": [_ev_key(49)],
+        "card_play_1": [_ev_key(49)],   # compatible pair -> no collision
+        "cancel": [_ev_key(4194305)],   # Esc
+        "pause": [_ev_key(4194305)],    # Esc — dismiss self-compatible
+    }))
+    assert check_binding(tmp_path, _SPEC) == []
+
+
+def test_binding_dead_action_and_programmatic(tmp_path):
+    (tmp_path / "project.godot").write_text(_keymap({
+        "ability_U": [_ev_key(49)],
+        "settings": [],        # no trigger -> dead
+        "debug_only": [],      # no trigger but declared programmatic -> exempt
+    }))
+    findings = check_binding(tmp_path, _SPEC)
+    assert len(findings) == 1
+    assert findings[0].detail == {"action": "settings", "reason": "no_trigger"}
+
+
+def test_binding_gamepad_collision_detected(tmp_path):
+    (tmp_path / "project.godot").write_text(_keymap({
+        "ability_U": [_ev_key(49), _ev_pad(2)],
+        "collection_panel": [_ev_pad(2)],   # same pad button as an ability
+    }))
+    findings = check_binding(tmp_path, _SPEC)
+    triggers = {f.detail["trigger"] for f in findings}
+    assert "pad_btn:2" in triggers
+
+
+def test_binding_mouse_button_parses_not_dead(tmp_path):
+    # Regression: a mouse-only action carries the nested-paren Vector2(0, 0) fields
+    # before button_index. It must yield a mouse trigger, never be miscounted dead.
+    (tmp_path / "project.godot").write_text(_keymap({
+        "ability_U": [_ev_key(49)],
+        "target_pick": [_ev_mouse(1)],        # mouse-only -> a real trigger, not dead
+    }))
+    imp = impact_binding(tmp_path, _SPEC)
+    assert "target_pick" not in imp.dead_actions
+    assert any(b.action == "target_pick" and b.trigger == "mouse:1"
+               for b in imp.bindings)
+    assert check_binding(tmp_path, _SPEC) == []
+
+
+def test_binding_mouse_button_collision_detected(tmp_path):
+    # And the trigger it produces still collides like any other: a panel sharing the
+    # mouse button with an ability is the same gap class as a shared keycode.
+    (tmp_path / "project.godot").write_text(_keymap({
+        "ability_U": [_ev_mouse(1)],
+        "collection_panel": [_ev_mouse(1)],
+    }))
+    findings = check_binding(tmp_path, _SPEC)
+    assert len(findings) == 1
+    assert findings[0].detail["trigger"] == "mouse:1"
+
+
+def test_binding_missing_keymap_is_a_finding(tmp_path):
+    findings = check_binding(tmp_path, _SPEC)  # no project.godot written
+    assert len(findings) == 1
+    assert "could not be read" in findings[0].message
+
+
+def test_binding_manifest_gate_needs_root(tmp_path):
+    (tmp_path / "project.godot").write_text(_keymap({
+        "ability_U": [_ev_key(49)],
+        "collection_panel": [_ev_key(49)],   # collision
+    }))
+    m = SurfaceManifest(bindings=[_SPEC])
+    assert m.gate([]) == []                       # no root -> bindings skipped
+    gaps = m.gate([], root=tmp_path)
+    assert [g.check for g in gaps] == ["input_binding"]

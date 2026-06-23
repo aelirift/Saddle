@@ -98,6 +98,48 @@ def test_gd_arg_propagation_kills_handoff_fp():
     assert {f.detail["func"] for f in check_value(mods, SPEC)} == {"sweep"}
 
 
+# RayXI's REAL idiom: the resolver is invoked dynamically, `obj.call("resolve_def",
+# ...)`, and the resolved dict is handed to a helper. The original gdref only saw
+# the direct `var x = resolve_def(...)` form, so `def` read as unresolved and every
+# helper it was handed to (`_spawn`) was a false positive — ~90 of them on RayXI,
+# burying the genuine HUD/tooltip base reads. `_activate` resolves via the dynamic
+# call and hands `def` to `_spawn`; `sweep` reads the base raw — the only true gap.
+GD_DYNAMIC_SRC = '''
+func resolve_def(aid, d):
+    return d
+
+func _activate(aid):
+    var def: Dictionary = _registry.call("get_def_by_id", aid)
+    def = _talents.call("apply_ability_modifiers", aid, def)
+    def = _talents.call("resolve_def", aid, def)
+    _spawn(def)
+
+func _spawn(def):
+    var dmg = def.get("damage")
+
+func sweep(inst):
+    if inst.get("damage") > 0:
+        expire(inst)
+'''
+
+DYN_SPEC = ValueSpec(name="damage", field="damage",
+                     accessor=("apply_ability_modifiers", "resolve_def"))
+
+
+def test_gd_dynamic_resolver_binding_kills_handoff_fp():
+    mods = gdref.parse_modules([("abil.gd", GD_DYNAMIC_SRC)])
+    imp = impact_value(mods, DYN_SPEC)
+    # the resolved local is seen through the dynamic .call("resolve_def", ...) form,
+    # so the helper that receives it is covered — and the dispatch method `call`
+    # itself is NOT mistaken for a covered consumer.
+    assert imp.arg_covered_funcs == {"_spawn"}
+    assert "_spawn" in {r.func for r in imp.covered_reads}
+    # only the genuinely raw read survives as a gap
+    assert {r.func for r in imp.uncovered_reads} == {"sweep"}
+    assert check_value(mods, DYN_SPEC) == imp.gaps()
+    assert {f.detail["func"] for f in check_value(mods, DYN_SPEC)} == {"sweep"}
+
+
 def test_no_resolvers_is_noop():
     # An empty resolver set can't cover anything: the guard returns nothing and
     # no read is silently marked covered.
