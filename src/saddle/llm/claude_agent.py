@@ -23,8 +23,11 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
+from pathlib import Path
 from typing import TYPE_CHECKING, AsyncIterator
 
+from saddle import supervise
 from .json_tools import extract_json_text, strip_think
 from .pool import PoolSlot, get_pool
 
@@ -51,6 +54,84 @@ def _env_model() -> str:
 
 def _env_effort() -> str:
     return (os.environ.get("SADDLE_AGENT_EFFORT", "") or "").strip()
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+# Coder liveness bounds (see saddle.supervise). connect/query are control-plane
+# round-trips that should be near-instant — a long wait means the `claude`
+# subprocess never came up. A coding TURN legitimately runs minutes, so it is
+# bounded by an IDLE heartbeat (silence, not duration) plus a generous absolute
+# cap. All overridable via env for slow hosts / very large turns.
+def _connect_deadline_s() -> float:
+    return _env_float("SADDLE_CODER_CONNECT_DEADLINE_S", 60.0)
+
+
+def _idle_deadline_s() -> float:
+    return _env_float("SADDLE_CODER_IDLE_TIMEOUT_S", 240.0)
+
+
+def _turn_deadline_s() -> float:
+    return _env_float("SADDLE_CODER_TURN_DEADLINE_S", 1800.0)
+
+
+_claude_path_resolved: str | None = None
+
+
+def _ensure_claude_on_path() -> str | None:
+    """Make the ``claude`` CLI discoverable to the Agent SDK's subprocess spawn.
+
+    The SDK launches ``claude`` BY NAME; if it is not on ``PATH`` the persistent
+    ``ClaudeSDKClient.connect()`` HANGS with no deadline (the 150s converge hang),
+    and the one-shot caller fails EVERY call and silently degrades to the
+    fallback provider — so saddle's intended Claude LEAD is dead without a single
+    error. Claude Code installs the CLI outside a bare subprocess's ``PATH``
+    (``~/.local/bin``, ``~/.claude/local``, an npm global bin), which a login
+    shell finds but saddle's spawned env does not.
+
+    Resolve it once and prepend its directory to ``PATH`` for this process (the
+    SDK subprocess inherits it). Honors ``$SADDLE_CLAUDE_BIN`` as an explicit
+    override and never hardcodes an absolute home path. Returns the resolved
+    binary path, or ``None`` if ``claude`` is nowhere to be found — in which case
+    callers fail FAST via the connect deadline instead of hanging.
+    """
+    global _claude_path_resolved
+    on_path = shutil.which("claude")
+    if on_path:
+        _claude_path_resolved = on_path
+        return on_path
+    candidates: list[Path] = []
+    override = (os.environ.get("SADDLE_CLAUDE_BIN") or "").strip()
+    if override:
+        candidates.append(Path(override).expanduser())
+    home = Path.home()
+    candidates += [
+        home / ".local" / "bin" / "claude",
+        home / ".claude" / "local" / "claude",
+        home / ".npm-global" / "bin" / "claude",
+        home / "node_modules" / ".bin" / "claude",
+        Path("/usr/local/bin/claude"),
+    ]
+    for cand in candidates:
+        try:
+            if cand.is_file() and os.access(cand, os.X_OK):
+                os.environ["PATH"] = (
+                    f"{cand.parent}{os.pathsep}{os.environ.get('PATH', '')}"
+                )
+                _claude_path_resolved = str(cand)
+                return str(cand)
+        except OSError:
+            continue
+    return None
 
 
 class ClaudeAgentUnavailable(RuntimeError):
@@ -147,6 +228,7 @@ class ClaudeAgentCaller:
                 "schema. No prose, no markdown fences, no commentary.)"
             )
 
+        _ensure_claude_on_path()  # revive the lead: the SDK spawns `claude` by name
         stderr_lines: list[str] = []
         options = self._options(system, stderr_sink=stderr_lines)
         slot_label = f"claude_agent/{label}" if label else "claude_agent"
@@ -241,8 +323,20 @@ class ChatSession:
     async def connect(self) -> None:
         from claude_agent_sdk import ClaudeSDKClient
 
+        _ensure_claude_on_path()  # else the SDK spawns a `claude` it cannot find
         self._client = ClaudeSDKClient(options=self._build_options())
-        await self._client.connect()
+        try:
+            # Bounded: a connect that does not land in seconds means the `claude`
+            # subprocess never came up — fail fast (typed) instead of hanging the
+            # whole converge loop until an external SIGTERM (the 150s hang).
+            await supervise.bounded(
+                self._client.connect(),
+                seconds=_connect_deadline_s(),
+                what="claude coder connect",
+            )
+        except BaseException:
+            self._client = None
+            raise
 
     async def ask(self, prompt: str) -> AsyncIterator[str]:
         """Send one turn; yield assistant text blocks as they arrive.
@@ -257,8 +351,24 @@ class ChatSession:
             await self.connect()
         assert self._client is not None
 
-        await self._client.query(prompt)
-        async for message in self._client.receive_response():
+        # Submitting the turn is a control round-trip — bound it like connect.
+        await supervise.bounded(
+            self._client.query(prompt),
+            seconds=_connect_deadline_s(),
+            what="claude coder query-submit",
+        )
+        # The response stream is HEARTBEAT-watched: any message (assistant text OR
+        # a transparent tool-use / tool-result) resets the idle clock, so a turn
+        # that is actively working never trips it, while a wedged turn (total
+        # silence) does — telling "still coding" apart from "stuck" without ever
+        # capping legitimately long work.
+        stream = supervise.heartbeat(
+            self._client.receive_response(),
+            idle_seconds=_idle_deadline_s(),
+            max_seconds=_turn_deadline_s(),
+            what="claude coder turn",
+        )
+        async for message in stream:
             if isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, TextBlock):

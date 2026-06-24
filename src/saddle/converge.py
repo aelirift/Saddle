@@ -81,6 +81,7 @@ STALLED = "stalled"                # the same gap set recurred — no progress
 EXHAUSTED = "exhausted"            # hit the hard round cap with gaps remaining
 NO_SURFACE = "no_surface"          # design declared no surface — gate can't verify
 CODER_FAILED = "coder_failed"      # coder turn crashed past its retries — halt
+CODER_UNAVAILABLE = "coder_unavailable"  # coder could not START (claude CLI unreachable) — halt fast, never hang
 
 _OK_OUTCOMES: frozenset[str] = frozenset({CONVERGED, ALREADY})
 
@@ -373,7 +374,24 @@ async def converge_design(
     if coder is None:
         coder = ChatSessionCoder(cwd=code_root, on_chunk=on_chunk)
 
-    async with coder:
+    try:
+        await coder.__aenter__()
+    except Exception as exc:  # noqa: BLE001 — coder couldn't START; halt fast
+        # The coder could not even open a session (e.g. the `claude` CLI is
+        # unreachable, so connect hit its deadline). Halt with a DISTINCT outcome
+        # instead of hanging or masquerading as a mid-coding crash — the gate has
+        # nothing to verify because no code was ever written.
+        result = ConvergeResult(
+            design.id, CODER_UNAVAILABLE, rounds=rounds, final_gaps=gaps,
+            error=str(exc),
+        )
+        if persist:
+            _persist(result, design, ctx, dkb)
+        _log.warning("converge: design %s halted — coder unavailable: %s",
+                     design.id, str(exc)[:160])
+        return result
+
+    try:
         for n in range(1, max(1, max_rounds) + 1):
             prompt = (
                 _first_brief(design, surface_text, gaps, directives)
@@ -425,6 +443,11 @@ async def converge_design(
                              design.id, len(after))
                 return result
             gaps = after
+    finally:
+        try:
+            await coder.__aexit__(None, None, None)
+        except Exception:  # noqa: BLE001 — session close is best-effort
+            pass
 
     # Hard cap — a liveness net; stall detection usually fires first.
     result = ConvergeResult(design.id, EXHAUSTED, rounds=rounds, final_gaps=gaps)

@@ -15,6 +15,7 @@ from saddle.codemap import Finding, SurfaceManifest, ValueSpec
 from saddle.converge import (
     ALREADY,
     CODER_FAILED,
+    CODER_UNAVAILABLE,
     CONVERGED,
     EXHAUSTED,
     NO_SURFACE,
@@ -340,3 +341,42 @@ def test_chatsessioncoder_without_sink_just_returns_text():
     coder = ChatSessionCoder(cwd="/x")  # no on_chunk
     coder._session = _FakeAskSession(["a", "b"])
     assert _run(coder.turn("go")) == "ab"
+
+
+# --- coder cannot even START (the 150s hang, now a fast typed halt) -----------
+class _UnopenableCoder:
+    """The coder's session never opens — connect hit its deadline / the `claude`
+    CLI is unreachable. ``__aenter__`` raises; a turn must never be reached."""
+
+    def __init__(self, exc: Exception | None = None):
+        self.turns = 0
+        self._exc = exc or RuntimeError(
+            "claude coder connect: no completion within 60s — treating as wedged"
+        )
+
+    async def __aenter__(self):
+        raise self._exc
+
+    async def __aexit__(self, *exc):
+        return None
+
+    async def turn(self, prompt: str) -> str:
+        self.turns += 1
+        raise AssertionError("turn must not run when the coder never opened")
+
+
+def test_coder_that_cannot_open_halts_unavailable_without_hanging():
+    """A coder whose session never opens halts with the DISTINCT CODER_UNAVAILABLE
+    outcome — fast, typed, no round ever runs — instead of the loop hanging until
+    an external SIGTERM (the converge-against-rayxi hang). The pre-loop gaps are
+    surfaced so the halt is inspectable."""
+    coder = _UnopenableCoder()
+    res = _run(converge_design(
+        _design(), code_root="/nonexistent", coder=coder,
+        gate=_gate_seq([_finding("sweep")]), directives=[], persist=False,
+    ))
+    assert res.status == CODER_UNAVAILABLE and not res.ok
+    assert coder.turns == 0                     # never reached a turn
+    assert res.rounds == []                     # no round ran
+    assert res.final_gaps and res.final_gaps[0].thing == "sweep"
+    assert "wedged" in res.error or "connect" in res.error
