@@ -139,7 +139,10 @@ def _http_error(provider: str, resp: httpx.Response) -> RuntimeError:
 
 
 def _is_retryable_status(status_code: int) -> bool:
-    return status_code in {408, 409, 425, 429, 500, 502, 503, 504}
+    # 529 = Anthropic-style "overloaded": a transient outage, retryable like the
+    # other 5xx. Its omission left both the Kimi path and (once unified) MiniMax
+    # treating an overload as a hard failure instead of a quick backoff-retry.
+    return status_code in {408, 409, 425, 429, 500, 502, 503, 504, 529}
 
 
 def _retry_same_provider(category: str) -> bool:
@@ -554,8 +557,12 @@ class MiniMaxCaller:
                         headers={"Authorization": f"Bearer {self._cfg['api_key']}", "Content-Type": "application/json"},
                         json=body,
                     )
-                if resp.status_code == 529 or resp.status_code == 500:
-                    # iter10: detect permanent token-plan errors and bail
+                if _is_retryable_status(resp.status_code):
+                    # Use the canonical retryable-status set (like KimiCaller)
+                    # rather than a hand-rolled `== 529 or == 500`, which silently
+                    # excluded 502/503/504 — gateway outages every bit as transient
+                    # as 500/529 — so they raised with no in-provider backoff-retry.
+                    # First detect permanent token-plan errors and bail
                     # immediately — retrying a "your current token plan not
                     # support model X" 4 times with 1+2+4+8s backoff is 15s
                     # of pure waste that compounds across ~70 calls per
@@ -574,9 +581,9 @@ class MiniMaxCaller:
                         )
                         raise _http_error("MiniMax", resp)
                     wait = 2 ** attempt  # 1, 2, 4, 8 seconds
-                    # 529/500 → provider_outage (or rate_limit if body
-                    # text mentions throttling). categorize_retry reads
-                    # both signals so the surfacing is accurate.
+                    # 5xx → provider_outage; 429 → external_rate_limit (which
+                    # _retry_same_provider sends straight to failover). categorize
+                    # reads status + body so the surfacing stays accurate.
                     _category = categorize_retry(
                         status_code=resp.status_code,
                         raw_response=body_text,

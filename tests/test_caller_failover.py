@@ -18,7 +18,12 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 
-from saddle.llm.callers import FallbackCaller, _count_thinking_chunks
+from saddle.llm.callers import (
+    FallbackCaller,
+    _count_thinking_chunks,
+    _is_retryable_status,
+    _retry_same_provider,
+)
 from saddle.llm.claude_agent import ClaudeAgentUnavailable
 
 
@@ -210,3 +215,27 @@ def test_tags_split_across_content_bearing_chunks():
 
 def test_empty_stream_counts_zero():
     assert _count_thinking_chunks([]) == 0
+
+
+def test_gateway_5xx_are_retryable_statuses():
+    # THE regression: MiniMax's hand-rolled `== 529 or == 500` covered only
+    # those two, so a 502/503/504 gateway outage — every bit as transient —
+    # raised with NO in-provider backoff-retry. The canonical set covers them.
+    for status in (500, 502, 503, 504, 529):
+        assert _is_retryable_status(status), status
+
+
+def test_client_errors_are_not_retryable_statuses():
+    # A 2xx/4xx is not a transient outage; never burn a retry on it.
+    for status in (200, 400, 401, 403, 404, 422):
+        assert not _is_retryable_status(status), status
+
+
+def test_rate_limit_is_a_retryable_status_but_routes_to_failover():
+    # 429 is in the retryable set, but its category sends the call to a DIFFERENT
+    # provider rather than a same-provider retry that can't clear in the backoff
+    # window — so retryable-status and retry-here are two separate decisions.
+    assert _is_retryable_status(429)
+    assert _retry_same_provider("external_rate_limit") is False
+    assert _retry_same_provider("provider_outage") is True
+    assert _retry_same_provider("timeout") is True
