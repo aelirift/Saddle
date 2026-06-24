@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# saddle launcher — run saddle's CLI from any directory or any session.
+#
+# saddle is a STANDALONE tool. Its CODE lives in its own repo and is merely
+# *used* by rayxi (and any other project) — never embedded in them. This wrapper
+# pins saddle's source on PYTHONPATH and forwards every argument to the CLI.
+#
+# Interpreter resolution (first that exists wins). saddle's design pipeline
+# needs sqlite_vec + httpx (and, for real embeddings, the host torch stack);
+# saddle is documented to borrow an interpreter that already has them rather
+# than vendor its own heavy deps:
+#   1. $SADDLE_PYTHON            — explicit override
+#   2. <saddle>/.venv           — saddle's own venv, if you make one (full independence)
+#   3. rayxiv4/.venv            — the documented default runtime (has the deps)
+#   4. python3                  — system fallback (intake works; design needs sqlite_vec)
+#
+# The focus project is NOT hardcoded: pass --tenant/--project (or set
+# SADDLE_CODE_ROOT) so the same saddle can design/gate for whatever you point it
+# at while staying a separate program.
+set -euo pipefail
+SADDLE_HOME="${SADDLE_HOME:-/home/aeli/projects/saddle}"
+export PYTHONPATH="${SADDLE_HOME}/src${PYTHONPATH:+:$PYTHONPATH}"
+
+pick_python() {
+  if [[ -n "${SADDLE_PYTHON:-}" ]]; then echo "$SADDLE_PYTHON"; return; fi
+  for cand in "${SADDLE_HOME}/.venv/bin/python" \
+              "/home/aeli/projects/rayxiv4/.venv/bin/python"; do
+    [[ -x "$cand" ]] && { echo "$cand"; return; }
+  done
+  command -v python3
+}
+exec "$(pick_python)" -m saddle.cli "$@"
