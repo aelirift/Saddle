@@ -123,10 +123,15 @@ class AuditTarget:
 
 @dataclass
 class AuditPlan:
-    """The full set of audit targets for one project root — the coverage registry."""
+    """The full set of audit targets for one project root — the coverage registry.
+
+    ``code_dirs`` records the SOURCE roots the audit reasons over (``src``/``apps``/
+    …) so the driver parses the system under audit, NOT the build OUTPUT a pipeline
+    scatters across the tree — see :func:`saddle.audit.ground.source_files`."""
 
     root: str
     targets: list[AuditTarget] = field(default_factory=list)
+    code_dirs: list[str] = field(default_factory=list)
 
     def by_kind(self, kind: str) -> list[AuditTarget]:
         return [t for t in self.targets if t.kind == kind]
@@ -135,13 +140,18 @@ class AuditPlan:
         return {t.id for t in self.targets}
 
     def to_dict(self) -> dict:
-        return {"root": self.root, "targets": [t.to_dict() for t in self.targets]}
+        return {
+            "root": self.root,
+            "code_dirs": list(self.code_dirs),
+            "targets": [t.to_dict() for t in self.targets],
+        }
 
     @classmethod
     def from_dict(cls, d: dict) -> "AuditPlan":
         return cls(
             root=str(d.get("root", "")),
             targets=[AuditTarget.from_dict(t) for t in d.get("targets", [])],
+            code_dirs=[str(c) for c in d.get("code_dirs", [])],
         )
 
 
@@ -271,6 +281,9 @@ def build_plan(
     """
     root = Path(root).expanduser().resolve()
     targets: list[AuditTarget] = []
+    resolved_code_dirs = [
+        d for d in (code_dirs or _DEFAULT_CODE_DIRS) if (root / d).is_dir()
+    ]
 
     if include_docs:
         doc_rels = _rglob_globs(root, doc_globs or _DEFAULT_DOC_GLOBS)
@@ -309,7 +322,7 @@ def build_plan(
             ))
 
     if include_packages:
-        for pkg_id, rel in _top_packages(root, code_dirs or _DEFAULT_CODE_DIRS):
+        for pkg_id, rel in _top_packages(root, resolved_code_dirs or _DEFAULT_CODE_DIRS):
             targets.append(AuditTarget(
                 id=f"package:{pkg_id}", kind=PACKAGE, title=pkg_id, source=rel, paths=[rel],
                 question=(
@@ -328,4 +341,7 @@ def build_plan(
                 question=question, paths=[],
             ))
 
-    return AuditPlan(root=str(root), targets=targets)
+    return AuditPlan(
+        root=str(root), targets=targets,
+        code_dirs=resolved_code_dirs or list(_DEFAULT_CODE_DIRS),
+    )

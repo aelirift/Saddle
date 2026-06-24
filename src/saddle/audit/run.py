@@ -21,10 +21,11 @@ from typing import TYPE_CHECKING, Callable
 
 from saddle import supervise
 from saddle.audit.finding import AuditFinding, ERROR, WARN, sort_findings
-from saddle.audit.ground import ground_target, _iter_code_text
+from saddle.audit.ground import (
+    ground_target, _iter_code_text, source_files, parse_sources, _TEXT_SCAN_EXTS,
+)
 from saddle.audit.plan import AuditPlan
 from saddle.audit.probe import audit_target
-from saddle.codemap import refs
 
 if TYPE_CHECKING:  # pragma: no cover
     from saddle.audit.plan import AuditTarget
@@ -32,6 +33,12 @@ if TYPE_CHECKING:  # pragma: no cover
     from saddle.llm.protocol import LLMCaller
 
 _log = logging.getLogger("saddle.audit.run")
+
+# A generous safety net only — with the parse SCOPED to the project's real source
+# dirs (not its generated build output) a whole-project parse is a second or two;
+# this deadline exists so a pathological tree can never wedge the audit before a
+# single probe runs — the liveness rule applied to the setup phase, not just probes.
+_PARSE_DEADLINE_S = 180.0
 
 
 @dataclass
@@ -154,13 +161,41 @@ async def run_audit(
         report.finished = time.time()
         return report
 
-    # Parse + read the code ONCE; every target's grounding reuses it.
-    emit("parse", phase="start")
-    mods = await asyncio.to_thread(_safe_parse, root)
-    code_files = await asyncio.to_thread(refs.project_files, root)
-    # Only pay for the raw text scan if some target actually needs it (registry/seed).
-    need_text = any(t.kind == "registry" or t.seeds for t in targets)
-    code_text = await asyncio.to_thread(_iter_code_text, code_files) if need_text else []
+    # Parse + read the code ONCE; every target's grounding reuses it. SCOPED to the
+    # project's real source dirs (plan.code_dirs) — never the whole repo, which on a
+    # generator pipeline is mostly build OUTPUT and would be slow + memory-heavy +
+    # would pollute the symbol menu. Bounded so even a pathological tree can't wedge
+    # the audit before a probe runs.
+    code_dirs = plan.code_dirs or None
+    emit("parse", phase="start", code_dirs=plan.code_dirs)
+    try:
+        mods = await supervise.bounded(
+            asyncio.to_thread(_safe_parse, root, code_dirs),
+            seconds=_PARSE_DEADLINE_S, what="audit source parse",
+        )
+        # Only pay for the raw text scan if some target actually needs it (registry/seed).
+        need_text = any(t.kind == "registry" or t.seeds for t in targets)
+        if need_text:
+            code_files = await supervise.bounded(
+                asyncio.to_thread(source_files, root, code_dirs, exts=_TEXT_SCAN_EXTS),
+                seconds=_PARSE_DEADLINE_S, what="audit source enumerate",
+            )
+            code_text = await supervise.bounded(
+                asyncio.to_thread(_iter_code_text, code_files),
+                seconds=_PARSE_DEADLINE_S, what="audit source read",
+            )
+        else:
+            code_files, code_text = [], []
+    except supervise.DeadlineExceeded as exc:
+        # Setup itself wedged — fail the whole plan loud (every target pending->failed)
+        # rather than hang. This is the liveness contract honored even before probes.
+        for t in targets:
+            report.coverage.failed[t.id] = f"setup wedged: {exc}"
+        report.finished = time.time()
+        emit("parse", phase="failed", reason=str(exc)[:120])
+        if persist:
+            _persist_report(report, plan, out_dir, root)
+        return report
     emit("parse", phase="done", modules=len(mods), files=len(code_files))
 
     sem = asyncio.Semaphore(max(1, concurrency))
@@ -175,6 +210,7 @@ async def run_audit(
                 grounding = await asyncio.to_thread(
                     ground_target, target, root,
                     mods=mods, code_files=code_files, code_text=code_text,
+                    code_dirs=code_dirs,
                 )
                 if grounding.is_empty():
                     async with lock:
@@ -218,9 +254,9 @@ async def run_audit(
     return report
 
 
-def _safe_parse(root: Path) -> list:
+def _safe_parse(root: Path, code_dirs: list[str] | None) -> list:
     try:
-        return refs.parse_project(root)
+        return parse_sources(root, code_dirs)
     except Exception:  # noqa: BLE001 — code grounding is best-effort
         _log.warning("audit: could not parse code at %s", root, exc_info=True)
         return []

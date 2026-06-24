@@ -36,6 +36,48 @@ _MAX_SITES_PER_KEY = 6          # code sites cited per key
 _MAX_SEED_HITS = 40             # total code lines cited per concern seed
 _PKG_SAMPLE_FILES = 14          # source files sampled to ground a package target
 
+# The audit reasons over the SYSTEM UNDER AUDIT — the project's own source — never
+# the build OUTPUT a pipeline emits. A generator like rayxi scatters tens of
+# thousands of generated .gd/.py game instances across the tree (knowledge/level/…);
+# parsing the whole repo to ground the audit is the slow, memory-heavy mistake that
+# made a probe look hung. We parse/scan only the real code dirs.
+_DEFAULT_CODE_DIRS: tuple[str, ...] = ("src", "app", "apps", "lib", "pkg")
+# Extensions worth a raw-text scan (registry-key dataflow + concern seeds) — broader
+# than what the AST parser reads, so a Go server / TS client congruence gap is seen.
+_TEXT_SCAN_EXTS: set[str] = {
+    ".py", ".gd", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".cs",
+    ".cpp", ".cc", ".c", ".h", ".hpp", ".kt", ".swift", ".rb", ".php",
+}
+
+
+def source_files(root, code_dirs: list[str] | None = None, *, exts: set[str] | None = None) -> list[str]:
+    """Parseable source under the project's real code dirs ONLY (``src``/``apps``/…),
+    never the whole repo. Falls back to the whole root only for a flat project that
+    has none of the conventional code dirs. ``exts`` defaults to the AST languages
+    (py/gd); pass :data:`_TEXT_SCAN_EXTS` for a broader raw-text scan."""
+    root = Path(root)
+    dirs = code_dirs or list(_DEFAULT_CODE_DIRS)
+    out: list[str] = []
+    seen: set[str] = set()
+    for d in dirs:
+        base = root / d
+        if not base.is_dir():
+            continue
+        for f in refs.project_files(base, exts=exts):
+            if f not in seen:
+                seen.add(f)
+                out.append(f)
+    if not out and not any((root / d).is_dir() for d in dirs):
+        return refs.project_files(root, exts=exts)  # flat repo: nothing else to scope to
+    return sorted(out)
+
+
+def parse_sources(root, code_dirs: list[str] | None = None) -> list:
+    """Parse the project's source dirs into Modules — the scoped equivalent of
+    :func:`refs.parse_project`, so the symbol menu reflects the pipeline's own
+    vocabulary, not the generated games it outputs."""
+    return refs.parse_paths(source_files(root, code_dirs))
+
 
 @dataclass
 class Grounding:
@@ -239,12 +281,15 @@ def ground_target(
     mods: list | None = None,
     code_files: list[str] | None = None,
     code_text: list[tuple[str, str]] | None = None,
+    code_dirs: list[str] | None = None,
 ) -> Grounding:
     """Assemble the full :class:`Grounding` for one :class:`~saddle.audit.plan.AuditTarget`.
 
     ``mods``/``code_files``/``code_text`` are parsed/read ONCE by the driver and
     passed in so a whole-plan run does not re-parse per target. Any missing piece
-    is recomputed best-effort here, so a single target can also be grounded alone.
+    is recomputed best-effort here (scoped to ``code_dirs`` — the project's real
+    source, NOT the whole repo), so a single target can also be grounded alone
+    without the whole-tree parse that made a probe look hung.
     """
     root = Path(root).expanduser().resolve()
     g = Grounding(target_id=target.id)
@@ -255,7 +300,7 @@ def ground_target(
 
     if mods is None:
         try:
-            mods = refs.parse_project(root)
+            mods = parse_sources(root, code_dirs)
         except Exception:  # noqa: BLE001 — code grounding is best-effort
             mods = []
     if mods:
@@ -268,7 +313,7 @@ def ground_target(
     if needs_scan:
         if code_text is None:
             if code_files is None:
-                code_files = refs.project_files(root)
+                code_files = source_files(root, code_dirs, exts=_TEXT_SCAN_EXTS)
             code_text = _iter_code_text(code_files)
         if target.kind == "registry" and target.paths:
             # A collapsed family carries several sample files — union their keys so

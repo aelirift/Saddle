@@ -410,13 +410,24 @@ def _run_audit(args: argparse.Namespace) -> int:
         if not narrate:
             return
         kind = ev.get("event")
-        if kind == "progress":
+        if kind == "plan":
+            sys.stderr.write(f"[audit] {ev.get('targets', 0)} target(s) to probe under {ev.get('root','')}\n")
+        elif kind == "parse" and ev.get("phase") == "start":
+            dirs = ", ".join(ev.get("code_dirs") or []) or "(whole root)"
+            sys.stderr.write(f"[audit] parsing source dirs: {dirs} …\n")
+        elif kind == "parse" and ev.get("phase") == "done":
+            sys.stderr.write(f"[audit] parsed {ev.get('modules', 0)} module(s) / {ev.get('files', 0)} file(s) — probing\n")
+        elif kind == "parse" and ev.get("phase") == "failed":
+            sys.stderr.write(f"[audit] SETUP WEDGED: {ev.get('reason','')}\n")
+        elif kind == "progress":
             sys.stderr.write(f"\r[audit] {ev['done']}/{ev['total']} targets probed")
             sys.stderr.flush()
         elif kind == "target" and ev.get("status") == "ran":
             sys.stderr.write(f"\r[audit] {ev['id']} -> {ev['findings']} finding(s)\n")
         elif kind == "target" and ev.get("status") == "failed":
             sys.stderr.write(f"\r[audit] {ev['id']} FAILED: {ev.get('reason','')}\n")
+        elif kind == "target" and ev.get("status") == "skipped":
+            sys.stderr.write(f"\r[audit] {ev['id']} skipped: {ev.get('reason','')}\n")
 
     report = asyncio.run(run_audit(
         plan, ctx=ctx, kinds=kinds, only=only,
