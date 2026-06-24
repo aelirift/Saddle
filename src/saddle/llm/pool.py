@@ -28,6 +28,7 @@ import logging
 import os
 import time
 
+from saddle import supervise
 from saddle.context import Context
 from saddle.trace import get_trace
 
@@ -105,6 +106,23 @@ _COOLDOWN_HIGH_S = 1.0    # slightly longer at high load
 _MEM_CEILING_PCT = float(_pool_policy().get("mem_ceiling_pct", 80.0))   # hard stop — no new procs above this
 _MEM_RESUME_PCT = float(_pool_policy().get("mem_resume_pct", 70.0))    # resume admitting below this
 _MEM_POLL_S = 3           # how often to recheck when paused on memory
+
+# Upper bound on how long admission will WAIT for memory to fall below the
+# ceiling. The ceiling can only pause NEW acquires; it cannot reclaim in-flight
+# calls, so if something ELSE on the host holds RAM above the ceiling and never
+# frees it, the wait loop would spin forever — a silent hang with only a periodic
+# warning, exactly the "I never see saddle return" failure. Past this budget the
+# ONE blocked acquire raises supervise.DeadlineExceeded (a typed signal the caller
+# fails the call / fails over on) instead of wedging the whole run. 0 disables the
+# bound (wait forever) — an EXPLICIT opt-out, never the silent default.
+try:
+    _MEM_WAIT_DEADLINE_S = float(
+        os.environ.get("SADDLE_POOL_MEM_WAIT_DEADLINE_S")
+        or os.environ.get("RAYXI_POOL_MEM_WAIT_DEADLINE_S")
+        or _pool_policy().get("mem_wait_deadline_s", 600.0)
+    )
+except (TypeError, ValueError):
+    _MEM_WAIT_DEADLINE_S = 600.0
 
 
 def _memory_usage_percent() -> float:
@@ -192,56 +210,88 @@ class ProcessPool:
         return _COOLDOWN_LOW_S if self._active < _ACTIVE_THRESHOLD else _COOLDOWN_HIGH_S
 
     async def acquire(self, label: str = "") -> float:
-        """Acquire a slot. Returns the wall-clock start time for stats."""
+        """Acquire a slot. Returns the wall-clock start time for stats.
+
+        Raises :class:`supervise.DeadlineExceeded` if memory stays above the
+        ceiling for longer than ``_MEM_WAIT_DEADLINE_S`` — admission waits, but
+        it does NOT wait forever.
+        """
         # Hard cap — blocks if _MAX_PROCS already active (host-aware; see
         # _default_max_procs)
         await self._semaphore.acquire()
 
-        # Serialize admission decisions so batching works
-        async with self._admission:
-            # Hard stop while memory is above ceiling
-            usage = _memory_usage_percent()
-            while usage >= _MEM_CEILING_PCT:
-                _log.warning(
-                    "Pool: memory %.0f%% >= ceiling %d%%, %d active — "
-                    "paused until %.0f%%",
-                    usage, _MEM_CEILING_PCT, self._active, _MEM_RESUME_PCT,
+        # The hard-cap slot is now HELD. Everything below can wait (memory
+        # gate), sleep (cooldown), be cancelled, or raise the memory deadline —
+        # any exit that is NOT the normal return must hand the slot back, or the
+        # pool permanently shrinks by one (and eventually deadlocks). release()
+        # only runs via PoolSlot.__aexit__, which never fires if acquire raises,
+        # so the slot return is this method's own responsibility.
+        admitted = False
+        try:
+            # Serialize admission decisions so batching works
+            async with self._admission:
+                # Hard stop while memory is above ceiling — BOUNDED so sustained
+                # external pressure can't wedge the acquire forever.
+                usage = _memory_usage_percent()
+                waited = 0.0
+                while usage >= _MEM_CEILING_PCT:
+                    if _MEM_WAIT_DEADLINE_S > 0 and waited >= _MEM_WAIT_DEADLINE_S:
+                        raise supervise.DeadlineExceeded(
+                            f"pool admission [{label or 'unlabeled'}]: memory "
+                            f"{usage:.0f}% stayed >= ceiling {_MEM_CEILING_PCT:.0f}% "
+                            f"for {waited:.0f}s — refusing to wait forever"
+                        )
+                    _log.warning(
+                        "Pool: memory %.0f%% >= ceiling %d%%, %d active — "
+                        "paused until %.0f%% (waited %.0fs/%.0fs)",
+                        usage, _MEM_CEILING_PCT, self._active, _MEM_RESUME_PCT,
+                        waited, _MEM_WAIT_DEADLINE_S,
+                    )
+                    trace = get_trace()
+                    if trace:
+                        trace.pool_pause(f"memory_ceiling_{usage:.0f}pct",
+                                         self._active, usage)
+                    await asyncio.sleep(_MEM_POLL_S)
+                    waited += _MEM_POLL_S
+                    usage = _memory_usage_percent()
+                    if usage < _MEM_RESUME_PCT:
+                        _log.info("Pool: memory %.0f%% < resume %d%% — resuming",
+                                  usage, _MEM_RESUME_PCT)
+                        break
+
+                self._active += 1
+                admitted = True
+                self._batch_admitted += 1
+                batch_sz = self._batch_size()
+                _log.debug(
+                    "Pool: acquired [%s] (memory %.0f%%, %d active, batch %d/%d)",
+                    label, usage, self._active, self._batch_admitted, batch_sz,
                 )
                 trace = get_trace()
                 if trace:
-                    trace.pool_pause(f"memory_ceiling_{usage:.0f}pct",
-                                     self._active, usage)
-                await asyncio.sleep(_MEM_POLL_S)
-                usage = _memory_usage_percent()
-                if usage < _MEM_RESUME_PCT:
-                    _log.info("Pool: memory %.0f%% < resume %d%% — resuming",
-                              usage, _MEM_RESUME_PCT)
-                    break
+                    trace.pool_acquire(label, self._active, usage)
 
-            self._active += 1
-            self._batch_admitted += 1
-            batch_sz = self._batch_size()
-            _log.debug(
-                "Pool: acquired [%s] (memory %.0f%%, %d active, batch %d/%d)",
-                label, usage, self._active, self._batch_admitted, batch_sz,
-            )
-            trace = get_trace()
-            if trace:
-                trace.pool_acquire(label, self._active, usage)
+                # After a full batch, cooldown to let memory settle
+                if self._batch_admitted >= batch_sz:
+                    self._batch_admitted = 0
+                    cd = self._cooldown()
+                    _log.debug(
+                        "Pool: batch full — cooling down %.1fs before next batch",
+                        cd,
+                    )
+                    if trace:
+                        trace.pool_batch_cooldown(batch_sz, cd, self._active)
+                    await asyncio.sleep(cd)
 
-            # After a full batch, cooldown to let memory settle
-            if self._batch_admitted >= batch_sz:
-                self._batch_admitted = 0
-                cd = self._cooldown()
-                _log.debug(
-                    "Pool: batch full — cooling down %.1fs before next batch",
-                    cd,
-                )
-                if trace:
-                    trace.pool_batch_cooldown(batch_sz, cd, self._active)
-                await asyncio.sleep(cd)
-
-        return time.monotonic()
+            return time.monotonic()
+        except BaseException:
+            # Memory-deadline raise, cancellation, or any error after the slot
+            # was taken — undo the admission counter (if we got that far) and
+            # release the hard-cap slot so a transient failure never strands it.
+            if admitted:
+                self._active -= 1
+            self._semaphore.release()
+            raise
 
     def release(self, label: str = "", start_time: float = 0.0) -> None:
         self._active -= 1

@@ -42,6 +42,7 @@ from .claude_agent import ClaudeAgentUnavailable
 from .retry_category import categorize_retry
 from .policy import active_priority, merged_config
 from saddle.context import Context
+from saddle import supervise
 
 _KIMI_CRED_PATH = Path.home() / ".kimi/credentials/kimi-code.json"
 _KIMI_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
@@ -73,6 +74,42 @@ def _env_float(name: str, default: float) -> float:
 
 def _provider_deadline_seconds() -> float:
     return _env_float("RAYXI_LLM_PROVIDER_DEADLINE_SECONDS", 0.0)
+
+
+def _minimax_stream_idle_seconds() -> float:
+    """Idle-heartbeat budget for a MiniMax SSE stream: silence longer than this
+    means the stream is wedged, not merely slow. Sized above a reasoning model's
+    time-to-first-token under load (TTFT can be tens of seconds) so real CoT
+    streaming never trips it, yet far under httpx's 600s read ceiling so a dead
+    connection is caught in minutes, not ten of them."""
+    return _env_float("RAYXI_MINIMAX_STREAM_IDLE_SECONDS", 180.0)
+
+
+def _minimax_stream_max_seconds() -> float:
+    """Wall-clock ceiling across a whole MiniMax stream — mirrors the httpx
+    client timeout default so the two agree on 'this turn has gone on too long'."""
+    return _env_float("RAYXI_MINIMAX_STREAM_MAX_SECONDS", 600.0)
+
+
+def _circuit_failure_threshold() -> int:
+    """Consecutive failover-routing failures from one provider before the
+    FallbackCaller trips its circuit and stops re-attempting it on every call.
+    0 disables the breaker (always re-try every provider, every call)."""
+    raw = os.environ.get("SADDLE_CIRCUIT_FAILURE_THRESHOLD")
+    if raw is None or not raw.strip():
+        return 3
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 3
+
+
+def _circuit_cooldown_s() -> float:
+    """How long a tripped provider is skipped before a single half-open re-probe.
+    Sized so a reliably-down lead (e.g. a crashing local CLI) is probed about
+    once per minute instead of on all N calls of a run, yet recovers promptly
+    once it comes back."""
+    return _env_float("SADDLE_CIRCUIT_COOLDOWN_S", 60.0)
 
 
 async def _call_with_provider_deadline(
@@ -453,7 +490,19 @@ class MiniMaxCaller:
                 body_text = (await resp.aread()).decode("utf-8", errors="replace")
                 raise RuntimeError(f"MiniMax error {resp.status_code}: {body_text[:500]}")
 
-            async for raw_line in resp.aiter_lines():
+            # Wrap the SSE line stream in an idle heartbeat: httpx's read timeout
+            # only fires if a single read blocks, so a connection that stays OPEN
+            # but goes SILENT mid-turn would hang up to the full 600s read ceiling
+            # with nothing to distinguish "still thinking" from "wedged". The
+            # heartbeat resets on every line, so real CoT streaming sails through
+            # while true silence past the idle window raises Stalled — the same
+            # liveness discipline the claude path already has on its stream.
+            async for raw_line in supervise.heartbeat(
+                resp.aiter_lines(),
+                idle_seconds=_minimax_stream_idle_seconds(),
+                max_seconds=_minimax_stream_max_seconds(),
+                what=f"minimax stream {label or 'request'}",
+            ):
                 line = (raw_line or "").strip()
                 if not line or line.startswith(":"):
                     continue
@@ -641,7 +690,14 @@ class MiniMaxCaller:
                         continue
                     raise last_exc
                 return text
-            except (httpx.TimeoutException, httpx.TransportError) as exc:
+            except (httpx.TimeoutException, httpx.TransportError,
+                    supervise.Stalled, supervise.DeadlineExceeded) as exc:
+                # A wedged-but-open stream (supervise.Stalled / DeadlineExceeded)
+                # is treated exactly like an httpx transport timeout: retry once
+                # in case it was a momentary provider hiccup, then RAISE so the
+                # FallbackCaller routes the call to the next provider instead of
+                # the run sitting silent — the user's "I never see you return"
+                # failure mode, now turned into a fast, typed failover.
                 last_exc = exc
                 if attempt < 1:
                     wait = 2 ** attempt
@@ -1042,29 +1098,109 @@ def _failover_routes_past(exc: Exception) -> bool:
 
 
 class FallbackCaller:
-    def __init__(self, callers: list) -> None:
+    """Try providers in order; route past a transient/unavailable failure to the
+    next; re-raise a genuine error so real defects aren't masked.
+
+    A CIRCUIT BREAKER keeps a provider that fails on EVERY call from being
+    re-attempted on every call: after ``failure_threshold`` consecutive
+    failover-routing failures the provider is tripped OPEN and skipped for
+    ``cooldown_s`` — then a single half-open re-probe lets it back in the moment
+    it recovers (a success resets the breaker). Without this, a reliably-down
+    lead (e.g. a local CLI that crashes on every spawn) makes every call in a run
+    pay its full failure latency before falling over — the exact wasted-work
+    drag observed auditing rayxi with a wedged ``claude`` CLI. The breaker NEVER
+    leaves the chain with zero attempts: if every provider is open, a last-resort
+    pass tries the open ones anyway.
+    """
+
+    def __init__(
+        self,
+        callers: list,
+        *,
+        failure_threshold: int | None = None,
+        cooldown_s: float | None = None,
+    ) -> None:
         self._callers = callers
+        self._failure_threshold = (
+            _circuit_failure_threshold() if failure_threshold is None
+            else max(0, failure_threshold)
+        )
+        self._cooldown_s = (
+            _circuit_cooldown_s() if cooldown_s is None else cooldown_s
+        )
+        # keyed by chain index: consecutive failures, and the monotonic time the
+        # provider's circuit re-closes (0.0 == closed).
+        self._fail_counts: dict[int, int] = {}
+        self._open_until: dict[int, float] = {}
+
+    def _breaker_open(self, i: int, now: float) -> bool:
+        return self._open_until.get(i, 0.0) > now
+
+    def _record_success(self, i: int) -> None:
+        if self._fail_counts.get(i) or self._open_until.get(i):
+            _log.info(
+                "FallbackCaller: %s recovered — circuit reset",
+                type(self._callers[i]).__name__,
+            )
+        self._fail_counts[i] = 0
+        self._open_until[i] = 0.0
+
+    def _record_failure(self, i: int, now: float) -> None:
+        if self._failure_threshold <= 0:
+            return
+        count = self._fail_counts.get(i, 0) + 1
+        self._fail_counts[i] = count
+        if count >= self._failure_threshold and not self._breaker_open(i, now):
+            self._open_until[i] = now + self._cooldown_s
+            _log.warning(
+                "FallbackCaller: %s tripped circuit after %d consecutive "
+                "failures — skipping for %.0fs",
+                type(self._callers[i]).__name__, count, self._cooldown_s,
+            )
 
     async def __call__(self, system: str, prompt: str, *, json_mode: bool = False, label: str = "") -> str:
         last_exc: Exception | None = None
-        for caller in self._callers:
-            try:
-                return await _call_with_provider_deadline(
-                    caller,
-                    system,
-                    prompt,
-                    json_mode=json_mode,
-                    label=label,
-                )
-            except Exception as exc:
-                if _failover_routes_past(exc):
-                    _log.warning(
-                        "FallbackCaller: %s failed (%s), trying next…",
-                        type(caller).__name__, str(exc)[:120],
+        threshold = self._failure_threshold
+        # Pass 1 tries providers whose circuit is CLOSED (or whose cooldown has
+        # lapsed → a half-open re-probe). Pass 2 only runs if pass 1 SKIPPED an
+        # open provider and nothing has yet succeeded — it tries the still-open
+        # ones as a last resort so a tripped breaker never yields zero attempts.
+        skipped_open = False
+        for pass_no in (1, 2):
+            if pass_no == 2 and not skipped_open:
+                break
+            for i, caller in enumerate(self._callers):
+                now = time.monotonic()
+                is_open = self._breaker_open(i, now)
+                if pass_no == 1 and threshold > 0 and is_open:
+                    skipped_open = True
+                    _log.info(
+                        "FallbackCaller: %s circuit open — skipping, trying next…",
+                        type(caller).__name__,
                     )
-                    last_exc = exc
-                else:
-                    raise
+                    continue
+                if pass_no == 2 and not is_open:
+                    continue  # already attempted in pass 1
+                try:
+                    result = await _call_with_provider_deadline(
+                        caller,
+                        system,
+                        prompt,
+                        json_mode=json_mode,
+                        label=label,
+                    )
+                    self._record_success(i)
+                    return result
+                except Exception as exc:
+                    if _failover_routes_past(exc):
+                        self._record_failure(i, time.monotonic())
+                        _log.warning(
+                            "FallbackCaller: %s failed (%s), trying next…",
+                            type(caller).__name__, str(exc)[:120],
+                        )
+                        last_exc = exc
+                    else:
+                        raise
         raise RuntimeError(f"All callers failed. Last error: {last_exc}")
 
 
