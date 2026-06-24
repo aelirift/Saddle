@@ -125,17 +125,39 @@ def field_reads(mod: Module, field: str) -> list[Ref]:
     return refs
 
 
+def _write_target(mod: Module, t, field: str) -> Ref | None:
+    """Classify a single Store-context target as a write of `field`, else None."""
+    if isinstance(t, ast.Attribute) and t.attr == field and isinstance(t.ctx, ast.Store):
+        return _mk(mod, t, "attr_write", field)
+    if isinstance(t, ast.Subscript) and isinstance(t.ctx, ast.Store) and _str_const(t.slice) == field:
+        return _mk(mod, t, "subscript_write", field)
+    return None
+
+
 def field_writes(mod: Module, field: str) -> list[Ref]:
-    """Every Store-context write of `field`: `x.field = ...` / `x['field'] = ...`."""
+    """Every Store-context write of `field`: plain `x.field = ...` / `x['field'] = ...`,
+    augmented `x.field += ...` (the dominant mutation idiom — a bare-`ast.Assign`
+    walk silently missed every `+=`/`-=`, leaving the boundary/persistence axes
+    blind to Python's own most common write), and annotated `x.field: T = ...`.
+
+    An augmented write reads-then-writes; it is classed as the WRITE only,
+    matching the GDScript sibling — so a direct base mutation (`inst.cd -= r`) is
+    not re-flagged by the value axis as a modifier that missed the resolver."""
     refs: list[Ref] = []
     for node in ast.walk(mod.tree):
         if isinstance(node, ast.Assign):
             for t in node.targets:
-                if isinstance(t, ast.Attribute) and t.attr == field and isinstance(t.ctx, ast.Store):
-                    refs.append(_mk(mod, t, "attr_write", field))
-                elif isinstance(t, ast.Subscript) and isinstance(t.ctx, ast.Store):
-                    if _str_const(t.slice) == field:
-                        refs.append(_mk(mod, t, "subscript_write", field))
+                r = _write_target(mod, t, field)
+                if r is not None:
+                    refs.append(r)
+        elif isinstance(node, ast.AugAssign):
+            r = _write_target(mod, node.target, field)
+            if r is not None:
+                refs.append(r)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            r = _write_target(mod, node.target, field)
+            if r is not None:
+                refs.append(r)
     return refs
 
 
@@ -335,14 +357,23 @@ def name_uses(mod: Module, name: str) -> list[Ref]:
     read through `self`/an instance). Deliberately permissive over the attribute
     base — the conservative bias for a liveness check is to over-count reads so a
     symbol is flagged DEAD only when truly nothing references it (a false 'dead' is
-    worse than a missed one). A Store target is not a read, so a symbol with
-    declarations but zero name_uses is dead."""
+    worse than a missed one). A plain Store target is not a read — BUT an
+    augmented assignment (`NAME += 1`, whose target carries a Store ctx) reads
+    the symbol before writing it, so it counts as a use (over-counting is the
+    safe direction: a knob only ever incremented must not read as dead). A symbol
+    with declarations and zero name_uses is dead."""
     out: list[Ref] = []
     for node in ast.walk(mod.tree):
         if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Load):
             out.append(_mk(mod, node, "use", name))
         elif isinstance(node, ast.Attribute) and node.attr == name and isinstance(node.ctx, ast.Load):
             out.append(_mk(mod, node, "use", name))
+        elif isinstance(node, ast.AugAssign):
+            t = node.target
+            if (isinstance(t, ast.Name) and t.id == name) or (
+                isinstance(t, ast.Attribute) and t.attr == name
+            ):
+                out.append(_mk(mod, t, "use", name))
     return out
 
 

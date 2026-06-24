@@ -78,6 +78,15 @@ def tick(self):
     self.health = self.health - 1   # written, but never packed and never mirrored
 '''
 
+# The dominant mutation idiom: an AUGMENTED write. A bare-`ast.Assign` walk saw
+# nothing here, so the leak shipped silently — the adapter was blind to Python's
+# own most common write on its own target language.
+BOUND_SERVER_AUG = '''
+# saddle-domain: server
+def tick(self):
+    self.health -= 1                # augmented write — same authoritative mutation
+'''
+
 
 def test_value_impact_partitions_and_gate_projects():
     mods = pyref.parse_modules([("abil.py", VALUE_SRC)])
@@ -133,3 +142,18 @@ def test_boundary_impact_unmirrored_flags_both_legs():
     assert "not read into 'replicate'" in msgs                # not packed into snapshot
     assert "no client-domain code reads it" in msgs           # never lands on screen
     assert all(f.check == "boundary_mirror" for f in imp.gaps())
+
+
+def test_boundary_impact_sees_augmented_server_write():
+    # Regression: `self.health -= 1` is the authoritative write. The adapter once
+    # walked only `ast.Assign`, so an augmented write produced ZERO server writes
+    # and the boundary axis silently passed (the leak shipped). It must now flag
+    # the un-mirrored write exactly as the plain-assignment form does.
+    mods = pyref.parse_modules([("server/state.py", BOUND_SERVER_AUG)])
+    spec = BoundarySpec(name="health", key="health", replication_func="replicate")
+    imp = impact_boundary(mods, spec)
+    assert [w.kind for w in imp.server_writes] == ["attr_write"]   # the -= is SEEN
+    assert check_boundary(mods, spec) == imp.gaps()               # gate == projection
+    msgs = " ".join(f.message for f in imp.gaps())
+    assert "not read into 'replicate'" in msgs
+    assert "no client-domain code reads it" in msgs

@@ -86,6 +86,32 @@ def test_refs_symbols_top_caps_and_ranks():
     assert len(top["collections"]) == 10            # capped
 
 
+# Augmented (`-=`) and annotated (`: int =`) writes — the idioms a bare-Assign
+# walk silently dropped. `hp` is mutated three ways; `armor` is annotated-assigned.
+WRITE_SRC = '''
+class Unit:
+    def hit(self):
+        self.hp = self.hp - 1     # plain assign  -> write + RHS read
+        self.hp -= 1              # augmented      -> write (read folded into it)
+        self.armor: int = 0       # annotated      -> write
+'''
+
+
+def test_pyref_augmented_and_annotated_are_writes():
+    mod = pyref.parse_modules([("u.py", WRITE_SRC)])[0]
+    hp_writes = pyref.field_writes(mod, "hp")
+    assert [w.kind for w in hp_writes] == ["attr_write", "attr_write"]   # plain + augmented
+    # the augmented write's implicit read is folded into the write, NOT re-counted
+    # as a base read (matches gdref; keeps the value axis from re-flagging it)
+    assert [r.lineno for r in pyref.field_reads(mod, "hp")] == [4]       # only the RHS read
+    assert [w.kind for w in pyref.field_writes(mod, "armor")] == ["attr_write"]
+
+
+def test_pyref_augmented_name_counts_as_a_use():
+    mod = pyref.parse_modules([("c.py", "N = 0\n\ndef f():\n    global N\n    N += 1\n")])[0]
+    assert [r.kind for r in pyref.name_uses(mod, "N")] == ["use"]        # the += reads N
+
+
 def test_project_files_excludes_vendored_dirs(tmp_path):
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "a.py").write_text("x = 1\n")

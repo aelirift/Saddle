@@ -94,6 +94,19 @@ def test_undeclared_symbol_is_silent_not_dead():
         assert imp.gaps() == []
 
 
+def test_augmented_only_symbol_is_not_falsely_dead():
+    # A counter declared then only ever `+= 1` (its target carries a Store ctx, so
+    # the naive Load-only walk saw zero reads and cried 'dead knob'). An augmented
+    # assignment genuinely READS the symbol to compute the new value, so it is a
+    # use — over-counting in the safe direction, never a false dead.
+    src = "TOTAL = 0\n\ndef bump():\n    global TOTAL\n    TOTAL += 1\n"
+    mods = pyref.parse_modules([("acc.py", src)])
+    imp = impact_lifecycle(mods, _spec("TOTAL"))
+    assert imp.decls and imp.uses
+    assert imp.gaps() == []
+    assert check_lifecycle(mods, _spec("TOTAL")) == []
+
+
 def test_liveness_is_project_wide_declared_here_read_there():
     # Declared in one module, read in ANOTHER — alive. Liveness is a whole-project
     # question (a knob read by any module is live), so the impact unions across
