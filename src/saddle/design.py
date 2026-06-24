@@ -333,8 +333,10 @@ async def _surface(
     symbols) and return it with its current code fan-out. No code ⇒ empty manifest
     and no LLM call. ``root`` lets the fan-out also scan the file substrates
     (references) so the body sees what's missing from config/docs/schema, not only
-    code. The LLM contract here is saddle's own, so a malformed reply surfaces
-    loudly (via call_json) rather than being swallowed."""
+    code. The LLM contract here is saddle's own, so a wholesale-malformed reply
+    surfaces loudly (via call_json); an individual spec ROW the LLM left
+    incomplete is dropped with a loud warning (SurfaceManifest.from_dict) so one
+    missing field never aborts the design — never silently swallowed."""
     if not mods:
         return SurfaceManifest(), ""
     menu = await asyncio.to_thread(lambda: refs.symbols(mods).top())

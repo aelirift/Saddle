@@ -27,6 +27,7 @@ AND verifiable:
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 from .finding import Finding
@@ -65,6 +66,24 @@ from .substrate import (
     impact_persistence,
     impact_reference,
 )
+
+_log = logging.getLogger("saddle.codemap.manifest")
+
+
+def _rows(items, conv, kind: str) -> list:
+    """Convert each raw spec row, dropping (LOUDLY) any the LLM left malformed.
+
+    A surface row that omits a required key is exactly the LLM-omission failure
+    mode saddle exists to absorb: skip THAT row and keep the rest of the manifest
+    (and the design body) rather than letting one missing field abort the whole
+    design. The warning keeps every drop visible — resilient, never silent."""
+    out: list = []
+    for x in items or []:
+        try:
+            out.append(conv(x))
+        except (KeyError, TypeError, AttributeError) as e:
+            _log.warning("surface: dropping malformed %s spec %r (%s)", kind, x, e)
+    return out
 
 
 def _value_to_dict(s: ValueSpec) -> dict:
@@ -187,14 +206,14 @@ class SurfaceManifest:
     def from_dict(cls, d: dict | None) -> "SurfaceManifest":
         d = d or {}
         return cls(
-            values=[_value_from_dict(x) for x in d.get("values", [])],
-            identities=[_identity_from_dict(x) for x in d.get("identities", [])],
-            boundaries=[_boundary_from_dict(x) for x in d.get("boundaries", [])],
-            references=[_reference_from_dict(x) for x in d.get("references", [])],
-            persistence=[_persistence_from_dict(x) for x in d.get("persistence", [])],
-            lifecycle=[_lifecycle_from_dict(x) for x in d.get("lifecycle", [])],
-            authority=[_authority_from_dict(x) for x in d.get("authority", [])],
-            bindings=[_binding_from_dict(x) for x in d.get("bindings", [])],
+            values=_rows(d.get("values"), _value_from_dict, "value"),
+            identities=_rows(d.get("identities"), _identity_from_dict, "identity"),
+            boundaries=_rows(d.get("boundaries"), _boundary_from_dict, "boundary"),
+            references=_rows(d.get("references"), _reference_from_dict, "reference"),
+            persistence=_rows(d.get("persistence"), _persistence_from_dict, "persistence"),
+            lifecycle=_rows(d.get("lifecycle"), _lifecycle_from_dict, "lifecycle"),
+            authority=_rows(d.get("authority"), _authority_from_dict, "authority"),
+            bindings=_rows(d.get("bindings"), _binding_from_dict, "binding"),
         )
 
     # --- the gate the design's own specs power ----------------------------

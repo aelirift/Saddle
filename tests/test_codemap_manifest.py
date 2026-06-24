@@ -9,6 +9,7 @@ against real code, so declaration names the thing while code proves coverage.
 from __future__ import annotations
 
 import json
+import logging
 
 from saddle.codemap import (
     BoundarySpec,
@@ -71,6 +72,49 @@ def test_manifest_from_dict_tolerates_none_and_empty():
     assert SurfaceManifest.from_dict(None).is_empty()
     assert SurfaceManifest.from_dict({}).is_empty()
     assert SurfaceManifest().format([]) == "(empty manifest)"
+
+
+def test_from_dict_drops_malformed_rows_without_aborting():
+    # The surface LLM omitted a required key in ONE value row and ONE boundary
+    # row (and handed back a non-dict row). saddle absorbs the omission: the
+    # well-formed rows survive, the bad ones are dropped LOUDLY, and the design
+    # is never aborted by one missing field.
+    payload = {
+        "values": [
+            {"name": "cooldown", "field": "cooldown_s", "accessor": "resolve_cd"},
+            {"name": "broken"},          # missing required "field" -> dropped
+            "not even a dict",           # wrong type -> dropped
+        ],
+        "boundaries": [
+            {"name": "health", "key": "health"},   # missing "replication_func" -> dropped
+            {"name": "mana", "key": "mana", "replication_func": "replicate"},
+        ],
+    }
+    # Capture directly on the manifest logger — robust to whatever global handler
+    # state another test (e.g. the CLI's _setup_logging) may have left behind.
+    seen: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            seen.append(record)
+
+    log = logging.getLogger("saddle.codemap.manifest")
+    handler = _Capture(level=logging.WARNING)
+    prior_level = log.level
+    log.setLevel(logging.WARNING)
+    log.addHandler(handler)
+    try:
+        m = SurfaceManifest.from_dict(payload)
+    finally:
+        log.removeHandler(handler)
+        log.setLevel(prior_level)
+    # only the well-formed rows are kept
+    assert [v.name for v in m.values] == ["cooldown"]
+    assert [b.name for b in m.boundaries] == ["mana"]
+    # every drop was surfaced loudly (not silently swallowed)
+    drops = [r for r in seen if "dropping malformed" in r.getMessage()]
+    assert len(drops) == 3
+    assert {r.levelname for r in drops} == {"WARNING"}
 
 
 def test_manifest_gate_and_format_run_designs_own_specs():
