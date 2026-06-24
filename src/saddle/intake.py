@@ -239,6 +239,9 @@ def format_intake(intake: Intake) -> str:
         lines.append(f"  {i:>2}. [{it.kind:<9}] {it.ask}")
         if it.detail:
             lines.append(f"        ↳ {it.detail}")
-    if not intake.meta.get("audit_complete", True):
+    # Default False, not True: an intake whose meta carries no convergence verdict
+    # has NOT proven coverage, so surface the gap rather than silently imply it
+    # converged. Matches the `audit_complete = False` init in itemize().
+    if not intake.meta.get("audit_complete", False):
         lines.append("(note: coverage audit did not converge — review for gaps)")
     return "\n".join(lines)
