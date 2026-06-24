@@ -16,6 +16,8 @@ A small subcommand dispatcher over saddle's surfaces:
     saddle codemap <design_id>      # Layer 3: gate a design's surface against code
     saddle codemap --symbols        # dump the project's grounding symbol menu
     saddle converge <design_id>     # Layer 4: drive the coder to satisfy the design's surface
+    saddle audit                    # audit a project: grounded probes -> findings + coverage
+    saddle audit --list             # enumerate everything that CAN be audited (no LLM)
     saddle guard --verb <v> --target <p>   # Layer 0: pre-action doctrine gate (exit 2 = BLOCK)
 
 Addressing: every non-chat command takes ``--tenant`` / ``--project`` to
@@ -362,6 +364,77 @@ def _run_converge(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+# -- audit: grounded probes -> findings + coverage ---------------------------
+
+def _run_audit(args: argparse.Namespace) -> int:
+    """Enumerate everything that can be audited under a project root and probe each
+    target, grounded in real code/registries/docs. ``--list`` just prints the
+    coverage plan (no LLM). A run prints the findings + the coverage ledger; the
+    full report (findings.json / report.md) is written under the root unless
+    ``--no-persist``. Exit 1 when any error-severity finding lands OR coverage is
+    incomplete (a target failed/pending) — so it gates in CI."""
+    from saddle.audit import build_plan, format_report, run_audit
+    from saddle.context import code_root
+
+    ctx = resolve(args.tenant, args.project)
+    root = args.root or str(code_root())
+    kinds = [k.strip() for k in (args.kinds or "").split(",") if k.strip()] or None
+    plan = build_plan(root)
+
+    # Attach any concern seeds (project-specific patterns the caller supplies — no
+    # engine vocabulary is baked into saddle) to every concern target.
+    seeds = [s for s in (args.seed or []) if s.strip()]
+    if seeds:
+        plan.targets = [
+            dataclasses.replace(t, seeds=list(t.seeds) + seeds) if t.kind == "concern" else t
+            for t in plan.targets
+        ]
+
+    if args.list:
+        sel = [t for t in plan.targets if (not kinds or t.kind in kinds)]
+        print(f"audit plan for {root}: {len(sel)} target(s) "
+              f"({len(plan.targets)} total before --kinds filter)")
+        for t in sel:
+            print(f"  [{t.kind:<9}] {t.id}")
+        return 0
+
+    only = list(args.only) if args.only else None
+    if args.limit and args.limit > 0:
+        pool = [t for t in plan.targets if (not kinds or t.kind in kinds)
+                and (not only or t.id in set(only))]
+        only = [t.id for t in pool[: args.limit]]
+
+    narrate = _verbosity(args) >= 0
+
+    def on_event(ev: dict) -> None:
+        if not narrate:
+            return
+        kind = ev.get("event")
+        if kind == "progress":
+            sys.stderr.write(f"\r[audit] {ev['done']}/{ev['total']} targets probed")
+            sys.stderr.flush()
+        elif kind == "target" and ev.get("status") == "ran":
+            sys.stderr.write(f"\r[audit] {ev['id']} -> {ev['findings']} finding(s)\n")
+        elif kind == "target" and ev.get("status") == "failed":
+            sys.stderr.write(f"\r[audit] {ev['id']} FAILED: {ev.get('reason','')}\n")
+
+    report = asyncio.run(run_audit(
+        plan, ctx=ctx, kinds=kinds, only=only,
+        concurrency=args.concurrency, per_target_deadline_s=args.deadline,
+        persist=not args.no_persist,
+        out_dir=args.out, on_event=on_event,
+    ))
+    if narrate:
+        sys.stderr.write("\n")
+
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2))
+    else:
+        print(format_report(report))
+    cov = report.coverage
+    return 0 if (not report.errors() and cov.complete) else 1
+
+
 # -- Layer 0: the pre-action doctrine gate -----------------------------------
 
 def _parse_evidence(pairs: list[str] | None) -> dict[str, str]:
@@ -508,6 +581,33 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="don't record the convergence trail onto the design")
     p_cv.add_argument("--json", action="store_true", help="machine-readable output")
 
+    p_au = sub.add_parser(
+        "audit",
+        help="audit a project: grounded probes emit findings + a coverage ledger",
+        parents=[g])
+    _add_ctx_flags(p_au)
+    p_au.add_argument("--root", default=None,
+                      help="project root to audit (default: $SADDLE_CODE_ROOT, else git root / cwd)")
+    p_au.add_argument("--list", action="store_true",
+                      help="enumerate the audit plan (what CAN be audited) and exit — no LLM")
+    p_au.add_argument("--kinds", default=None,
+                      help="comma-separated target kinds to include (registry,doc,package,concern)")
+    p_au.add_argument("--only", action="append", metavar="TARGET_ID",
+                      help="restrict to specific target id(s) (repeatable)")
+    p_au.add_argument("--limit", type=int, default=0,
+                      help="cap the number of targets probed (0 = no cap)")
+    p_au.add_argument("--seed", action="append", metavar="REGEX",
+                      help="ground every concern probe with this code-pattern seed (repeatable)")
+    p_au.add_argument("--concurrency", type=int, default=3,
+                      help="probes to run in parallel (default 3)")
+    p_au.add_argument("--deadline", type=float, default=300.0,
+                      help="per-probe deadline in seconds before that target fails (default 300)")
+    p_au.add_argument("--out", default=None,
+                      help="directory for the written report (default: <root>/.saddle/audit/<ts>)")
+    p_au.add_argument("--no-persist", action="store_true", dest="no_persist",
+                      help="don't write the report to disk")
+    p_au.add_argument("--json", action="store_true", help="machine-readable output")
+
     p_gd = sub.add_parser(
         "guard",
         help="Layer 0: gate a proposed action against doctrine before taking it",
@@ -537,6 +637,7 @@ _DISPATCH = {
     "kb": _run_kb,
     "codemap": _run_codemap,
     "converge": _run_converge,
+    "audit": _run_audit,
     "guard": _run_guard,
 }
 
