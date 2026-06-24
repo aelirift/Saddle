@@ -16,6 +16,7 @@ A small subcommand dispatcher over saddle's surfaces:
     saddle codemap <design_id>      # Layer 3: gate a design's surface against code
     saddle codemap --symbols        # dump the project's grounding symbol menu
     saddle converge <design_id>     # Layer 4: drive the coder to satisfy the design's surface
+    saddle guard --verb <v> --target <p>   # Layer 0: pre-action doctrine gate (exit 2 = BLOCK)
 
 Addressing: every non-chat command takes ``--tenant`` / ``--project`` to
 address a specific tenant+project; omitted, they resolve from the environment
@@ -361,6 +362,54 @@ def _run_converge(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+# -- Layer 0: the pre-action doctrine gate -----------------------------------
+
+def _parse_evidence(pairs: list[str] | None) -> dict[str, str]:
+    """Parse ``--evidence k=v`` repeats into a dict. A bare ``--evidence k``
+    (no ``=``) is shorthand for ``k=true`` — convenient for boolean evidence
+    like ``cross_project_task``."""
+    out: dict[str, str] = {}
+    for item in pairs or []:
+        if "=" in item:
+            k, v = item.split("=", 1)
+            out[k.strip()] = v.strip()
+        else:
+            out[item.strip()] = "true"
+    return out
+
+
+def _run_guard(args: argparse.Namespace) -> int:
+    """saddle's first passthrough: evaluate a proposed action against doctrine
+    BEFORE it happens. Exit 0 = ALLOW, 2 = BLOCK — so a worker (or a coder
+    wrapper, or a PreToolUse hook) can gate a step with
+    ``saddle guard ... && <do the thing>`` and the gate runs with no LLM in the
+    enforcement loop."""
+    from saddle.context import code_root
+    from saddle.doctrine import Action, guard
+
+    ctx = resolve(args.tenant, args.project)
+    root = args.root or str(code_root())
+    action = Action(
+        verb=args.verb,
+        target=args.target,
+        target_kind=args.kind,
+        evidence=_parse_evidence(args.evidence),
+        project_root=root,
+    )
+    verdict = guard(action, ctx)
+    if args.json:
+        print(json.dumps({
+            "allowed": verdict.allowed,
+            "rule_id": verdict.rule_id,
+            "reason": verdict.reason,
+            "required_evidence": list(verdict.required_evidence),
+            "severity": verdict.severity,
+        }, indent=2))
+    else:
+        print(verdict.render())
+    return 0 if verdict.allowed else 2
+
+
 # -- parser ------------------------------------------------------------------
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -459,6 +508,23 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="don't record the convergence trail onto the design")
     p_cv.add_argument("--json", action="store_true", help="machine-readable output")
 
+    p_gd = sub.add_parser(
+        "guard",
+        help="Layer 0: gate a proposed action against doctrine before taking it",
+        parents=[g])
+    _add_ctx_flags(p_gd)
+    p_gd.add_argument("--verb", required=True,
+                      help="action verb (edit/write/create/delete/rm/...)")
+    p_gd.add_argument("--target", required=True,
+                      help="the path or code symbol the action would touch")
+    p_gd.add_argument("--kind", choices=["auto", "path", "code"], default="auto",
+                      help="how to read --target (default: auto-infer from shape)")
+    p_gd.add_argument("--evidence", action="append", metavar="K=V",
+                      help="evidence k=v (repeatable); bare k means k=true")
+    p_gd.add_argument("--root", default=None,
+                      help="focus-project root (default: $SADDLE_CODE_ROOT, else git root / cwd)")
+    p_gd.add_argument("--json", action="store_true", help="machine-readable verdict")
+
     return parser
 
 
@@ -471,6 +537,7 @@ _DISPATCH = {
     "kb": _run_kb,
     "codemap": _run_codemap,
     "converge": _run_converge,
+    "guard": _run_guard,
 }
 
 

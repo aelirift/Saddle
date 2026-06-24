@@ -1,3 +1,18 @@
 {
-  "disabledMcpjsonServers": ["backpack"]
+  "disabledMcpjsonServers": [
+    "backpack"
+  ],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHONPATH=${CLAUDE_PROJECT_DIR}/src python3 -m saddle.doctrine_hook"
+          }
+        ]
+      }
+    ]
+  }
 }
