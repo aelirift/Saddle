@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from pathlib import Path
 
 from saddle.dkb import DKB, get_dkb
@@ -56,9 +57,19 @@ def seed_dkb(dkb: DKB | None = None, *, path: Path | None = None) -> dict:
     entries = load_seed_entries(path)
     added = 0
     for k in entries:
-        if d.get_knowledge(k.id) is None:
+        # Cheap existence pre-check first: it skips the expensive embed for the
+        # common already-present case (every run after the first). The check and
+        # the insert are not one atomic step, though, so two seeders racing on a
+        # fresh db can both read "absent" and both insert — the loser hits a
+        # PRIMARY KEY violation. Catch it: a concurrent seeder having inserted
+        # this stable id IS the idempotent outcome this loader promises.
+        if d.get_knowledge(k.id) is not None:
+            continue
+        try:
             d.add_knowledge(k)
             added += 1
+        except sqlite3.IntegrityError:
+            _log.debug("DKB seed: %s already inserted by a concurrent seeder", k.id)
     result = {"total": len(entries), "added": added, "skipped": len(entries) - added}
     _log.info(
         "DKB seed: %d entries (%d added, %d already present)",

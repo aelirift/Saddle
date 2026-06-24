@@ -239,15 +239,25 @@ class DKB:
         emb = self._emb().embed([f"{k.title}\n\n{k.body}"])[0]
         with self._lock:
             self._ensure_vec()
-            self._conn.execute(
-                "INSERT INTO knowledge(id,kind,title,body,tags,scope_tenant,"
-                "scope_project,source,status,ts) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (k.id, k.kind, k.title, k.body, tags_json, k.scope_tenant,
-                 k.scope_project, k.source, k.status, k.ts),
-            )
-            if k.status == ACTIVE:
-                self._index(k, tags_json, emb)
-            self._conn.commit()
+            try:
+                self._conn.execute(
+                    "INSERT INTO knowledge(id,kind,title,body,tags,scope_tenant,"
+                    "scope_project,source,status,ts) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (k.id, k.kind, k.title, k.body, tags_json, k.scope_tenant,
+                     k.scope_project, k.source, k.status, k.ts),
+                )
+                if k.status == ACTIVE:
+                    self._index(k, tags_json, emb)
+                self._conn.commit()
+            except Exception:
+                # Never strand an open write transaction on a failed insert
+                # (e.g. a duplicate id racing a concurrent seeder, or an index
+                # write that fails). Roll back so the connection is clean for
+                # the next caller, then re-raise — a genuine duplicate id is a
+                # programming error everywhere except the idempotent seed path,
+                # which catches IntegrityError itself.
+                self._conn.rollback()
+                raise
         return k
 
     def _index(self, k: Knowledge, tags_json: str, emb: list[float]) -> None:
