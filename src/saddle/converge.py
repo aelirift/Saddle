@@ -401,7 +401,10 @@ async def converge_design(
             closed = [f for f in gaps if str(f) not in after_sig]
             rounds.append(Round(
                 n=n, gaps_before=len(gaps), gaps_after=len(after),
-                closed=max(0, len(gaps) - len(after)), findings_after=after,
+                # the TRUE set-difference count — a count delta (before-after)
+                # reads 0 when a round closes one gap and opens another, and
+                # would disagree with the `closed` list, the log, and the reprompt
+                closed=len(closed), findings_after=after,
             ))
             _log.info("converge: design %s round %d — %d gap(s) -> %d (closed %d)",
                       design.id, n, len(gaps), len(after), len(closed))

@@ -174,6 +174,25 @@ def test_converges_in_one_round_when_the_turn_closes_the_gap():
     assert res.rounds[0].gaps_before == 1 and res.rounds[0].gaps_after == 0
 
 
+def test_round_closed_counts_the_set_difference_not_the_count_delta():
+    """When a round CLOSES one gap but OPENS another, the gap count is unchanged —
+    a raw before-minus-after delta records 0 closed, which lies. ``Round.closed``
+    must be the true set-difference (the actual finding that went away)."""
+    a, b, c = _finding("alpha"), _finding("beta"), _finding("gamma")
+    coder = _ScriptedCoder(actions=[None, None])
+    res = _run(converge_design(
+        _design(), code_root="/nonexistent", coder=coder,
+        # pre-gate {a,b}; round1 -> {b,c} (a closed, c opened); round2 -> {} (clean)
+        gate=_gate_seq([a, b], [b, c], []), directives=[], persist=False,
+        max_rounds=4, stall_repeat=3,
+    ))
+    assert res.status == CONVERGED and res.ok
+    r1 = res.rounds[0]
+    assert r1.gaps_before == 2 and r1.gaps_after == 2   # count is unchanged...
+    assert r1.closed == 1                               # ...but one gap (alpha) truly closed
+    assert res.rounds[1].closed == 2                    # round 2 closed both remaining
+
+
 def test_real_gate_end_to_end_drives_a_real_edit_to_clean(tmp_path):
     """The crown jewel: a REAL intent_drift gate over a real tree, driven to clean
     by a fake coder that writes the fix. No injected gate — the actual codemap."""
