@@ -287,3 +287,37 @@ def test_persists_the_convergence_trail_via_the_dkb():
     assert did == "dsg_test"
     assert patch["convergence"]["outcome"] == CONVERGED
     assert patch["convergence"]["rounds"][0]["closed"] == 1
+
+
+# --- live coder streaming ----------------------------------------------------
+class _FakeAskSession:
+    """Stand-in for ChatSession: ``ask`` yields the canned chunks one at a time."""
+
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    async def ask(self, prompt: str):
+        for c in self._chunks:
+            yield c
+
+
+def test_chatsessioncoder_streams_each_chunk_to_the_sink_live():
+    from saddle.converge import ChatSessionCoder
+
+    seen: list[str] = []
+    coder = ChatSessionCoder(cwd="/x", on_chunk=seen.append)
+    coder._session = _FakeAskSession(["analyzing ", "editing ", "done"])
+    out = _run(coder.turn("go"))
+    # The full text is still returned for the loop's accounting...
+    assert out == "analyzing editing done"
+    # ...AND every chunk was surfaced live, terminated by a newline so the next
+    # narration line starts clean.
+    assert seen == ["analyzing ", "editing ", "done", "\n"]
+
+
+def test_chatsessioncoder_without_sink_just_returns_text():
+    from saddle.converge import ChatSessionCoder
+
+    coder = ChatSessionCoder(cwd="/x")  # no on_chunk
+    coder._session = _FakeAskSession(["a", "b"])
+    assert _run(coder.turn("go")) == "ab"

@@ -155,11 +155,16 @@ class ChatSessionCoder:
         system_prompt: str | None = None,
         model: str | None = None,
         effort: str | None = None,
+        on_chunk: Callable[[str], None] | None = None,
     ) -> None:
         self._cwd = str(cwd)
         self._system_prompt = system_prompt or _CODER_SYSTEM
         self._model = model
         self._effort = effort
+        # Live stream sink: each text chunk the coder emits is handed to this as
+        # it arrives (the CLI points it at stderr), so a turn is watchable in
+        # real time instead of surfacing only after it completes.
+        self._on_chunk = on_chunk
         self._session = None
 
     async def __aenter__(self) -> "ChatSessionCoder":
@@ -183,7 +188,11 @@ class ChatSessionCoder:
         assert self._session is not None
         parts: list[str] = []
         async for chunk in self._session.ask(prompt):
+            if self._on_chunk is not None:
+                self._on_chunk(chunk)
             parts.append(chunk)
+        if self._on_chunk is not None and parts:
+            self._on_chunk("\n")  # terminate the streamed block for the next line
         return "".join(parts)
 
 
@@ -315,6 +324,7 @@ async def converge_design(
     stall_repeat: int = 3,
     turn_retries: int = 2,
     persist: bool = True,
+    on_chunk: Callable[[str], None] | None = None,
 ) -> ConvergeResult:
     """Drive ``design`` into the code at ``code_root`` until its completeness
     surface is satisfied, gating after every coder turn.
@@ -322,7 +332,9 @@ async def converge_design(
     Injection points keep the loop game-agnostic and testable: ``coder`` defaults
     to a :class:`ChatSessionCoder` scoped to ``code_root``; ``gate`` defaults to
     :func:`saddle.design.intent_drift` bound to ``code_root`` (re-parsing fresh
-    code every call). Both can be replaced without touching the loop.
+    code every call). Both can be replaced without touching the loop. ``on_chunk``
+    (when no explicit ``coder`` is given) streams the default coder's live output
+    chunk-by-chunk — the CLI points it at stderr so a run is watchable.
 
     Returns a :class:`ConvergeResult` carrying the per-round trail and the final
     gap set. Never raises on a coder crash — it halts with ``status=CODER_FAILED``
@@ -359,7 +371,7 @@ async def converge_design(
     history: list[frozenset[str]] = []
     closed: list[Finding] = []
     if coder is None:
-        coder = ChatSessionCoder(cwd=code_root)
+        coder = ChatSessionCoder(cwd=code_root, on_chunk=on_chunk)
 
     async with coder:
         for n in range(1, max(1, max_rounds) + 1):
@@ -368,6 +380,8 @@ async def converge_design(
                 if n == 1
                 else _reprompt_brief(gaps, closed)
             )
+            _log.info("converge: design %s round %d/%d — coder working on %d gap(s)",
+                      design.id, n, max(1, max_rounds), len(gaps))
             try:
                 await _coder_turn(coder, prompt, retries=turn_retries)
             except CoderTurnError as exc:

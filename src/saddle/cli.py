@@ -28,12 +28,67 @@ import argparse
 import asyncio
 import dataclasses
 import json
+import logging
 import sys
 
 from saddle.context import Context, resolve
 
 _KB_KINDS = ["best_practice", "anti_pattern", "lesson", "principle"]
 _SCOPES = ["global", "tenant", "project"]
+
+
+# -- progress narration ------------------------------------------------------
+# saddle's layers (orchestrator, design, converge, the LLM pool) already emit
+# their progress via ``logging`` at INFO. Nothing surfaced it: a bare CLI run
+# installs no handler, so Python's last-resort handler drops INFO and every long
+# command looked like a frozen black box. Narrate by default — INFO to stderr,
+# results stay on stdout (so ``--json`` piping is unaffected) — with ``-q`` to
+# silence and ``-v`` for debug.
+
+class _LogFmt(logging.Formatter):
+    """Clean narration: bare message for INFO, a ``[warning]``/``[error]`` tag
+    above it, with any traceback appended."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        msg = record.getMessage()
+        if record.levelno >= logging.WARNING:
+            msg = f"[{record.levelname.lower()}] {msg}"
+        if record.exc_info:
+            msg = f"{msg}\n{self.formatException(record.exc_info)}"
+        return msg
+
+
+def _setup_logging(verbosity: int) -> None:
+    """Route saddle's own loggers to stderr. ``verbosity``: <0 quiet (WARNING+),
+    0 narrate (INFO), >0 debug. Scoped to the ``saddle`` logger so third-party
+    INFO (httpx, the SDK) stays out of the narration."""
+    if verbosity < 0:
+        level = logging.WARNING
+    elif verbosity == 0:
+        level = logging.INFO
+    else:
+        level = logging.DEBUG
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(_LogFmt())
+    log = logging.getLogger("saddle")
+    log.handlers[:] = [handler]
+    log.setLevel(level)
+    log.propagate = False
+
+
+def _verbosity(args: argparse.Namespace) -> int:
+    """-1 quiet / 0 narrate / +n debug, from the global ``-q`` / ``-v`` flags.
+    Both use ``SUPPRESS`` defaults so they land on the namespace from either
+    side of the subcommand without clobbering each other."""
+    if getattr(args, "quiet", False):
+        return -1
+    return getattr(args, "verbose", 0) or 0
+
+
+def _emit_stderr(text: str) -> None:
+    """Write a streamed coder chunk straight through to stderr, live."""
+    sys.stderr.write(text)
+    sys.stderr.flush()
 
 
 def _run_chat() -> int:
@@ -279,11 +334,14 @@ def _run_converge(args: argparse.Namespace) -> int:
         print(f"converge: no design {args.design!r} in {ctx.key}", file=sys.stderr)
         return 2
     root = args.root or str(code_root())
+    # Stream the coder's work to stderr live (unless silenced) so a converge run
+    # isn't a black box; the result still lands on stdout for piping.
+    on_chunk = None if _verbosity(args) < 0 else _emit_stderr
     result = asyncio.run(
         converge_design(
             design, code_root=root, ctx=ctx,
             max_rounds=args.max_rounds, turn_retries=args.turn_retries,
-            persist=not args.no_persist,
+            persist=not args.no_persist, on_chunk=on_chunk,
         )
     )
     if args.json:
@@ -306,19 +364,32 @@ def _run_converge(args: argparse.Namespace) -> int:
 # -- parser ------------------------------------------------------------------
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="saddle", description="saddle LLM harness")
+    # Global progress flags, shared by the top-level parser AND every subparser
+    # (via ``parents``) so they're accepted on either side of the subcommand.
+    # SUPPRESS defaults mean an unset flag never overwrites a value parsed from
+    # the other side.
+    g = argparse.ArgumentParser(add_help=False)
+    g.add_argument("-v", "--verbose", action="count", default=argparse.SUPPRESS,
+                   help="narrate more (repeat for debug)")
+    g.add_argument("-q", "--quiet", action="store_true", default=argparse.SUPPRESS,
+                   help="silence progress narration (warnings + errors only)")
+
+    parser = argparse.ArgumentParser(
+        prog="saddle", description="saddle LLM harness", parents=[g])
     sub = parser.add_subparsers(dest="cmd")
 
-    sub.add_parser("chat", help="interactive agentic chat (default)")
+    sub.add_parser("chat", help="interactive agentic chat (default)", parents=[g])
 
-    p_in = sub.add_parser("intake", help="decompose + record a prompt (Layer 1)")
+    p_in = sub.add_parser("intake", help="decompose + record a prompt (Layer 1)",
+                          parents=[g])
     p_in.add_argument("prompt", nargs="?", help="prompt text; omit or '-' to read stdin")
     _add_ctx_flags(p_in)
     p_in.add_argument("--audits", type=int, default=2,
                       help="max coverage-audit passes (default 2)")
     p_in.add_argument("--json", action="store_true", help="dump the raw intake as JSON")
 
-    p_dg = sub.add_parser("design", help="decompose → fold → design (Layer 1 + 2)")
+    p_dg = sub.add_parser("design", help="decompose → fold → design (Layer 1 + 2)",
+                          parents=[g])
     p_dg.add_argument("prompt", nargs="?", help="prompt text; omit or '-' to read stdin")
     _add_ctx_flags(p_dg)
     p_dg.add_argument("--audits", type=int, default=2,
@@ -329,17 +400,18 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="stop after folding; don't run the design pipeline")
     p_dg.add_argument("--json", action="store_true", help="dump the orchestration as JSON")
 
-    p_td = sub.add_parser("todos", help="show the open todo backlog")
+    p_td = sub.add_parser("todos", help="show the open todo backlog", parents=[g])
     _add_ctx_flags(p_td)
 
-    p_dir = sub.add_parser("directives", help="list / promote standing rules")
+    p_dir = sub.add_parser("directives", help="list / promote standing rules",
+                           parents=[g])
     _add_ctx_flags(p_dir)
     p_dir.add_argument("--add", nargs="?", const="-", default=None,
                        metavar="TEXT", help="promote a directive (text or '-'/omit for stdin)")
     p_dir.add_argument("--scope", choices=_SCOPES, default="project",
                        help="scope to promote at (default project)")
 
-    p_les = sub.add_parser("lesson", help="record a DKB entry by hand")
+    p_les = sub.add_parser("lesson", help="record a DKB entry by hand", parents=[g])
     p_les.add_argument("text", nargs="?", help="lesson text; omit or '-' to read stdin")
     _add_ctx_flags(p_les)
     p_les.add_argument("--kind", choices=_KB_KINDS, default="lesson",
@@ -349,7 +421,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_les.add_argument("--scope", choices=_SCOPES, default="project",
                        help="visibility scope (default project)")
 
-    p_kb = sub.add_parser("kb", help="Design Knowledge Base: list / search / seed")
+    p_kb = sub.add_parser("kb", help="Design Knowledge Base: list / search / seed",
+                          parents=[g])
     _add_ctx_flags(p_kb)
     p_kb.add_argument("--search", nargs="?", const="-", default=None,
                       metavar="QUERY", help="hybrid-search the DKB (text or '-'/omit for stdin)")
@@ -358,7 +431,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_kb.add_argument("-k", type=int, default=8, dest="k", help="search hits to return")
     p_kb.add_argument("--limit", type=int, default=50, help="max entries to list")
 
-    p_cm = sub.add_parser("codemap", help="Layer 3: gate a design's completeness surface against code")
+    p_cm = sub.add_parser(
+        "codemap",
+        help="Layer 3: gate a design's completeness surface against code",
+        parents=[g])
     p_cm.add_argument("design", nargs="?", help="design id to gate (omit when using --symbols)")
     _add_ctx_flags(p_cm)
     p_cm.add_argument("--symbols", action="store_true",
@@ -369,7 +445,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_cv = sub.add_parser(
         "converge",
-        help="Layer 4: drive the coder to implement a design until its surface is satisfied")
+        help="Layer 4: drive the coder to implement a design until its surface is satisfied",
+        parents=[g])
     p_cv.add_argument("design", help="design id to implement and converge")
     _add_ctx_flags(p_cv)
     p_cv.add_argument("--root", default=None,
@@ -399,6 +476,7 @@ _DISPATCH = {
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    _setup_logging(_verbosity(args))
     if args.cmd is None or args.cmd == "chat":
         return _run_chat()
     handler = _DISPATCH.get(args.cmd)
