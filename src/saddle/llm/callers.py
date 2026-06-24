@@ -164,6 +164,26 @@ def _normalize_content(text: str, *, json_mode: bool) -> str:
     return strip_think(text).strip()
 
 
+def _count_thinking_chunks(pieces: list[str]) -> int:
+    """How many streamed chunks fell inside a ``<think>…</think>`` reasoning span
+    — a CoT-latency diagnostic for the MiniMax log, nothing more. A chunk counts
+    while the span is open (opener and closer may share one chunk or split across
+    chunks); answer chunks AFTER the close do not count. The old inline test
+    (``"<think" in p or thinking_count and "</think>" not in p``) never reset its
+    state, so once thinking began it mislabeled the entire answer as thinking."""
+    n = 0
+    in_thinking = False
+    for piece in pieces:
+        low = piece.lower()
+        if "<think" in low:
+            in_thinking = True
+        if in_thinking:
+            n += 1
+        if "</think>" in low:
+            in_thinking = False
+    return n
+
+
 def _load_config(ctx: "Context | None" = None) -> dict:
     # Saddle's secrets/policy split: api keys come from a SHARED file, routing
     # (priority + caps) from saddle's OWN config/llm_policy.json. merged_config
@@ -418,7 +438,6 @@ class MiniMaxCaller:
     ) -> str:
         content_parts: list[str] = []
         chunk_count = 0
-        thinking_chunk_count = 0
         saw_done = False
 
         async with client.stream(
@@ -464,8 +483,6 @@ class MiniMaxCaller:
                 if not isinstance(piece, str) or not piece:
                     continue
                 chunk_count += 1
-                if "<think" in piece.lower() or thinking_chunk_count and "</think>" not in piece.lower():
-                    thinking_chunk_count += 1
                 content_parts.append(piece)
                 if chunk_count == 1:
                     _log.info("MiniMax stream started for %s", label or "request")
@@ -473,7 +490,7 @@ class MiniMaxCaller:
         text = "".join(content_parts)
         _log.info(
             "MiniMax stream finished for %s: chunks=%d thinking_chunks=%d done=%s",
-            label or "request", chunk_count, thinking_chunk_count, saw_done,
+            label or "request", chunk_count, _count_thinking_chunks(content_parts), saw_done,
         )
         return _normalize_content(text, json_mode=json_mode)
 

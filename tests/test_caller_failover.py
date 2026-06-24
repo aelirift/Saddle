@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 
-from saddle.llm.callers import FallbackCaller
+from saddle.llm.callers import FallbackCaller, _count_thinking_chunks
 from saddle.llm.claude_agent import ClaudeAgentUnavailable
 
 
@@ -125,3 +125,40 @@ def test_claude_agent_options_wire_stderr_sink():
     # No sink supplied -> no stderr callback installed.
     opts_none = ClaudeAgentCaller({})._options("sys")
     assert opts_none.stderr is None
+
+
+def test_thinking_chunks_do_not_bleed_into_the_answer():
+    # THE regression: the old inline counter never reset `in_thinking`, so once
+    # a <think> opened it mislabeled the entire post-</think> answer as thinking
+    # and reported all 6 chunks. The span here is <think>, reasoning, more,
+    # </think> — the closer-bearing chunk is the LAST thinking chunk (it carries
+    # the delimiter), so the count is 4; the 2 answer chunks strictly AFTER the
+    # close are not thinking.
+    pieces = ["<think>", "reasoning", "more", "</think>", "answer one", "answer two"]
+    assert _count_thinking_chunks(pieces) == 4
+
+
+def test_open_and_close_in_one_chunk_counts_once():
+    # MiniMax often packs the whole CoT into a single SSE delta. The opener and
+    # closer share that one chunk -> exactly one thinking chunk, and the trailing
+    # answer chunks stay uncounted.
+    assert _count_thinking_chunks(["<think>cot</think>", "ans", "tail"]) == 1
+
+
+def test_no_thinking_span_counts_zero():
+    # A plain answer with no CoT must report zero — not silently accrue once the
+    # state flag is set, which is exactly what the old `... and "</think>" not in`
+    # expression did.
+    assert _count_thinking_chunks(["just", "an", "answer"]) == 0
+
+
+def test_tags_split_across_content_bearing_chunks():
+    # Tags can be glued to content: "<think>start" opens, "end</think>tail"
+    # closes. Every chunk from opener THROUGH the closer counts (3); the pure
+    # answer chunk after does not.
+    pieces = ["<think>start", "mid", "end</think>tail", "pure answer"]
+    assert _count_thinking_chunks(pieces) == 3
+
+
+def test_empty_stream_counts_zero():
+    assert _count_thinking_chunks([]) == 0
