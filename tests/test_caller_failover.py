@@ -108,6 +108,54 @@ def test_fallback_all_down_raises_with_last_cause():
     assert down1.calls == 1 and down2.calls == 1
 
 
+def test_fallback_reraises_genuine_error_whose_text_contains_a_bare_5xx_number():
+    # THE substring regression: the old classifier routed past anything whose
+    # message merely CONTAINED "500"/"403"/"1234". A real schema defect reading
+    # "expected 500 rows" is not a provider 500 — it must propagate so it isn't
+    # masked behind failover, exactly like the ValueError case above.
+    boom = _Raises(ValueError("expected 500 rows for field 'goals', got 3"))
+    backup = _Returns("never reached")
+    fc = FallbackCaller([boom, backup])
+
+    raised = False
+    try:
+        asyncio.run(fc("sys", "prompt"))
+    except ValueError:
+        raised = True
+
+    assert raised, "a bare number in the message must NOT be read as a provider 5xx"
+    assert backup.calls == 0
+
+
+def test_fallback_routes_structured_http_5xx_even_without_a_reason_phrase():
+    # A real provider outage arrives as an HTTP error carrying a structured
+    # status. Routing must come from that status (503), not from finding "503"
+    # in the text — so a terse "server error" with .response.status_code routes.
+    class _Httpish(RuntimeError):
+        def __init__(self, msg: str, status: int) -> None:
+            super().__init__(msg)
+            self.response = type("R", (), {"status_code": status})()
+
+    down = _Raises(_Httpish("server error", 503))
+    backup = _Returns("ok")
+    fc = FallbackCaller([down, backup])
+
+    assert asyncio.run(fc("sys", "prompt")) == "ok"
+    assert backup.calls == 1
+
+
+def test_fallback_routes_content_filter_false_positive():
+    # A provider safety classifier rejecting a benign prompt is a routing
+    # failure — a different provider may accept it. Preserved as an explicit
+    # phrase match (not a bare code), so it still routes.
+    down = _Raises(RuntimeError("request was rejected: content_filter flagged high risk"))
+    backup = _Returns("ok")
+    fc = FallbackCaller([down, backup])
+
+    assert asyncio.run(fc("sys", "prompt")) == "ok"
+    assert backup.calls == 1
+
+
 def test_claude_agent_options_wire_stderr_sink():
     # Verifies ClaudeAgentCaller threads the SDK stderr callback into the sink
     # so a CLI crash's real cause is captured. SDK-guarded: skip where the

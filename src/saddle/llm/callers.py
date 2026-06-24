@@ -984,6 +984,56 @@ class DeepSeekCaller:
         return await self._call_openai(system, prompt, json_mode=json_mode, label=label)
 
 
+# Failure categories (from the canonical `categorize_retry`) that mean "this
+# PROVIDER is the problem; a DIFFERENT provider may succeed" — FallbackCaller
+# routes past them. The complement (empty_response / parse_error /
+# validation_failed / input_too_large / output_too_large / other) is OUR
+# contract gap: the next provider would hit the same defect, so we re-raise and
+# surface it instead of silently masking it behind failover.
+_FAILOVER_ROUTE_CATEGORIES = frozenset({
+    "external_rate_limit",
+    "provider_outage",
+    "timeout",
+    "provider_blocked",
+})
+
+# Provider-side safety-classifier rejections. A benign prompt one provider
+# flags, another may accept — so route past. Kept as explicit PHRASES (never
+# bare codes) so they cannot over-match a genuine error the way "500" or "403"
+# substrings did.
+_CONTENT_FILTER_MARKERS = (
+    "content_filter", "content filter", "high risk", "request was rejected",
+)
+
+
+def _is_content_filter_rejection(err: str) -> bool:
+    low = err.lower()
+    return any(m in low for m in _CONTENT_FILTER_MARKERS)
+
+
+def _failover_routes_past(exc: Exception) -> bool:
+    """Should FallbackCaller degrade to the next provider for this failure?
+
+    Classify by the SHAPE of the failure (typed signal, structured HTTP status,
+    exception type, then text) via the canonical categorizer the retry loop
+    already uses — NOT by hunting bare numeric substrings like "500"/"403"/
+    "1234" in the message. Those over-match: a schema error reading "expected
+    500 rows" must not be mistaken for a provider 500 and routed past, masking
+    the real defect (the same false-classification family that crashed the
+    dogfood, just in the opposite direction)."""
+    # A lead-provider subprocess crash (the local `claude` CLI exiting non-zero)
+    # is a routing failure regardless of what its captured stderr says.
+    if isinstance(exc, ClaudeAgentUnavailable):
+        return True
+    if _is_content_filter_rejection(str(exc)):
+        return True
+    # Prefer the structured HTTP status when the exception carries one, so a
+    # real provider 5xx routes even when its message has no reason phrase.
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    category = categorize_retry(exception=exc, status_code=status)
+    return category in _FAILOVER_ROUTE_CATEGORIES
+
+
 class FallbackCaller:
     def __init__(self, callers: list) -> None:
         self._callers = callers
@@ -1000,26 +1050,11 @@ class FallbackCaller:
                     label=label,
                 )
             except Exception as exc:
-                err_str = str(exc).lower()
-                is_transient = any(p in err_str for p in (
-                    "rate limit", "usage limit", "quota", "insufficient balance",
-                    "1302", "1234", "1113", "403", "429", "529", "500", "502", "503",
-                    "overloaded", "empty response", "timeout",
-                    # Provider-side safety classifiers can false-positive on
-                    # benign game-combat prompts. Treat them as provider
-                    # routing failures so the pipeline can try the next
-                    # configured model instead of aborting the whole run.
-                    "content_filter", "content filter", "high risk",
-                    "request was rejected",
-                ))
-                # A lead-provider subprocess crash (the local `claude` CLI
-                # exiting non-zero) means that provider is unavailable for THIS
-                # call — a routing failure, not a prompt error — regardless of
-                # whether its captured stderr happens to contain a known
-                # transient marker. Always degrade to the next provider.
-                is_provider_down = isinstance(exc, ClaudeAgentUnavailable)
-                if is_provider_down or is_transient or "timeout" in type(exc).__name__.lower():
-                    _log.warning("FallbackCaller: %s failed (%s), trying next…", type(caller).__name__, str(exc)[:120])
+                if _failover_routes_past(exc):
+                    _log.warning(
+                        "FallbackCaller: %s failed (%s), trying next…",
+                        type(caller).__name__, str(exc)[:120],
+                    )
                     last_exc = exc
                 else:
                     raise
