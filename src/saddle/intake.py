@@ -103,15 +103,23 @@ _SYSTEM_AUDIT = (
 
 _SYSTEM_SCOPE = (
     "You are the focus gate of an assistant DEDICATED to one project. You are "
-    "given that FOCUS project's identity and a numbered list of work items "
-    "pulled from a user's message. For each item, decide whether the work it "
-    "asks for belongs to the FOCUS project, or targets a DIFFERENT project, "
-    "codebase, or product. Judge by what the work is ABOUT, not by wording. An "
-    "item that asks to build, fix, audit, or change something that is NOT the "
-    "focus project — naming or describing another system, repo, or product — "
-    "is out_of_focus. Questions about this assistant itself, meta-requests, "
-    "and anything about the focus project are in_focus. When genuinely unsure, "
-    "mark out_of_focus so it is surfaced rather than waved through.\n\n"
+    "given that FOCUS project's identity and a numbered list of ACTION items — "
+    "tasks the user wants performed — pulled from a user's message. For each "
+    "item, decide whether CARRYING IT OUT would change, build, or operate on "
+    "the code, files, or state of a DIFFERENT project, codebase, or product "
+    "than the focus. Judge by what the action would TOUCH, not by wording.\n"
+    "- out_of_focus: doing it would modify another project — build, fix, edit, "
+    "create, delete, refactor, or otherwise change code, files, or state that "
+    "belong to a system that is NOT the focus project.\n"
+    "- in_focus: it operates on the focus project itself; OR on THIS assistant "
+    "or the current session/configuration (wiring, connecting, or configuring "
+    "this assistant counts as in_focus); OR it only researches, explains, "
+    "references, or plans around another project WITHOUT changing that "
+    "project's code.\n"
+    "Merely naming or describing another system is NOT out_of_focus — only "
+    "acting on another project's code or files is. When a task genuinely WOULD "
+    "modify another project's code and you are unsure, mark out_of_focus so it "
+    "is surfaced rather than waved through.\n\n"
     "Respond with ONLY a JSON object: "
     '{"verdicts": [{"index": <the item\'s number>, "scope": "in_focus" | '
     '"out_of_focus", "reason": "<short why>"}]}. '
@@ -179,17 +187,32 @@ def _scope_prompt(focus_desc: str, items: list[Item]) -> str:
 async def _classify_scope(
     caller: "LLMCaller", items: list[Item], ctx: Context
 ) -> dict[str, Any]:
-    """Tag each final item in_focus / out_of_focus against the focus project.
+    """Tag each ACTION (task) item in_focus / out_of_focus against the focus.
 
-    Annotates — never filters. Out-of-focus items stay in the intake; this only
+    Only tasks are weighed. A question, a piece of context, a decision, or a
+    standing directive that *mentions* another project is discussion or
+    planning — referencing another codebase is not drift; only a task that
+    would MODIFY another project's code or files crosses the boundary. So
+    non-task items are never flagged, and a prompt with no tasks at all skips
+    the focus call entirely: nothing to act on, nothing to warn about.
+
+    Annotates — never filters. Out-of-focus tasks stay in the intake; this only
     records WHICH ones cross a project boundary and a human-readable warning so
     the drift ("you pulled me onto another project") is surfaced. Refusing the
-    work stays Layer 0's job. If the model fails to classify every item, that is
+    work stays Layer 0's job. If the model fails to classify every task, that is
     recorded (``scope_checked=False``) and surfaced rather than silently read as
     "all in focus" — the same never-imply-coverage stance as the audit pass.
     """
+    # Only actions can cross the project boundary. Filter to tasks, keeping each
+    # one's ORIGINAL position so the surfaced warning numbers line up with the
+    # full item list the user sees. No tasks -> nothing to check, no LLM call.
+    actionable = [(i, it) for i, it in enumerate(items) if it.kind == TASK]
+    if not actionable:
+        return {"out_of_focus": [], "scope_warning": "", "scope_checked": True}
+
     raw = await _call_json(
-        caller, _SYSTEM_SCOPE, _scope_prompt(focus_descriptor(ctx), items),
+        caller, _SYSTEM_SCOPE,
+        _scope_prompt(focus_descriptor(ctx), [it for _, it in actionable]),
         label="intake/scope",
     )
     verdicts = raw.get("verdicts")
@@ -200,31 +223,32 @@ async def _classify_scope(
             if not isinstance(v, dict):
                 continue
             try:
-                idx = int(v.get("index", 0)) - 1
+                sub = int(v.get("index", 0)) - 1
             except (TypeError, ValueError):
                 continue
-            if not (0 <= idx < len(items)) or idx in classified:
+            if not (0 <= sub < len(actionable)) or sub in classified:
                 continue
-            classified.add(idx)
+            classified.add(sub)
             if str(v.get("scope", "")).strip().lower() == "out_of_focus":
+                orig_idx, item = actionable[sub]
                 out_of_focus.append({
-                    "n": idx + 1,
-                    "ask": items[idx].ask,
+                    "n": orig_idx + 1,
+                    "ask": item.ask,
                     "reason": str(v.get("reason", "")).strip(),
                 })
-    scope_checked = len(classified) >= len(items)
+    scope_checked = len(classified) >= len(actionable)
     warning = ""
     if out_of_focus:
         proj = focus_project(ctx)
         warning = (
-            f"{len(out_of_focus)} of {len(items)} item(s) target work OUTSIDE "
-            f"the focus project ({proj}). saddle is focused on {proj}; this work "
-            f"belongs to another project and should not be acted on here without "
-            f"an explicit cross-project decision."
+            f"{len(out_of_focus)} of {len(actionable)} action(s) target work "
+            f"OUTSIDE the focus project ({proj}). saddle is focused on {proj}; "
+            f"that work changes another project and should not be acted on here "
+            f"without an explicit cross-project decision."
         )
     elif not scope_checked:
         warning = (
-            "focus check did not classify every item — review scope manually "
+            "focus check did not classify every action — review scope manually "
             "before acting."
         )
     return {
@@ -248,9 +272,11 @@ async def decompose(
 
     Two-pass: itemize, then audit coverage (bounded by ``max_audits``)
     appending any missed items until the auditor reports complete. A final
-    focus pass (unless ``check_focus=False``) tags any item that targets work
-    OUTSIDE the focus project and records a ``scope_warning`` in ``meta`` — it
-    annotates, never filters, so off-focus asks are surfaced, not dropped. The
+    focus pass (unless ``check_focus=False``) tags any TASK that targets work
+    OUTSIDE the focus project and records a ``scope_warning`` in ``meta`` —
+    discussing or referencing another project (questions, context, decisions)
+    is not drift, only acting on its code is. It annotates, never filters, so
+    off-focus asks are surfaced, not dropped. The
     whole decomposition runs inside ``ctx``'s tenant fairness gate. Persists to
     the store unless ``persist=False``. Pass ``caller`` to bypass provider
     resolution (tests); otherwise the context's default fallback chain is used.
@@ -298,8 +324,9 @@ async def decompose(
                 # forward progress is possible; stop rather than spin.
                 break
 
-        # Focus gate — flag asks that target work OUTSIDE this project.
-        # Annotate, never filter: out-of-focus items stay in the list, but the
+        # Focus gate — flag TASKS that target work OUTSIDE this project (only
+        # actions can drift; discussing or referencing another project is fine).
+        # Annotate, never filter: out-of-focus tasks stay in the list, but the
         # drift ("you pulled me onto another project") is surfaced. Refusing
         # the work is Layer 0's job, not intake's.
         if check_focus and items:
