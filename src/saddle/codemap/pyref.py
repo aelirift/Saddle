@@ -261,13 +261,19 @@ def calls_to(mod: Module, callee: str) -> list[Ref]:
     """Every call to a function named `callee` — `callee(...)` or `x.callee(...)`.
     Used to decide whether a consumer resolved the effective value *in scope*
     before reading a base field (RayXI's _function_has_resolve, in real AST)."""
+    # A literal's method (`"x".join(...)`, `[...].pop(...)`) is a builtin, never a
+    # project function — so a method call on a literal receiver is not a call to
+    # `callee`. Excluding it mirrors the GDScript adapter's string-literal guard and
+    # kills the generic-method-name collision (a service `join` vs `"\n".join`).
+    _LITERAL = (ast.Constant, ast.List, ast.Tuple, ast.Set, ast.Dict, ast.JoinedStr)
     refs: list[Ref] = []
     for node in ast.walk(mod.tree):
         if isinstance(node, ast.Call):
             f = node.func
             if isinstance(f, ast.Name) and f.id == callee:
                 refs.append(_mk(mod, node, "call", callee))
-            elif isinstance(f, ast.Attribute) and f.attr == callee:
+            elif (isinstance(f, ast.Attribute) and f.attr == callee
+                    and not isinstance(f.value, _LITERAL)):
                 refs.append(_mk(mod, node, "call", callee))
     return refs
 
@@ -383,6 +389,171 @@ def function_defs(mod: Module, name: str) -> list[Ref]:
     for node in ast.walk(mod.tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
             out.append(_mk(mod, node, "func_def", name))
+    return out
+
+
+def func_arity(mod: Module, name: str) -> tuple[int, int] | None:
+    """``(min_required, max_total)`` POSITIONAL parameter counts of ``def name`` —
+    the AST counterpart of the GDScript :func:`saddle.codemap.gdref.func_arity`, so
+    the congruence caller-scan can tell two same-named methods on different classes
+    apart by how many arguments a call passes. ``None`` if not defined here. A leading
+    ``self``/``cls`` is dropped (a method call site does not pass it); ``min_required``
+    excludes parameters with defaults; ``*args`` makes the maximum unbounded."""
+    for node in ast.walk(mod.tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            a = node.args
+            pos = list(a.posonlyargs) + list(a.args)
+            if pos and pos[0].arg in ("self", "cls"):
+                pos = pos[1:]
+            total = len(pos)
+            required = max(0, total - len(a.defaults))
+            if a.vararg is not None:
+                return (required, 1_000_000_000)
+            return (required, total)
+    return None
+
+
+def registered_service_names(mod: Module) -> set[str]:
+    """Service names this module self-registers under. The string-keyed service-locator
+    is a GDScript/RayXI runtime convention with no Python analogue, so this is an empty
+    set — which makes the congruence caller-scan skip receiver disambiguation for Python
+    modules (it keeps every same-named caller, the conservative default)."""
+    return set()
+
+
+def call_receiver_services(mod: Module, callee: str) -> dict[int, str]:
+    """Receiver→service-name resolution for calls to ``callee``. Empty for Python (no
+    string-keyed service locator); the caller-scan then never drops a Python caller on
+    receiver grounds."""
+    return {}
+
+
+def call_arg_counts(mod: Module, callee: str) -> dict[int, int]:
+    """Map each line that calls ``callee`` to its POSITIONAL argument count — the
+    call-side complement of :func:`func_arity`. A call using a keyword argument or a
+    ``*args`` spread is OMITTED (its effective arity is indeterminate, so it is never
+    used to delete a caller — the conservative bias the GDScript adapter holds too).
+    When a line holds several matching calls the largest count wins."""
+    _LITERAL = (ast.Constant, ast.List, ast.Tuple, ast.Set, ast.Dict, ast.JoinedStr)
+    out: dict[int, int] = {}
+    for node in ast.walk(mod.tree):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        match = (isinstance(f, ast.Name) and f.id == callee) or (
+            isinstance(f, ast.Attribute) and f.attr == callee
+            and not isinstance(f.value, _LITERAL)
+        )
+        if not match:
+            continue
+        if node.keywords or any(isinstance(arg, ast.Starred) for arg in node.args):
+            continue  # keyword / spread call — arity indeterminate, do not filter on it
+        out[node.lineno] = max(out.get(node.lineno, 0), len(node.args))
+    return out
+
+
+def rpc_receivers(mod: Module) -> set[str]:
+    """Function names carrying an ``@rpc`` decorator — the project's REMOTE entry
+    points. A replicated-state mutator CALLED from one of these has a real server
+    route (the handler runs on the authority even though a remote peer triggers it);
+    a mutator reached only from raw UI handlers has none. ``rpc`` is the engine's
+    networking marker, not game vocabulary. Python has no built-in ``@rpc``; this
+    recognises a decorator NAMED ``rpc`` (bare ``@rpc`` or called ``@rpc(...)``,
+    possibly attribute-qualified) so a project — or a parity test — that models the
+    same shape is read identically to the GDScript adapter."""
+    out: set[str] = set()
+    for node in ast.walk(mod.tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for dec in node.decorator_list:
+            base = dec.func if isinstance(dec, ast.Call) else dec
+            name = base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", None)
+            if name == "rpc":
+                out.add(node.name)
+                break
+    return out
+
+
+def _write_base(t) -> tuple[str, str] | None:
+    """For a Store-context target, the (base-identifier, kind) it mutates, else None.
+    `self._state[k]` -> ('_state','subscript_write'); `self.x` -> ('x','attr_write');
+    a bare `x` -> ('x','bare_write')."""
+    if isinstance(t, ast.Attribute) and isinstance(t.ctx, ast.Store):
+        return t.attr, "attr_write"
+    if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Store):
+        return t.id, "bare_write"
+    if isinstance(t, ast.Subscript) and isinstance(t.ctx, ast.Store):
+        v = t.value
+        if isinstance(v, ast.Attribute):
+            return v.attr, "subscript_write"
+        if isinstance(v, ast.Name):
+            return v.id, "subscript_write"
+        return "<subscript>", "subscript_write"
+    return None
+
+
+# In-place container-mutating methods (list / dict / set). A call to one of these on
+# a member or name receiver mutates that container even with no assignment, so a
+# function whose only state change is `self._items.append(x)` / `self._requests.pop(k)`
+# is still a MUTATOR — the AST counterpart of gdref's `_GD_MUT_METHODS`, kept in parity
+# so a `.erase`/`.pop`-only gated mutator is not misread as a pure reader on either
+# language.
+_PY_MUT_METHODS = frozenset({
+    "append", "extend", "insert", "remove", "pop", "popitem", "clear", "sort",
+    "reverse", "add", "discard", "update", "setdefault", "difference_update",
+    "intersection_update", "symmetric_difference_update",
+})
+
+
+def _mut_call_base(node) -> tuple[str, str] | None:
+    """For a container-mutating method call (`self._x.append(...)`, `_x.pop(k)`), the
+    (base-identifier, kind) it mutates, else None. The receiver must be a bare member
+    (`self.X` → 'X') or a name (`X` → 'X'); a chained/subscripted receiver
+    (`self._x[k].append()`) is indeterminate and skipped — the conservative miss the
+    write detection holds throughout."""
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+        return None
+    if node.func.attr not in _PY_MUT_METHODS:
+        return None
+    recv = node.func.value
+    if isinstance(recv, ast.Attribute):
+        return recv.attr, "method_mutate"
+    if isinstance(recv, ast.Name):
+        return recv.id, "method_mutate"
+    return None
+
+
+def func_writes(mod: Module, func_name: str) -> list[Ref]:
+    """Every STATE write inside the body of `func_name`, each Ref's ``name`` being
+    the BASE identifier mutated. The per-function complement of :func:`field_writes`
+    (one field across the module) — this is one function across all fields, so a
+    MUTATOR (writes state) is told apart from a pure getter without enumerating field
+    names. Covers plain/augmented/annotated assignment AND in-place container mutation
+    (`self._x.append/pop/clear/...`); a bare-`Name` target is the Python local idiom and
+    reports its id (the congruence caller scopes writes to the replicated field names
+    derived from the mirror-apply body, so a same-named local is filtered out there)."""
+    out: list[Ref] = []
+    for fn in ast.walk(mod.tree):
+        if not (isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name == func_name):
+            continue
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, ast.AugAssign):
+                targets = [node.target]
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                targets = [node.target]
+            elif isinstance(node, ast.Call):
+                b = _mut_call_base(node)
+                if b is not None:
+                    out.append(_mk(mod, node, b[1], b[0]))
+                continue
+            else:
+                continue
+            for t in targets:
+                base = _write_base(t)
+                if base is not None:
+                    out.append(_mk(mod, t, base[1], base[0]))
     return out
 
 

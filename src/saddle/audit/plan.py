@@ -58,12 +58,20 @@ _DEFAULT_CODE_DIRS = ["src", "app", "apps", "lib", "pkg"]
 _DEFAULT_CONCERNS: list[tuple[str, str]] = [
     (
         "client_server_congruence",
-        "Find every feature whose authoritative state is written on the server but "
-        "never mirrored to the client (or vice-versa): a value the server mutates "
-        "with no replication into the client snapshot, an @rpc the client calls "
-        "that the server never defines, a HUD that reads a field the server never "
-        "sends. Name the feature, the server write site, and the missing client "
-        "read — not just menus, EVERY feature.",
+        "Find every feature where authoritative state and its mirror disagree, in "
+        "EITHER direction. (a) Server writes the client never sees: a value the "
+        "server mutates with no replication into the client snapshot, an @rpc the "
+        "client calls that the server never defines, a HUD that reads a field the "
+        "server never sends. (b) The opposite and just-as-broken shape — a "
+        "client-side UI that WRITES authoritative state DIRECTLY: it calls a mutator "
+        "on a service that DOES ship a client mirror, but the mutator is not "
+        "gated to the server and there is no intent/request routed to the server, so "
+        "the local change silently diverges and is reverted the instant the next "
+        "server snapshot arrives. Name the feature, the write site, and the missing "
+        "gate-or-mirror. A system that is server-only BY DESIGN (no client reader, "
+        "deliberately excluded from the client scene — e.g. interest-management, "
+        "anti-cheat, server AI) is NOT a gap; only flag a real divergence. Not just "
+        "menus, EVERY feature.",
     ),
     (
         "menus_ux_reachable",
@@ -132,6 +140,11 @@ class AuditPlan:
     root: str
     targets: list[AuditTarget] = field(default_factory=list)
     code_dirs: list[str] = field(default_factory=list)
+    # The project's string-keyed DATA files (knowledge/config/data/schemas/…). The
+    # driver builds the data-field menu from these so doc/package probes can check a
+    # doc-claimed contract field against the DATA it actually lives in, not only the
+    # code symbol menu — the false-`absent` class for data-driven architectures.
+    data_files: list[str] = field(default_factory=list)
 
     def by_kind(self, kind: str) -> list[AuditTarget]:
         return [t for t in self.targets if t.kind == kind]
@@ -143,6 +156,7 @@ class AuditPlan:
         return {
             "root": self.root,
             "code_dirs": list(self.code_dirs),
+            "data_files": list(self.data_files),
             "targets": [t.to_dict() for t in self.targets],
         }
 
@@ -152,6 +166,7 @@ class AuditPlan:
             root=str(d.get("root", "")),
             targets=[AuditTarget.from_dict(t) for t in d.get("targets", [])],
             code_dirs=[str(c) for c in d.get("code_dirs", [])],
+            data_files=[str(p) for p in d.get("data_files", [])],
         )
 
 
@@ -285,6 +300,14 @@ def build_plan(
         d for d in (code_dirs or _DEFAULT_CODE_DIRS) if (root / d).is_dir()
     ]
 
+    # The project's string-keyed data files — resolved ONCE here (not just for
+    # registry targets) so the driver can build a data-field menu for doc/package
+    # probes even when registry targets are excluded.
+    data_file_rels = [
+        rel for rel in _rglob_globs(root, registry_globs or _DEFAULT_REGISTRY_GLOBS)
+        if _is_string_keyed(root / rel)
+    ]
+
     if include_docs:
         doc_rels = _rglob_globs(root, doc_globs or _DEFAULT_DOC_GLOBS)
         for gid, paths, source in _collapse_groups(
@@ -302,12 +325,8 @@ def build_plan(
             ))
 
     if include_registries:
-        reg_rels = [
-            rel for rel in _rglob_globs(root, registry_globs or _DEFAULT_REGISTRY_GLOBS)
-            if _is_string_keyed(root / rel)
-        ]
         for gid, paths, source in _collapse_groups(
-            reg_rels, threshold=collapse_threshold, sample=collapse_sample
+            data_file_rels, threshold=collapse_threshold, sample=collapse_sample
         ):
             targets.append(AuditTarget(
                 id=f"registry:{gid}", kind=REGISTRY, title=gid, source=source, paths=paths,
@@ -344,4 +363,5 @@ def build_plan(
     return AuditPlan(
         root=str(root), targets=targets,
         code_dirs=resolved_code_dirs or list(_DEFAULT_CODE_DIRS),
+        data_files=data_file_rels,
     )

@@ -144,6 +144,18 @@ _SYS_SURFACE = (
     "menu, e.g. `is_server`, `is_multiplayer_authority`); mutators (the function "
     "names that perform the authoritative write). The WRITE side of the trust "
     "boundary — declare it for any state a client must not set directly.\n"
+    "- congruences: a server->client replication MIRROR whose state mutators must "
+    "each pass an authority gate — the WHOLE congruence bug class, derived per-"
+    "function across files instead of named mutator-by-mutator. A mirror service is "
+    "any module defining `mirror_apply` (the client-side snapshot applier); the "
+    "fields it writes are the replicated state; any public function that writes one "
+    "of them is a mutator and must call a `guard` before it writes OR be unreachable "
+    "from non-server code, else a HUD mutates the local mirror and the next snapshot "
+    "reverts it. Fields: name; mirror_apply (the applier fn, e.g. "
+    "`apply_replication_snapshot`); guard (the authority-check function(s)); exempt "
+    "(functions the service legitimately leaves ungated). The mutator SET and its "
+    "call sites are read from the AST — you only name the engine tokens. Declare it "
+    "for any service that ships a client-side copy of server-owned state.\n"
     "- bindings: an INPUT keymap that must be unambiguous and fully reachable — "
     "every physical input does exactly ONE intended thing and every declared "
     "action is invocable, or a key opens a panel when the player meant to act (the "
@@ -163,7 +175,9 @@ _SYS_SURFACE = (
     '"key": "...", "substrates": ["..."]}], "persistence": [{"name": "...", '
     '"key": "...", "save_func": "...", "load_func": "..."}], "lifecycle": '
     '[{"name": "...", "symbol": "..."}], "authority": [{"name": "...", '
-    '"guard": ["..."], "mutators": ["..."]}], "bindings": [{"name": "...", '
+    '"guard": ["..."], "mutators": ["..."]}], "congruences": [{"name": "...", '
+    '"mirror_apply": "...", "guard": ["..."], "exempt": ["..."]}], '
+    '"bindings": [{"name": "...", '
     '"keymap": "...", "families": {"fam": ["prefix_"]}, "compatible": '
     '[["famA", "famB"]], "programmatic": ["..."]}]}'
 )

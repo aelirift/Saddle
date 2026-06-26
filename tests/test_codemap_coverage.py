@@ -25,6 +25,7 @@ from saddle.codemap import (
     AuthoritySpec,
     BindingSpec,
     BoundarySpec,
+    CongruenceSpec,
     IdentitySpec,
     LifecycleSpec,
     PersistenceSpec,
@@ -49,11 +50,12 @@ def _singular(field: str) -> str:
     return field
 
 
-def test_kinds_are_the_expected_eight():
+def test_kinds_are_the_expected_nine():
     # The ONE deliberate count. If a kind is added/removed this fails on purpose,
     # forcing every other seam below to be re-checked rather than drifting.
     assert _kinds() == {"value", "identity", "boundary", "reference",
-                        "persistence", "lifecycle", "authority", "binding"}
+                        "persistence", "lifecycle", "authority", "congruence",
+                        "binding"}
 
 
 def test_every_kind_is_exported_across_all_seams():
@@ -101,6 +103,8 @@ def test_manifest_round_trips_and_dispatches_one_spec_per_kind(tmp_path):
         persistence=[PersistenceSpec("p", "pk", "save", "load")],
         lifecycle=[LifecycleSpec("l", "sym")],
         authority=[AuthoritySpec("a", "is_server", ("set_x",))],
+        congruences=[CongruenceSpec("c", "apply_replication_snapshot", "is_server",
+                                    exempt=("register_catalog",))],
         bindings=[BindingSpec("bind", "project.godot", {"ability": ("ability_",)},
                               compatible=(("ability", "card"),),
                               programmatic=("debug_toggle",))],
@@ -109,7 +113,8 @@ def test_manifest_round_trips_and_dispatches_one_spec_per_kind(tmp_path):
     d = back.to_dict()
     assert {k: len(v) for k, v in d.items()} == {
         "values": 1, "identities": 1, "boundaries": 1, "references": 1,
-        "persistence": 1, "lifecycle": 1, "authority": 1, "bindings": 1,
+        "persistence": 1, "lifecycle": 1, "authority": 1, "congruences": 1,
+        "bindings": 1,
     }
     # impacts() returns a fan-out bucket for every kind ...
     imps = back.impacts([], root=tmp_path)

@@ -22,10 +22,10 @@ import os
 import sqlite3
 import threading
 import time
-import uuid
 from pathlib import Path
 from typing import Iterable, Protocol, runtime_checkable
 
+from saddle import ids
 from saddle.context import Context
 from saddle.models import (
     ITEM_STATUSES,
@@ -65,10 +65,6 @@ CREATE TABLE IF NOT EXISTS item (
 CREATE INDEX IF NOT EXISTS ix_item_tp ON item(tenant, project, status);
 CREATE INDEX IF NOT EXISTS ix_item_intake ON item(intake_id);
 """
-
-
-def _new_id(prefix: str) -> str:
-    return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
 def _default_db_path() -> Path:
@@ -164,13 +160,13 @@ class SqliteStore:
         """Persist an intake + its items in one transaction. Stamps ids,
         ts, seq, tenant, project onto the passed object and returns it."""
         now = time.time()
-        intake.id = intake.id or _new_id("int")
+        intake.id = intake.id or ids.record_id(ids.KIND_INTAKE)
         intake.tenant = ctx.tenant
         intake.project = ctx.project
         intake.ts = intake.ts or now
         rows = []
         for i, item in enumerate(intake.items):
-            item.id = item.id or _new_id("itm")
+            item.id = item.id or ids.record_id(ids.KIND_ITEM)
             item.intake_id = intake.id
             item.tenant = ctx.tenant
             item.project = ctx.project

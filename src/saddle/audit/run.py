@@ -20,9 +20,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from saddle import supervise
+from saddle.audit.congruence import deterministic_congruence_findings
 from saddle.audit.finding import AuditFinding, ERROR, WARN, sort_findings
 from saddle.audit.ground import (
     ground_target, _iter_code_text, source_files, parse_sources, _TEXT_SCAN_EXTS,
+    data_field_counts,
 )
 from saddle.audit.plan import AuditPlan
 from saddle.audit.probe import audit_target
@@ -186,6 +188,17 @@ async def run_audit(
             )
         else:
             code_files, code_text = [], []
+        # Data-field menu — built ONCE from the plan's data files so doc/package
+        # probes can check a doc-claimed contract field against the DATA it lives in,
+        # not only the code symbol menu (the false-`absent` class). Bounded like the
+        # parse; a failure here degrades to "no menu", never wedges the run.
+        try:
+            data_counts = await supervise.bounded(
+                asyncio.to_thread(data_field_counts, root, list(plan.data_files)),
+                seconds=_PARSE_DEADLINE_S, what="audit data-field index",
+            )
+        except supervise.DeadlineExceeded:
+            data_counts = {}
     except supervise.DeadlineExceeded as exc:
         # Setup itself wedged — fail the whole plan loud (every target pending->failed)
         # rather than hang. This is the liveness contract honored even before probes.
@@ -197,6 +210,23 @@ async def run_audit(
             _persist_report(report, plan, out_dir, root)
         return report
     emit("parse", phase="done", modules=len(mods), files=len(code_files))
+
+    # Deterministic congruence pre-pass — the codemap's 9th check, auto-derived from
+    # the parsed code (no hand-authored spec). Emits first-class, citation-backed
+    # findings so the bug class RayXI shipped four times CANNOT silently regrow; the
+    # LLM concern probe below stays as the open-ended complement (it catches shapes
+    # off this axis — a server write never replicated at all). Bounded + best-effort:
+    # a failure here degrades to "no deterministic findings", never wedges the run.
+    try:
+        cong = await supervise.bounded(
+            asyncio.to_thread(deterministic_congruence_findings, mods),
+            seconds=_PARSE_DEADLINE_S, what="audit congruence pre-pass",
+        )
+        report.findings.extend(cong)
+        emit("congruence", phase="done", findings=len(cong))
+    except Exception as exc:  # noqa: BLE001 — the pre-pass must never break the run
+        _log.warning("audit: deterministic congruence pre-pass failed: %s", exc)
+        emit("congruence", phase="failed", reason=str(exc)[:120])
 
     sem = asyncio.Semaphore(max(1, concurrency))
     done = 0
@@ -210,7 +240,7 @@ async def run_audit(
                 grounding = await asyncio.to_thread(
                     ground_target, target, root,
                     mods=mods, code_files=code_files, code_text=code_text,
-                    code_dirs=code_dirs,
+                    code_dirs=code_dirs, data_counts=data_counts,
                 )
                 if grounding.is_empty():
                     async with lock:

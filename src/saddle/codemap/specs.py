@@ -145,6 +145,51 @@ class AuthoritySpec:
 
 
 @dataclass
+class CongruenceSpec:
+    """A server→client replication MIRROR and the authority gate its state mutators
+    must pass — the WHOLE congruence bug class, derived per-function across files
+    instead of named mutator-by-mutator (the gap AuthoritySpec left: it checks a
+    HAND-LISTED set of mutators in isolation; this DERIVES the set from the code and
+    correlates each with its call sites).
+
+    A "mirror service" is any module that defines ``mirror_apply`` — the function
+    that applies the replicated snapshot on the CLIENT, so the service ships a
+    client-side copy of its state. In such a service, the fields that
+    ``mirror_apply`` itself writes ARE the replicated state; any PUBLIC function that
+    writes one of those fields is a MUTATOR of authoritative state. A mutator is safe
+    on a real client ONLY when it is BOTH authority-gated (it calls a ``guard`` —
+    ``is_server`` / ``_is_server`` / ``is_multiplayer_authority`` … — before it
+    writes) AND routed (an ``@rpc`` receiver carries a remote client's intent to the
+    authority), OR is unreachable from non-authoritative code.
+
+    The GAP has TWO halves — the precise shapes RayXI shipped five times
+    (mount_collection, stat_allocation, auction_house, profession_skill_curve,
+    weekly_vault) — and a mutator reached from a raw client/HUD caller is a gap when
+    it is in EITHER:
+
+      * UNGATED — the HUD mutates the local mirror, the next server snapshot reverts
+        it (the change flickers then vanishes), and the server never learns the
+        intent. [shape #1]
+      * GATED but UNROUTED — on a real client the guard bails, the click silently
+        no-ops, and the server never learns the intent. [shape #2 — weekly_vault]
+
+    ``mirror_apply`` and ``guard`` are project/ENGINE tokens (a Godot replication
+    apply-fn, a Godot authority check) — NOT game vocabulary — so the one spec serves
+    any Godot-style replication project; the mutator SET, its call sites, and the
+    ``@rpc`` routes are read from the AST, never declared. ``exempt`` names functions
+    a mirror service legitimately leaves ungated/unrouted (e.g. a build-time catalog
+    registrar that writes a non-replicated ``@export``)."""
+    name: str
+    mirror_apply: str
+    guard: str | tuple[str, ...]
+    exempt: tuple[str, ...] = ()
+
+    @property
+    def guards(self) -> tuple[str, ...]:
+        return (self.guard,) if isinstance(self.guard, str) else tuple(self.guard)
+
+
+@dataclass
 class BindingSpec:
     """An input keymap that must be UNAMBIGUOUS and fully REACHABLE — the axis
     RayXI's gates never had, so a build shipped the number row firing BOTH a

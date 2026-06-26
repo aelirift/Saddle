@@ -70,6 +70,49 @@ def function_defs(mod, name):
     return _adapter(mod).function_defs(mod, name)
 
 
+def func_arity(mod, name):
+    """``(min_required, max_total)`` parameter counts of function ``name`` in this
+    module, or ``None`` if it is not defined here. Lets a caller-scan tell two
+    same-named functions on different modules apart by argument count."""
+    return _adapter(mod).func_arity(mod, name)
+
+
+def call_arg_counts(mod, callee):
+    """Map ``lineno -> argument count`` for every call to ``callee`` in this module
+    (the call-side complement of :func:`func_arity`). Indeterminate sites are omitted."""
+    return _adapter(mod).call_arg_counts(mod, callee)
+
+
+def registered_service_names(mod) -> set[str]:
+    """The service name(s) this module registers ITSELF under (the locator identity it
+    declares in code). Empty when the language/project has no such convention."""
+    return _adapter(mod).registered_service_names(mod)
+
+
+def call_receiver_services(mod, callee):
+    """Map ``lineno -> service name`` for calls whose receiver was resolved from the
+    service locator — lets the caller-scan tell apart same-name, same-arity methods on
+    different services. Indeterminate receivers are omitted."""
+    return _adapter(mod).call_receiver_services(mod, callee)
+
+
+def rpc_receivers(mod) -> set[str]:
+    """Names of functions in this module that are RPC remote entry points (an
+    ``@rpc`` annotation/decorator) — the congruence impact's server-route detector."""
+    return _adapter(mod).rpc_receivers(mod)
+
+
+def func_writes(mod, name):
+    return _adapter(mod).func_writes(mod, name)
+
+
+def function_names(mod) -> list[str]:
+    """Every function NAME defined in this one module (from its symbol inventory).
+    The enumeration the congruence impact needs to derive a mirror service's mutator
+    set without a hand-listed spec."""
+    return list(_adapter(mod).symbols(mod)["funcs"].keys())
+
+
 def _ranked(counts: dict[str, int], n: int) -> dict[str, int]:
     """Most load-bearing first, ties broken by name so the menu is deterministic."""
     items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))

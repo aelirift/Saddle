@@ -10,8 +10,15 @@ request) and threaded through the call. Resolution order per field:
 
     tenant   explicit arg -> $SADDLE_TENANT -> OS user -> "default"
     project  explicit arg -> $SADDLE_PROJECT -> git repo name -> cwd name
+    area     explicit arg -> $SADDLE_AREA -> "" (optional sub-label)
 
-Both fields are slugified to ``[a-z0-9_-]`` because they become
+``tenant``/``project`` are the isolation boundary; ``area`` is an OPTIONAL
+descriptive sub-label (e.g. ``layer1``) that does NOT widen or narrow
+isolation — it only enriches the self-describing qualified id
+(``<tenant>_<project>[_<area>]_<kind>_<locator>``) so a long-lived
+reference reads as "rayxi's saddle hookup, layer 1". Empty means none.
+
+The fields are slugified to ``[a-z0-9_-]`` because they become
 filesystem path segments (``config/tenants/<tenant>/...``) and database
 filter keys — an unsanitised value would be a path-traversal / injection
 vector. The dataclass is frozen + slugified in ``__post_init__`` so every
@@ -68,6 +75,7 @@ class Context:
 
     tenant: str
     project: str
+    area: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -76,11 +84,21 @@ class Context:
         object.__setattr__(
             self, "project", _slug(self.project, fallback=_DEFAULT_PROJECT)
         )
+        # area is optional: an empty/blank value slugs to "" (no fallback) and
+        # simply drops out of the scope prefix.
+        object.__setattr__(self, "area", _slug(self.area, fallback=""))
 
     @property
     def key(self) -> str:
-        """Stable ``tenant/project`` string for labels + log lines."""
+        """Stable ``tenant/project`` string for labels + log lines. Excludes
+        ``area`` — the isolation key is (tenant, project) only."""
         return f"{self.tenant}/{self.project}"
+
+    @property
+    def scope_prefix(self) -> str:
+        """Underscore-joined scope for self-describing qualified ids:
+        ``tenant_project`` or ``tenant_project_area`` when an area is set."""
+        return "_".join(p for p in (self.tenant, self.project, self.area) if p)
 
 
 def _default_tenant() -> str:
@@ -103,21 +121,30 @@ def _default_project(cwd: Path | None = None) -> str:
     return (root or base).name
 
 
+def _default_area() -> str:
+    """Optional sub-label from ``$SADDLE_AREA`` (empty if unset)."""
+    env = os.environ.get("SADDLE_AREA")
+    return env if (env and env.strip()) else ""
+
+
 def resolve(
     tenant: str | None = None,
     project: str | None = None,
     *,
+    area: str | None = None,
     cwd: str | Path | None = None,
 ) -> Context:
     """Resolve a Context from explicit args, env, and the working dir.
 
     Empty/whitespace args are treated as "not given" and fall through to
-    the env/host defaults.
+    the env/host defaults. ``area`` is optional and has no host default — it
+    stays empty unless given explicitly or via ``$SADDLE_AREA``.
     """
     cwd_path = Path(cwd) if cwd is not None else None
     t = tenant if (tenant and tenant.strip()) else _default_tenant()
     p = project if (project and project.strip()) else _default_project(cwd_path)
-    return Context(tenant=t, project=p)
+    a = area if (area and area.strip()) else _default_area()
+    return Context(tenant=t, project=p, area=a)
 
 
 def default() -> Context:

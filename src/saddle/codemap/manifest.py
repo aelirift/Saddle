@@ -34,16 +34,19 @@ from .finding import Finding
 from .impact import (
     AuthorityImpact,
     BoundaryImpact,
+    CongruenceImpact,
     IdentityImpact,
     LifecycleImpact,
     ValueImpact,
     format_authority_impact,
     format_boundary_impact,
+    format_congruence_impact,
     format_identity_impact,
     format_lifecycle_impact,
     format_value_impact,
     impact_authority,
     impact_boundary,
+    impact_congruence,
     impact_identity,
     impact_lifecycle,
     impact_value,
@@ -52,6 +55,7 @@ from .specs import (
     AuthoritySpec,
     BindingSpec,
     BoundarySpec,
+    CongruenceSpec,
     IdentitySpec,
     LifecycleSpec,
     PersistenceSpec,
@@ -156,6 +160,18 @@ def _authority_from_dict(d: dict) -> AuthoritySpec:
                          mutators=tuple(d.get("mutators", ())))
 
 
+def _congruence_to_dict(s: CongruenceSpec) -> dict:
+    return {"name": s.name, "mirror_apply": s.mirror_apply,
+            "guard": list(s.guards), "exempt": list(s.exempt)}
+
+
+def _congruence_from_dict(d: dict) -> CongruenceSpec:
+    g = d.get("guard")
+    guard = tuple(g) if isinstance(g, (list, tuple)) else g
+    return CongruenceSpec(name=d["name"], mirror_apply=d["mirror_apply"],
+                          guard=guard, exempt=tuple(d.get("exempt", ())))
+
+
 def _binding_to_dict(s: BindingSpec) -> dict:
     return {"name": s.name, "keymap": s.keymap,
             "families": {k: list(v) for k, v in s.families.items()},
@@ -183,12 +199,13 @@ class SurfaceManifest:
     persistence: list[PersistenceSpec] = field(default_factory=list)
     lifecycle: list[LifecycleSpec] = field(default_factory=list)
     authority: list[AuthoritySpec] = field(default_factory=list)
+    congruences: list[CongruenceSpec] = field(default_factory=list)
     bindings: list[BindingSpec] = field(default_factory=list)
 
     def is_empty(self) -> bool:
         return not (self.values or self.identities or self.boundaries
                     or self.references or self.persistence or self.lifecycle
-                    or self.authority or self.bindings)
+                    or self.authority or self.congruences or self.bindings)
 
     def to_dict(self) -> dict:
         return {
@@ -199,6 +216,7 @@ class SurfaceManifest:
             "persistence": [_persistence_to_dict(s) for s in self.persistence],
             "lifecycle": [_lifecycle_to_dict(s) for s in self.lifecycle],
             "authority": [_authority_to_dict(s) for s in self.authority],
+            "congruences": [_congruence_to_dict(s) for s in self.congruences],
             "bindings": [_binding_to_dict(s) for s in self.bindings],
         }
 
@@ -213,6 +231,7 @@ class SurfaceManifest:
             persistence=_rows(d.get("persistence"), _persistence_from_dict, "persistence"),
             lifecycle=_rows(d.get("lifecycle"), _lifecycle_from_dict, "lifecycle"),
             authority=_rows(d.get("authority"), _authority_from_dict, "authority"),
+            congruences=_rows(d.get("congruences"), _congruence_from_dict, "congruence"),
             bindings=_rows(d.get("bindings"), _binding_from_dict, "binding"),
         )
 
@@ -228,6 +247,7 @@ class SurfaceManifest:
             "persistence": [impact_persistence(mods, s) for s in self.persistence],
             "lifecycle": [impact_lifecycle(mods, s) for s in self.lifecycle],
             "authority": [impact_authority(mods, s) for s in self.authority],
+            "congruences": [impact_congruence(mods, s) for s in self.congruences],
             "references": [],
             "bindings": [],
         }
@@ -268,6 +288,8 @@ class SurfaceManifest:
             blocks.append(format_lifecycle_impact(imp))
         for imp in imps["authority"]:
             blocks.append(format_authority_impact(imp))
+        for imp in imps["congruences"]:
+            blocks.append(format_congruence_impact(imp))
         for imp in imps["bindings"]:
             blocks.append(format_binding_impact(imp))
         return "\n\n".join(blocks) if blocks else "(empty manifest)"

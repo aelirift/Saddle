@@ -29,12 +29,39 @@ commit can never drift apart. One derivation, two readers.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from . import refs
 from .finding import Finding
 from .pyref import Ref
-from .specs import AuthoritySpec, BoundarySpec, IdentitySpec, LifecycleSpec, ValueSpec
+from .specs import (
+    AuthoritySpec,
+    BoundarySpec,
+    CongruenceSpec,
+    IdentitySpec,
+    LifecycleSpec,
+    ValueSpec,
+)
+
+# Verification harnesses — build-oracle probes and unit/integration tests — call
+# mutators DIRECTLY to exercise them, run with authority, and are NOT the client UI
+# surface. They are excluded from the congruence caller scan by filename convention
+# (probe/test/spec naming is universal across projects and languages), so a test that
+# drives a mutator is never misread as a HUD that mutates replicated state.
+#
+# Matched on the BASENAME (not the whole path) for the file conventions, so a source
+# file living under an incidental ancestor dir merely NAMED like a test — e.g. pytest's
+# own ``/tmp/.../test_foo0/`` fixture root — is NOT mistaken for a harness. Only a real
+# ``test/`` or ``tests/`` directory segment counts as a harness directory.
+_HARNESS_FILE_RE = re.compile(r"(?:^test_|_test\.|_spec\.|_probe\.)")
+
+
+def _is_harness_path(path: str) -> bool:
+    segs = path.replace("\\", "/").lower().split("/")
+    if _HARNESS_FILE_RE.search(segs[-1]):
+        return True
+    return any(seg in ("test", "tests") for seg in segs[:-1])
 
 
 @dataclass
@@ -302,6 +329,143 @@ class AuthorityImpact:
         return out
 
 
+@dataclass
+class MutatorSite:
+    """One public state-mutator of a mirror service, with everything the congruence
+    gate needs to judge it: where it is defined, the replicated-state writes it
+    performs, whether it calls an authority guard, every call site OUTSIDE its own
+    module, and which of those callers is the ``@rpc`` server route.
+
+    A replicated-state mutator is safe on a real client ONLY when it is BOTH
+    authority-gated (so the direct call no-ops off the authority) AND routed (so a
+    remote client's intent reaches the server through an ``@rpc`` receiver). The two
+    ways that breaks are the two halves of the bug class:
+
+      * UNGATED + raw client call — the client mutates its LOCAL mirror and the next
+        server snapshot reverts it (the change flickers then vanishes). [shape #1]
+      * GATED but UNROUTED + raw client call — on a remote client the guard bails and
+        the intent is silently lost; the click does nothing, the server never learns.
+        [shape #2 — the weekly_vault claim shape RayXI shipped]
+
+    ``raw_client_callers`` are the CLIENT-domain (UI) callers that are NOT the ``@rpc``
+    route (the genuine HUD invocations); ``rpc_routed`` is whether any ``@rpc`` receiver
+    calls this mutator (a real server path exists).
+
+    A caller counts as a genuine divergence only when it is CLIENT-domain — a HUD that
+    runs on the client (a Godot Control/CanvasLayer script, see gdref's UI-extends
+    promotion). A SHARED-domain service that calls the mutator (e.g. a server-side
+    loot/talent service) runs on the authority, so its gated call is correct, not a
+    bug; counting it would be the false positive the rayxi sweep exposed. The high-
+    precision client signal is what makes this an ERROR-severity deterministic check
+    rather than a guess; the fuzzier shared-caller cases stay the LLM probe's job."""
+    module: str
+    name: str
+    def_ref: Ref
+    write_refs: list[Ref] = field(default_factory=list)
+    guarded: bool = False
+    external_calls: list[Ref] = field(default_factory=list)
+    # (path, lineno) of external call sites whose enclosing function is an @rpc
+    # receiver — the server route, told apart from raw UI calls.
+    rpc_caller_lines: set = field(default_factory=set)
+
+    @property
+    def rpc_routed(self) -> bool:
+        return bool(self.rpc_caller_lines)
+
+    @property
+    def risky_callers(self) -> list[Ref]:
+        # Every non-server external caller (includes the @rpc route) — kept for the
+        # impact's domain ledger and the human-readable format.
+        return [r for r in self.external_calls if r.domain != "server"]
+
+    @property
+    def raw_client_callers(self) -> list[Ref]:
+        # CLIENT-domain callers that are NOT the @rpc route — the genuine HUD calls
+        # that put the mutator on a real client's invocation path. Shared-domain
+        # (server-side service) callers are excluded: their gated call runs on the
+        # authority and is correct.
+        return [r for r in self.external_calls
+                if r.domain == "client"
+                and (r.path, r.lineno) not in self.rpc_caller_lines]
+
+    @property
+    def is_gap(self) -> bool:
+        # Reachable from a raw client/UI call AND not in the one safe shape (gated AND
+        # routed). An ungated mutator with only server-domain or @rpc-route callers is
+        # server-internal, not a congruence divergence, so it stays silent.
+        if not self.raw_client_callers:
+            return False
+        return (not self.guarded) or (not self.rpc_routed)
+
+    @property
+    def gap_kind(self) -> str:
+        """Which half of the break this is — drives the finding's explanation. An
+        ungated mutator is reported as ``ungated`` even if it is also unrouted: gating
+        is the more fundamental missing guard and the message covers both fixes."""
+        return "ungated" if not self.guarded else "unrouted"
+
+
+@dataclass
+class CongruenceImpact:
+    """Every site that bears on the server→client mirror congruence of a project:
+    each mirror service (a module defining ``mirror_apply``) and, per service, every
+    public mutator of its replicated state classified as guarded / ungated and with
+    its external call sites. The gap slice is the ungated-AND-client-reachable
+    mutators — the exact two-way-broken shape the audit's ``client_server_congruence``
+    concern names, here proven deterministically from the AST instead of left to an
+    LLM to rediscover across files."""
+    spec: CongruenceSpec
+    services: list[Ref] = field(default_factory=list)
+    mutators: list[MutatorSite] = field(default_factory=list)
+
+    @property
+    def gap_mutators(self) -> list[MutatorSite]:
+        return [m for m in self.mutators if m.is_gap]
+
+    @property
+    def domains(self) -> list[str]:
+        return sorted({r.domain for r in self.services}
+                      | {m.def_ref.domain for m in self.mutators})
+
+    def gaps(self) -> list[Finding]:
+        out: list[Finding] = []
+        for m in self.gap_mutators:
+            callers = sorted({r.location for r in m.raw_client_callers})
+            if m.gap_kind == "ungated":
+                why = (
+                    f"calls no authority guard ({' / '.join(self.spec.guards)}) in its "
+                    f"body, so on a real client the caller mutates the LOCAL mirror and "
+                    f"the next server snapshot reverts it (the change flickers then "
+                    f"vanishes)"
+                )
+            else:
+                why = (
+                    "is authority-gated but has NO server route (no @rpc receiver calls "
+                    "it), so on a real client the guard bails and the player's intent is "
+                    "silently lost — the click does nothing and the server never learns"
+                )
+            out.append(Finding(
+                check="client_server_congruence",
+                severity="error",
+                node_kind="congruence",
+                thing=self.spec.name,
+                message=(
+                    f"{m.name!r} mutates replicated state on a mirror service "
+                    f"(the module defines {self.spec.mirror_apply!r}) and is CALLED from "
+                    f"{len(m.raw_client_callers)} raw client/UI site(s) "
+                    f"({', '.join(callers)}) — it {why}. Gate the mutator with the guard "
+                    f"AND route the caller through a server intent/RPC, repainting from "
+                    f"the snapshot applier (the proven four-part fix)"
+                ),
+                location=m.def_ref.location,
+                detail={"func": m.name, "domain": m.def_ref.domain,
+                        "gap_kind": m.gap_kind, "routed": m.rpc_routed,
+                        "writes": [w.location for w in m.write_refs],
+                        "external_calls": [r.location for r in m.raw_client_callers]},
+            ))
+        return out
+
+
 def impact_value(mods: list, spec: ValueSpec) -> ValueImpact:
     imp = ValueImpact(spec=spec)
     resolver_set = set(spec.resolvers)
@@ -352,6 +516,175 @@ def impact_authority(mods: list, spec: AuthoritySpec) -> AuthorityImpact:
             for r in refs.calls_to(m, g):
                 if r.func in mutators:
                     imp.guard_calls.append(r)
+    return imp
+
+
+def _module_callees(m) -> dict[str, set[str]]:
+    """Module-local call graph: each function name → the set of same-module functions
+    it calls. Built from ``calls_to`` (whose Refs carry the enclosing function in
+    ``.func``), so it needs no new per-language primitive and works for every adapter.
+    Cross-module and library calls fall away because only names this module defines are
+    nodes — exactly the scope a transitive same-module write-following needs."""
+    graph: dict[str, set[str]] = {}
+    for callee in refs.function_names(m):
+        for r in refs.calls_to(m, callee):
+            if r.func:
+                graph.setdefault(r.func, set()).add(callee)
+    return graph
+
+
+def _effective_writes(m, fn: str, callees: dict[str, set[str]],
+                      follow_public: bool = False) -> list:
+    """The replicated-state writes ``fn`` is RESPONSIBLE for: its own direct writes
+    plus those of the same-module helpers it calls, transitively. A public mutator can
+    land a replicated write only through a helper — chat_backend's ``send_message``
+    writes the replicated ``_history`` solely via ``_record_history`` — and a direct-
+    writes-only scan reads it as a non-writer, silently missing a real gated-but-
+    unrouted client gap.
+
+    PRIVATE helpers are always followed (an implementation detail of the caller).
+    PUBLIC callees are followed only when ``follow_public`` is set — used for a GATED
+    mutator, whose authority guard is the author's declaration "invoking me mutates
+    authoritative state," so a write it reaches through a public delegate
+    (``guild_system.kick`` → public ``leave`` → ``_guilds``) is still its
+    responsibility for the per-action congruence question. For an UNGATED function
+    (and for the snapshot applier, from which the replicated field set is derived)
+    public callees are NOT followed: descending into an independent public mutator
+    would double-attribute one logical write and could inflate the replicated set with
+    a field the applier never lands. Cycle-safe via ``seen``; the entry ``fn`` always
+    contributes its own writes regardless of name."""
+    seen: set[str] = set()
+    out: list = []
+    stack = [fn]
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        out.extend(refs.func_writes(m, cur))
+        for nxt in callees.get(cur, ()):
+            if nxt in seen:
+                continue
+            # Private helpers are always part of the caller's write responsibility; a
+            # public callee is followed only from a gated mutator (follow_public).
+            if nxt.startswith("_") or follow_public:
+                stack.append(nxt)
+    return out
+
+
+def impact_congruence(mods: list, spec: CongruenceSpec) -> CongruenceImpact:
+    """Derive the whole mirror-congruence fan-out from the parsed project — no
+    hand-listed mutators. For every module defining ``mirror_apply`` (a mirror
+    service), the replicated state is the set of base fields that ``mirror_apply``
+    itself writes; each PUBLIC function writing one of those fields is a mutator,
+    classified guarded/ungated by whether it calls a ``guard``, and annotated with
+    its call sites in OTHER modules. Cross-file by construction — the per-function
+    HUD-call ↔ ungated-mutator correlation an isolated per-file scan cannot see."""
+    imp = CongruenceImpact(spec=spec)
+    guards = set(spec.guards)
+    exempt = set(spec.exempt)
+
+    services = []
+    for m in mods:
+        defs = refs.function_defs(m, spec.mirror_apply)
+        if defs:
+            services.append(m)
+            imp.services.extend(defs)
+    if not services:
+        return imp
+
+    # The set of @rpc entry-point names each module defines — the server routes a
+    # remote client's intent travels through. Computed once; a mutator called by one
+    # of these is ROUTED (the safe shape), so the call is told apart from a raw HUD
+    # call. Typically the IntentRouter autoload owns these, but an in-service @rpc
+    # endpoint counts too.
+    rpc_by_mod = {m.path: refs.rpc_receivers(m) for m in mods}
+
+    for m in services:
+        # Module-local call graph, built once per service, so a mutator's writes can
+        # be followed through the private helpers it delegates to (the send_message →
+        # _record_history → _history edge that a direct-only scan misses).
+        callees = _module_callees(m)
+        # Replicated state = the base fields mirror_apply writes when it lands the
+        # snapshot on the client (counting its private appliers too). A mutator of
+        # THOSE fields races the next snapshot; a write to any other field (a build-
+        # time @export catalog) is not a mirror divergence and is correctly ignored.
+        rep_fields = {w.name for w in _effective_writes(m, spec.mirror_apply, callees)}
+        if not rep_fields:
+            continue
+        guard_funcs = {r.func for g in guards for r in refs.calls_to(m, g) if r.func}
+        for fn in refs.function_names(m):
+            if fn == spec.mirror_apply or fn in exempt or fn.startswith("_"):
+                continue
+            guarded = fn in guard_funcs
+            direct = [w for w in refs.func_writes(m, fn) if w.name in rep_fields]
+            # A gated mutator owns the writes it reaches through PUBLIC delegates too
+            # (kick -> leave -> _guilds); an ungated function does not (its public
+            # callee is an independent mutator), so follow_public tracks the guard.
+            writes = [w for w in _effective_writes(m, fn, callees, follow_public=guarded)
+                      if w.name in rep_fields]
+            if not writes:
+                continue  # touches no replicated state at all (a getter / unrelated write)
+            # A function that touches replicated state ONLY through a private helper
+            # (no direct write of its own) counts as a mutator only when it is
+            # authority-GATED — the author's own `if not _is_server(): return` is the
+            # declaration "this mutates authoritative state." An UNGATED function whose
+            # sole replicated write is indirect is overwhelmingly a getter whose helper
+            # lazily restores from save (collection_log.pages_state -> _ensure_restored)
+            # or a cross-authority sync (store.apply_entitlement_grants ->
+            # _record_ownership), NOT a per-action mirror mutation. Direct writes stay
+            # the high-precision signal for the ungated (shape-1) case; the fuzzier
+            # indirect-ungated cases are left to the LLM probe, not raised as a hard gap.
+            if not direct and not guarded:
+                continue
+            defs = refs.function_defs(m, fn)
+            if not defs:
+                continue
+            # The mutator's own parameter arity — the disambiguator that keeps a call
+            # to a SAME-NAMED method on a different service (guild_system.invite/3 vs
+            # group_framework.invite/2) from being charged to this one. A call whose
+            # argument count cannot fit `[min_required, max_total]` is a different
+            # function that merely shares the name; only when the arity is known on
+            # BOTH sides and provably incompatible is the attribution dropped (an
+            # indeterminate count never deletes a caller — the adapter's standing bias).
+            arity = refs.func_arity(m, fn)
+            # When name AND arity ALSO collide (chat_backend.kick/3 vs guild_system.kick/3),
+            # the receiver decides: the service name this module declares for itself vs the
+            # service a caller resolved its receiver from. An empty set (module declares no
+            # locator identity) disables this filter — conservative, keeps every caller.
+            my_services = refs.registered_service_names(m)
+            ext: list[Ref] = []
+            rpc_lines: set = set()
+            for other in mods:
+                # Verification harnesses (build-oracle probes / tests) drive mutators
+                # directly with authority — they are not the client UI, so they never
+                # make a mutator "client-reachable".
+                if _is_harness_path(other.path):
+                    continue
+                rpc_here = rpc_by_mod.get(other.path, set())
+                arg_counts = refs.call_arg_counts(other, fn) if arity is not None else {}
+                recv_services = refs.call_receiver_services(other, fn) if my_services else {}
+                for r in refs.calls_to(other, fn):
+                    if arity is not None:
+                        nargs = arg_counts.get(r.lineno)
+                        if nargs is not None and not (arity[0] <= nargs <= arity[1]):
+                            continue  # same name, incompatible arity — a different func
+                    recv_svc = recv_services.get(r.lineno)
+                    if recv_svc is not None and recv_svc not in my_services:
+                        continue  # receiver resolved from a DIFFERENT named service
+                    # An @rpc receiver calling the mutator is the server route — mark
+                    # it (so it is not counted a raw client call) and note the mutator
+                    # is routed, whether the receiver is in another module or this one.
+                    if r.func in rpc_here:
+                        rpc_lines.add((r.path, r.lineno))
+                    if other.path == m.path:
+                        continue  # a service calling its own mutator is server-internal
+                    ext.append(r)
+            imp.mutators.append(MutatorSite(
+                module=m.path, name=fn, def_ref=defs[0], write_refs=writes,
+                guarded=fn in guard_funcs, external_calls=ext,
+                rpc_caller_lines=rpc_lines,
+            ))
     return imp
 
 
@@ -423,6 +756,32 @@ def format_authority_impact(imp: AuthorityImpact) -> str:
     out.append(f"  guard calls inside mutators: {len(imp.guard_calls)}")
     for r in imp.guard_calls:
         out.append(_loc_line(r))
+    return "\n".join(out)
+
+
+def format_congruence_impact(imp: CongruenceImpact) -> str:
+    s = imp.spec
+    out = [f"CONGRUENCE {s.name!r}  (mirror services define {s.mirror_apply!r}; "
+           f"guards: {' / '.join(s.guards)})",
+           f"  mirror services: {len(imp.services)}"]
+    for r in imp.services:
+        out.append(f"      {r.location}  [{r.domain}]")
+    out.append(f"  replicated-state mutators: {len(imp.mutators)}")
+    for m in imp.mutators:
+        if m.is_gap:
+            n = len(m.raw_client_callers)
+            if m.gap_kind == "ungated":
+                mark = f"UNGATED + client-reachable — fix this ({n} raw caller(s))"
+            else:
+                mark = f"gated but UNROUTED + client-reachable — fix this ({n} raw caller(s))"
+        elif m.guarded:
+            route = "routed" if m.rpc_routed else "no client caller"
+            mark = f"gated ({route})"
+        else:
+            mark = "ungated (server-internal — no client caller)"
+        out.append(f"      [{mark}] {m.def_ref.location}  [{m.def_ref.domain}] {m.name}()")
+        for r in m.raw_client_callers:
+            out.append(f"          called by {r.location}  [{r.domain}] {r.func or '<module>'}()")
     return "\n".join(out)
 
 

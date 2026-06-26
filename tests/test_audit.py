@@ -127,6 +127,52 @@ def test_ground_target_registry_assembles_files_and_dataflow(tmp_path):
     assert not g.is_empty()
 
 
+# --- grounding: doc-claimed fields that live in DATA, not code symbols ----
+
+def test_doc_field_check_grounds_data_fields_so_they_are_not_false_absent(tmp_path):
+    """The false-`absent` class: a data-driven project keeps its contract field
+    names in JSON, NOT in parsed code, so they never appear in the symbol menu. A
+    doc citing such a field must be grounded as PRESENT (count>0) so the probe does
+    not report it 'unimplemented'; a field genuinely absent from data grounds as 0."""
+    from saddle.audit.ground import data_field_counts
+    root = tmp_path
+    (root / "knowledge").mkdir()
+    # `provides`/`reads_from` are field NAMES in the data, never referenced by code.
+    (root / "knowledge" / "sys_a.json").write_text(json.dumps({
+        "camera": {"provides": ["pos"], "reads_from": ["input"]},
+    }))
+    (root / "knowledge" / "sys_b.json").write_text(json.dumps({
+        "mover": {"provides": ["vel"], "reads_from": ["pos"]},
+    }))
+    # A doc that claims those fields exist, plus one that does NOT exist anywhere.
+    (root / "ARCH.md").write_text(
+        "Systems expose `provides` and consume `reads_from`. "
+        "Instances reference roles via `definition_id`. See `docs/x.md`.\n"
+    )
+    plan = build_plan(root)
+    assert plan.data_files, "the data files must be enumerated for the field index"
+    # round-trips through dict (the new field is serialized)
+    from saddle.audit.plan import AuditPlan
+    assert AuditPlan.from_dict(plan.to_dict()).data_files == plan.data_files
+
+    counts = data_field_counts(root, plan.data_files)
+    assert counts.get("provides", 0) >= 2 and counts.get("reads_from", 0) >= 2
+
+    doc = next(t for t in plan.targets if t.id == "doc:ARCH.md")
+    g = ground_target(doc, root, mods=[], data_counts=counts)
+    # the doc-cited data fields are grounded PRESENT, not absent
+    assert g.doc_field_check.get("provides", 0) > 0
+    assert g.doc_field_check.get("reads_from", 0) > 0
+    # a field that exists nowhere grounds as 0 (a real candidate, correctly)
+    assert g.doc_field_check.get("definition_id") == 0
+    # a backticked file PATH is not mistaken for a schema field
+    assert "docs/x.md" not in g.doc_field_check
+    # the rendered bundle steers the probe away from the false finding
+    text = g.format()
+    assert "DOC-CLAIMED FIELD CHECK" in text
+    assert "do NOT report it" in text
+
+
 # --- probe (fake caller) -------------------------------------------------
 
 class _FakeCaller:

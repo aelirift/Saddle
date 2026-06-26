@@ -294,10 +294,12 @@ def _within(root: str, target: str) -> bool:
 
 
 def _focus_root() -> str:
-    """The focus project's root, resolved the same way Layer 3 resolves the
-    code it parses — so the fence and the code-map agree on "the project."""
-    from saddle.context import code_root
-    return str(code_root())
+    """The focus project's root — the single boundary shared by the doctrine
+    fence, Layer 3's code-map, and Layer 1 intake. Resolved via the focus
+    authority (:func:`saddle.focus.focus_root`) so every layer agrees on what
+    "the project" is."""
+    from saddle.focus import focus_root
+    return str(focus_root())
 
 
 def _rule_triggers(rule: CheckRule, action: Action) -> bool:

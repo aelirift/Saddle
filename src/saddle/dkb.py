@@ -39,6 +39,7 @@ import time
 from pathlib import Path
 from typing import Iterable
 
+from saddle import ids
 from saddle.context import Context
 from saddle.embed import Embedder, get_embedder
 from saddle.models import (
@@ -51,7 +52,7 @@ from saddle.models import (
     Design,
     Knowledge,
 )
-from saddle.store import _new_id, default_db_path
+from saddle.store import default_db_path
 
 _log = logging.getLogger("saddle.dkb")
 
@@ -233,7 +234,7 @@ class DKB:
             raise ValueError(f"unknown knowledge status {k.status!r}")
         if k.scope_project and not k.scope_tenant:
             raise ValueError("scope_project requires scope_tenant (project implies tenant)")
-        k.id = k.id or _new_id("kno")
+        k.id = k.id or ids.record_id(ids.KIND_KNOWLEDGE)
         k.ts = k.ts or time.time()
         tags_json = json.dumps(list(k.tags))
         emb = self._emb().embed([f"{k.title}\n\n{k.body}"])[0]
@@ -402,7 +403,7 @@ class DKB:
     def add_design(self, ctx: Context, design: Design) -> Design:
         if design.status not in DESIGN_STATUSES:
             raise ValueError(f"unknown design status {design.status!r}")
-        design.id = design.id or _new_id("dsg")
+        design.id = design.id or ids.record_id(ids.KIND_DESIGN)
         design.tenant = ctx.tenant
         design.project = ctx.project
         design.ts = design.ts or time.time()

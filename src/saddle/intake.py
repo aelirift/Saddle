@@ -23,9 +23,10 @@ can't starve another's.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from saddle.context import Context, default as _default_ctx
+from saddle.focus import focus_descriptor, focus_project
 from saddle.llm.json_tools import call_json as _call_json
 from saddle.llm.pool import tenant_gate
 from saddle.models import (
@@ -100,6 +101,23 @@ _SYSTEM_AUDIT = (
     "Set complete to true only when nothing was missed (missed is empty)."
 )
 
+_SYSTEM_SCOPE = (
+    "You are the focus gate of an assistant DEDICATED to one project. You are "
+    "given that FOCUS project's identity and a numbered list of work items "
+    "pulled from a user's message. For each item, decide whether the work it "
+    "asks for belongs to the FOCUS project, or targets a DIFFERENT project, "
+    "codebase, or product. Judge by what the work is ABOUT, not by wording. An "
+    "item that asks to build, fix, audit, or change something that is NOT the "
+    "focus project — naming or describing another system, repo, or product — "
+    "is out_of_focus. Questions about this assistant itself, meta-requests, "
+    "and anything about the focus project are in_focus. When genuinely unsure, "
+    "mark out_of_focus so it is surfaced rather than waved through.\n\n"
+    "Respond with ONLY a JSON object: "
+    '{"verdicts": [{"index": <the item\'s number>, "scope": "in_focus" | '
+    '"out_of_focus", "reason": "<short why>"}]}. '
+    "Include EVERY item exactly once."
+)
+
 
 def _coerce_kind(raw: object) -> str:
     k = str(raw or "").strip().lower()
@@ -148,6 +166,74 @@ def _audit_prompt(prompt: str, items: list[Item]) -> str:
     )
 
 
+def _scope_prompt(focus_desc: str, items: list[Item]) -> str:
+    lines = [f"{i + 1}. [{it.kind}] {it.ask}" for i, it in enumerate(items)]
+    listing = "\n".join(lines) if lines else "(none)"
+    return (
+        f"FOCUS PROJECT: {focus_desc}\n\n"
+        f"WORK ITEMS:\n{listing}\n\n"
+        "Classify each item's scope relative to the FOCUS project above."
+    )
+
+
+async def _classify_scope(
+    caller: "LLMCaller", items: list[Item], ctx: Context
+) -> dict[str, Any]:
+    """Tag each final item in_focus / out_of_focus against the focus project.
+
+    Annotates — never filters. Out-of-focus items stay in the intake; this only
+    records WHICH ones cross a project boundary and a human-readable warning so
+    the drift ("you pulled me onto another project") is surfaced. Refusing the
+    work stays Layer 0's job. If the model fails to classify every item, that is
+    recorded (``scope_checked=False``) and surfaced rather than silently read as
+    "all in focus" — the same never-imply-coverage stance as the audit pass.
+    """
+    raw = await _call_json(
+        caller, _SYSTEM_SCOPE, _scope_prompt(focus_descriptor(ctx), items),
+        label="intake/scope",
+    )
+    verdicts = raw.get("verdicts")
+    out_of_focus: list[dict[str, Any]] = []
+    classified: set[int] = set()
+    if isinstance(verdicts, list):
+        for v in verdicts:
+            if not isinstance(v, dict):
+                continue
+            try:
+                idx = int(v.get("index", 0)) - 1
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= idx < len(items)) or idx in classified:
+                continue
+            classified.add(idx)
+            if str(v.get("scope", "")).strip().lower() == "out_of_focus":
+                out_of_focus.append({
+                    "n": idx + 1,
+                    "ask": items[idx].ask,
+                    "reason": str(v.get("reason", "")).strip(),
+                })
+    scope_checked = len(classified) >= len(items)
+    warning = ""
+    if out_of_focus:
+        proj = focus_project(ctx)
+        warning = (
+            f"{len(out_of_focus)} of {len(items)} item(s) target work OUTSIDE "
+            f"the focus project ({proj}). saddle is focused on {proj}; this work "
+            f"belongs to another project and should not be acted on here without "
+            f"an explicit cross-project decision."
+        )
+    elif not scope_checked:
+        warning = (
+            "focus check did not classify every item — review scope manually "
+            "before acting."
+        )
+    return {
+        "out_of_focus": out_of_focus,
+        "scope_warning": warning,
+        "scope_checked": scope_checked,
+    }
+
+
 async def decompose(
     prompt: str,
     ctx: Context | None = None,
@@ -156,13 +242,17 @@ async def decompose(
     store: "Store | None" = None,
     persist: bool = True,
     max_audits: int = 2,
+    check_focus: bool = True,
 ) -> Intake:
     """Decompose ``prompt`` into a recorded :class:`Intake` for ``ctx``.
 
     Two-pass: itemize, then audit coverage (bounded by ``max_audits``)
-    appending any missed items until the auditor reports complete. The whole
-    decomposition runs inside ``ctx``'s tenant fairness gate. Persists to the
-    store unless ``persist=False``. Pass ``caller`` to bypass provider
+    appending any missed items until the auditor reports complete. A final
+    focus pass (unless ``check_focus=False``) tags any item that targets work
+    OUTSIDE the focus project and records a ``scope_warning`` in ``meta`` — it
+    annotates, never filters, so off-focus asks are surfaced, not dropped. The
+    whole decomposition runs inside ``ctx``'s tenant fairness gate. Persists to
+    the store unless ``persist=False``. Pass ``caller`` to bypass provider
     resolution (tests); otherwise the context's default fallback chain is used.
     """
     text = (prompt or "").strip()
@@ -176,6 +266,10 @@ async def decompose(
 
     audits_run = 0
     audit_complete = False
+    # Focus gate result — populated below unless check_focus is off / no items.
+    scope_info: dict[str, Any] = {
+        "out_of_focus": [], "scope_warning": "", "scope_checked": False,
+    }
     async with tenant_gate(ctx):
         first = await _call_json(
             caller, _SYSTEM_ITEMIZE, _itemize_prompt(text), label="intake/itemize"
@@ -204,6 +298,13 @@ async def decompose(
                 # forward progress is possible; stop rather than spin.
                 break
 
+        # Focus gate — flag asks that target work OUTSIDE this project.
+        # Annotate, never filter: out-of-focus items stay in the list, but the
+        # drift ("you pulled me onto another project") is surfaced. Refusing
+        # the work is Layer 0's job, not intake's.
+        if check_focus and items:
+            scope_info = await _classify_scope(caller, items, ctx)
+
     intake = Intake(
         raw_prompt=text,
         summary=summary,
@@ -214,6 +315,9 @@ async def decompose(
             "audit_complete": audit_complete,
             "final_items": len(items),
             "todo_items": sum(1 for it in items if it.is_todo()),
+            "out_of_focus": scope_info["out_of_focus"],
+            "scope_warning": scope_info["scope_warning"],
+            "scope_checked": scope_info["scope_checked"],
         },
     )
 
@@ -233,6 +337,12 @@ def format_intake(intake: Intake) -> str:
         lines.append(f"intake {intake.id}  [{intake.tenant}/{intake.project}]")
     if intake.summary:
         lines.append(f"summary: {intake.summary}")
+    warning = intake.meta.get("scope_warning", "")
+    if warning:
+        lines.append(f"⚠ SCOPE: {warning}")
+        for o in intake.meta.get("out_of_focus", []):
+            reason = f" — {o['reason']}" if o.get("reason") else ""
+            lines.append(f"    • item {o['n']} is out of focus: {o['ask']}{reason}")
     todo = intake.meta.get("todo_items", sum(1 for i in intake.items if i.is_todo()))
     lines.append(f"{len(intake.items)} items ({todo} todo):")
     for i, it in enumerate(intake.items, 1):

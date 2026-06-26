@@ -87,6 +87,7 @@ from .finding import Finding
 from .impact import (
     impact_authority,
     impact_boundary,
+    impact_congruence,
     impact_identity,
     impact_lifecycle,
     impact_value,
@@ -95,6 +96,7 @@ from .specs import (
     AuthoritySpec,
     BindingSpec,
     BoundarySpec,
+    CongruenceSpec,
     IdentitySpec,
     LifecycleSpec,
     PersistenceSpec,
@@ -111,6 +113,7 @@ __all__ = [
     "PersistenceSpec",
     "LifecycleSpec",
     "AuthoritySpec",
+    "CongruenceSpec",
     "BindingSpec",
     "check_value",
     "check_identity",
@@ -119,6 +122,7 @@ __all__ = [
     "check_persistence",
     "check_lifecycle",
     "check_authority",
+    "check_congruence",
     "check_binding",
 ]
 
@@ -149,6 +153,10 @@ def check_lifecycle(mods: list, spec: LifecycleSpec) -> list[Finding]:
 
 def check_authority(mods: list, spec: AuthoritySpec) -> list[Finding]:
     return impact_authority(mods, spec).gaps()
+
+
+def check_congruence(mods: list, spec: CongruenceSpec) -> list[Finding]:
+    return impact_congruence(mods, spec).gaps()
 
 
 def check_binding(root, spec: BindingSpec) -> list[Finding]:

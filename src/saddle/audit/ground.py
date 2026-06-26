@@ -35,6 +35,8 @@ _MAX_KEYS = 80                  # registry keys whose dataflow we trace
 _MAX_SITES_PER_KEY = 6          # code sites cited per key
 _MAX_SEED_HITS = 40             # total code lines cited per concern seed
 _PKG_SAMPLE_FILES = 14          # source files sampled to ground a package target
+_MAX_DATA_FIELDS = 160          # declared field NAMES surfaced in the data-field menu
+_MAX_DATA_FILES = 1200          # data files scanned for the field menu (bounded sweep)
 
 # The audit reasons over the SYSTEM UNDER AUDIT — the project's own source — never
 # the build OUTPUT a pipeline emits. A generator like rayxi scatters tens of
@@ -87,12 +89,15 @@ class Grounding:
     target_id: str
     files: dict[str, str] = field(default_factory=dict)        # rel-path -> (capped) text
     symbol_menu: dict = field(default_factory=dict)            # codemap symbol menu
+    data_fields: dict = field(default_factory=dict)           # data-file field name -> use count
+    doc_field_check: dict = field(default_factory=dict)       # doc-cited `field` -> data use-count
     key_dataflow: dict[str, list[str]] = field(default_factory=dict)  # registry key -> sites
     seed_hits: dict[str, list[str]] = field(default_factory=dict)     # seed -> "rel:line  <code>"
     notes: list[str] = field(default_factory=list)            # grounding caveats (truncation, no code)
 
     def is_empty(self) -> bool:
-        return not (self.files or self.symbol_menu or self.key_dataflow or self.seed_hits)
+        return not (self.files or self.symbol_menu or self.data_fields
+                    or self.doc_field_check or self.key_dataflow or self.seed_hits)
 
     def format(self) -> str:
         out: list[str] = []
@@ -116,6 +121,29 @@ class Grounding:
         if self.symbol_menu:
             out.append("=== PROJECT SYMBOL MENU (real names, ranked by use — ground your finding sites here) ===\n"
                        + json.dumps(self.symbol_menu, indent=1))
+        if self.doc_field_check:
+            present = {k: v for k, v in self.doc_field_check.items() if v > 0}
+            absent = sorted(k for k, v in self.doc_field_check.items() if v == 0)
+            lines = [
+                "=== DOC-CLAIMED FIELD CHECK (every `identifier` this doc cites -> its use-count "
+                "in the project's JSON DATA) ===",
+                "Schema/contract lives in DATA, not the code symbol menu. A token with count>0 "
+                "EXISTS — do NOT report it 'absent', 'unimplemented', or 'not in the symbol menu' "
+                "as a finding; the symbol menu only indexes parsed code. Only a token absent from "
+                "BOTH the symbol menu AND this check (count 0 below) is a candidate for a missing/"
+                "drift finding.",
+                "  present in data: " + (json.dumps(present) if present else "(none)"),
+                "  count 0 in data (verify against symbol menu before flagging): "
+                + (", ".join(absent) if absent else "(none)"),
+            ]
+            out.append("\n".join(lines))
+        if self.data_fields:
+            out.append(
+                "=== DATA-FILE FIELD MENU (schema/contract field names declared in the project's "
+                "JSON data, ranked by use) ===\n"
+                "A data-driven architecture keeps its contract in DATA, not code: a field absent "
+                "from the SYMBOL MENU above may still be a real, heavily-used field here.\n"
+                + json.dumps(self.data_fields, indent=1))
         if self.notes:
             out.append("=== GROUNDING NOTES ===\n" + "\n".join(f"  - {n}" for n in self.notes))
         return "\n\n".join(out)
@@ -208,6 +236,104 @@ def registry_keys(data) -> list[str]:
     return keys[:_MAX_KEYS]
 
 
+def data_field_counts(
+    root: str | Path,
+    data_files: list[str],
+    *,
+    max_files: int = _MAX_DATA_FILES,
+) -> dict[str, int]:
+    """Use-count of EVERY field name (dict key) declared across the project's data
+    files — the full index, not a ranked slice.
+
+    The code symbol menu only carries names that appear in *parsed source*. A
+    data-driven architecture (every rayxi "system" is a JSON package) keeps its
+    contract — `provides`, `reads_from`, `duration_type`, … — in DATA, not code, so
+    those names are absent from the symbol menu by construction. A doc probe handed
+    only the symbol menu therefore reports every data-schema field a doc references
+    as "absent (0)" — a false `missing_impl`. This index is the missing half: the
+    dict KEYS (schema field names, distinct from :func:`registry_keys` which lifts
+    id/name VALUES for dataflow). It is computed ONCE per run and consumed two ways
+    — a ranked menu (:func:`data_field_menu`) for general vocabulary, and a TARGETED
+    per-doc check (:func:`doc_field_presence`) that answers "does THIS field the doc
+    names exist in data?" precisely, regardless of how rare it is. Bounded
+    (``max_files``, depth) so a big data tree cannot wedge or bloat grounding.
+    """
+    root = Path(root).expanduser().resolve()
+    counts: dict[str, int] = {}
+
+    def _walk(node, depth: int) -> None:
+        if depth > 6:
+            return
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if isinstance(k, str) and 2 <= len(k) <= 64:
+                    counts[k] = counts.get(k, 0) + 1
+                if isinstance(v, (dict, list)):
+                    _walk(v, depth + 1)
+        elif isinstance(node, list):
+            for v in node:
+                if isinstance(v, (dict, list)):
+                    _walk(v, depth + 1)
+
+    for rel in data_files[:max_files]:
+        try:
+            data = json.loads((root / rel).read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 — a bad data file is not fatal to the index
+            continue
+        _walk(data, 0)
+    return counts
+
+
+def data_field_menu(
+    root: str | Path,
+    data_files: list[str],
+    *,
+    cap: int = _MAX_DATA_FIELDS,
+    max_files: int = _MAX_DATA_FILES,
+) -> dict[str, int]:
+    """The top ``cap`` data field names by use — the general-vocabulary slice of
+    :func:`data_field_counts` (back-compat convenience for callers/tests)."""
+    counts = data_field_counts(root, data_files, max_files=max_files)
+    top = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:cap]
+    return dict(top)
+
+
+# A doc cites the names it claims exist as `backtick-quoted` identifiers. We check
+# those exact tokens against data — a precise lookup that a frequency-ranked menu
+# cannot do (a real-but-rare field like `provides` sits below any sane cap).
+_DOC_IDENT_RE = re.compile(r"`([a-zA-Z_][a-zA-Z0-9_./]{1,48})`")
+_MAX_DOC_FIELDS = 80            # backtick identifiers checked per doc target
+
+
+def doc_field_presence(doc_texts: list[str], data_counts: dict[str, int]) -> dict[str, int]:
+    """For every `backtick identifier` a doc cites, its use-count in the data files.
+
+    The precise antidote to the false-`absent` class: when a doc says a field exists
+    and the probe is about to call it unimplemented, this hands over the fact — that
+    field appears N times in the project's data (N>0 ⇒ it EXISTS; N==0 ⇒ genuinely
+    absent there too). Bounded to the field-shaped tokens (dotted/identifier names),
+    capped, so a doc full of code snippets does not bloat grounding.
+    """
+    seen: dict[str, int] = {}
+    for text in doc_texts:
+        for m in _DOC_IDENT_RE.finditer(text or ""):
+            tok = m.group(1)
+            if tok in seen:
+                continue
+            # A data FIELD is a bare/dotted identifier — not a file path or filename.
+            # Backticked paths (docs/x.md, src/y.py) and bare filenames (foo.json) are
+            # doc references, not schema fields; dropping them keeps the count-0 list
+            # to genuine field candidates instead of every cited path.
+            if "/" in tok or tok.rsplit(".", 1)[-1] in (
+                "md", "py", "json", "gd", "tres", "tscn", "ts", "tsx", "go", "rs", "toml", "yaml", "yml"
+            ):
+                continue
+            seen[tok] = int(data_counts.get(tok, 0))
+            if len(seen) >= _MAX_DOC_FIELDS:
+                return seen
+    return seen
+
+
 def _iter_code_text(code_files: list[str]) -> "list[tuple[str, str]]":
     """(path, text) for each code file, read once. Unreadable files skipped."""
     out: list[tuple[str, str]] = []
@@ -282,6 +408,7 @@ def ground_target(
     code_files: list[str] | None = None,
     code_text: list[tuple[str, str]] | None = None,
     code_dirs: list[str] | None = None,
+    data_counts: dict | None = None,
 ) -> Grounding:
     """Assemble the full :class:`Grounding` for one :class:`~saddle.audit.plan.AuditTarget`.
 
@@ -307,6 +434,18 @@ def ground_target(
         g.symbol_menu = refs.symbols(mods).top()
     else:
         g.notes.append("no parseable code found under root — symbol menu empty")
+
+    # Doc/package probes judge doc-claimed CONTRACT field names — which, in a
+    # data-driven project, live in JSON, not the code symbol menu. Hand them the
+    # data evidence so "this documented field is unimplemented" is checked against
+    # the data too, not just code (the false-`absent` class). Docs additionally get
+    # a TARGETED per-field check on the exact `identifiers` they cite, so a real-but-
+    # rare field (below any ranked-menu cap) is still proven present.
+    if data_counts and target.kind in ("doc", "package"):
+        top = sorted(data_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:_MAX_DATA_FIELDS]
+        g.data_fields = dict(top)
+        if target.kind == "doc" and files:
+            g.doc_field_check = doc_field_presence(list(files.values()), data_counts)
 
     # Registry dataflow + concern seeds both need the raw code text.
     needs_scan = target.kind == "registry" or bool(target.seeds)
