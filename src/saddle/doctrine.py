@@ -249,9 +249,11 @@ SEED_RULES: tuple[CheckRule, ...] = (
         target_kind="path",
         override_evidence="cross_project_task",
         message=(
-            "this action targets a path OUTSIDE the focus project. saddle is the "
-            "focus; a sibling repo (rayxiv4, ...) is off-limits unless the task is "
-            "explicitly cross-project (evidence cross_project_task=true)."
+            "this action targets a path OUTSIDE the focus project. Editing, "
+            "creating, or deleting files that live outside the focus root shown "
+            "below — in a sibling repo or any other project — is off-limits "
+            "unless the task is explicitly cross-project (evidence "
+            "cross_project_task=true)."
         ),
     ),
     CheckRule(
