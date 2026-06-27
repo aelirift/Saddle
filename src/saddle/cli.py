@@ -19,6 +19,9 @@ A small subcommand dispatcher over saddle's surfaces:
     saddle audit                    # audit a project: grounded probes -> findings + coverage
     saddle audit --list             # enumerate everything that CAN be audited (no LLM)
     saddle guard --verb <v> --target <p>   # Layer 0: pre-action doctrine gate (exit 2 = BLOCK)
+    saddle cross-project list              # list cross-project authorization grants
+    saddle cross-project grant <root>...   # authorize work spanning these project roots
+    saddle cross-project revoke            # revoke all cross-project grants
 
 Addressing: every non-chat command takes ``--tenant`` / ``--project`` to
 address a specific tenant+project; omitted, they resolve from the environment
@@ -494,6 +497,56 @@ def _run_guard(args: argparse.Namespace) -> int:
     return 0 if verdict.allowed else 2
 
 
+# -- cross-project authorization grants --------------------------------------
+
+def _run_crossproject(args: argparse.Namespace) -> int:
+    """Manage the explicit, persistent grants the doctrine scope-fence consults.
+
+    The fence blocks edits outside the focus project unless the work is
+    explicitly cross-project; a *grant* is how a human (or this CLI) records that
+    authorization durably. ``list`` shows what's authorized, ``grant`` adds a set
+    of mutually-authorized roots, ``revoke`` clears them all."""
+    import time
+
+    from saddle import crossproject
+
+    if args.action == "list":
+        grants = crossproject.load_grants()
+        if not grants:
+            print("no cross-project grants (the scope-fence is fully closed)")
+            return 0
+        print(f"{len(grants)} cross-project grant(s):")
+        for g in grants:
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(g.ts)) if g.ts else "?"
+            tnt = g.tenant or "(every tenant)"
+            print(f"  [{tnt}] {when} via {g.source}")
+            for r in g.roots:
+                print(f"      root: {r}")
+            if g.reason:
+                print(f"      reason: {g.reason}")
+        return 0
+
+    if args.action == "grant":
+        roots = [r for r in (args.roots or []) if r.strip()]
+        if not roots:
+            print("cross-project grant: pass one or more project roots to authorize",
+                  file=sys.stderr)
+            return 2
+        tenant = args.tenant if args.tenant is not None else resolve(args.tenant, args.project).tenant
+        g = crossproject.grant(roots, tenant=tenant, reason=args.reason or "", source="cli")
+        print(f"granted [{g.tenant or 'every tenant'}] across {len(g.roots)} root(s):")
+        for r in g.roots:
+            print(f"  {r}")
+        return 0
+
+    if args.action == "revoke":
+        n = crossproject.revoke_all()
+        print(f"revoked {n} cross-project grant(s)")
+        return 0
+
+    return 2  # unreachable — argparse constrains the choices
+
+
 # -- parser ------------------------------------------------------------------
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -636,6 +689,18 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="focus-project root (default: $SADDLE_CODE_ROOT, else git root / cwd)")
     p_gd.add_argument("--json", action="store_true", help="machine-readable verdict")
 
+    p_xp = sub.add_parser(
+        "cross-project",
+        help="manage cross-project authorization grants for the scope-fence",
+        parents=[g])
+    _add_ctx_flags(p_xp)
+    p_xp.add_argument("action", choices=["list", "grant", "revoke"],
+                      help="list grants, grant across roots, or revoke all")
+    p_xp.add_argument("roots", nargs="*",
+                      help="project roots to authorize together (for 'grant')")
+    p_xp.add_argument("--reason", default="",
+                      help="why this cross-project work is authorized (recorded on the grant)")
+
     return parser
 
 
@@ -650,6 +715,7 @@ _DISPATCH = {
     "converge": _run_converge,
     "audit": _run_audit,
     "guard": _run_guard,
+    "cross-project": _run_crossproject,
 }
 
 

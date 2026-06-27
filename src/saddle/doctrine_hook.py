@@ -79,6 +79,24 @@ def main(argv: list[str] | None = None) -> int:
     if verdict.allowed:
         return 0
 
+    # The scope-fence is the one rule with a legitimate cross-project override.
+    # actions_from_tool attaches no evidence, so the tool path cannot say "this
+    # is cross-project" inline -- instead we consult persisted authorization
+    # grants. Any other rule (no-unwired-delete, disposition-coherent) is a
+    # non-scope concern and is never overridden here.
+    if getattr(verdict, "rule_id", None) == "stay-in-project-focus":
+        try:
+            from saddle.crossproject import authorize_tool
+
+            note = authorize_tool(tool_name, tool_input, focus=root)
+        except Exception as exc:  # noqa: BLE001 -- grant-check failure keeps the block
+            note = None
+            print(f"doctrine_hook: grant check error ({exc!r}); keeping block",
+                  file=sys.stderr)
+        if note is not None:
+            print(f"[doctrine] cross-project ALLOW: {note}", file=sys.stderr)
+            return 0
+
     print(json.dumps(_deny_doc(verdict.render())))
     print(f"[doctrine] BLOCKED {tool_name}: {verdict.render()}", file=sys.stderr)
     return 0
