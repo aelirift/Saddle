@@ -31,6 +31,7 @@ from saddle.models import (
     DRIFT_DRIFT,
     DRIFT_UNKNOWN,
     FORK_RESOLVED,
+    FORK_SUPERSEDED,
     Action,
     Fork,
     ForkOption,
@@ -63,6 +64,37 @@ a) yes, add caching
 b) no, keep it simple
 """
 
+# Digit-labeled lists: the agent's default PROSE shape (enumerated findings /
+# steps), which must NOT be ingested as a fork — versus genuine numbered choices,
+# which carry explicit decision framing. This is the precision seam that the
+# ledger (95% false forks) forced.
+_AGENT_DIGIT_ENUM = """\
+Two findings already, both major:
+1. the resolver reads the cooldown raw
+2. the tooltip shows the stale number
+"""
+
+_AGENT_DIGIT_BACKREF = """\
+So the faithful implementation of Option A is:
+1. cover edits at warn
+2. keep deletes blocking
+3. surface an allowed-with-warn edit
+"""
+
+_AGENT_DIGIT_HANDOFF = """\
+Three threads here, and I want your call on direction:
+1. fix the resolver
+2. fix the tooltip
+3. fix both
+"""
+
+_AGENT_DIGIT_REC = """\
+My recommendation among these is the hybrid:
+1. pure server-side
+2. pure client-side
+3. the hybrid (recommended)
+"""
+
 
 # === parsing the agent's offered fork ====================================
 
@@ -92,6 +124,36 @@ def test_eg_and_ie_are_not_mistaken_for_options():
     fork = parse_fork(_AGENT_EG)
     assert fork is not None
     assert fork.labels() == ["a", "b"]  # no stray "e"
+
+
+def test_bare_numbered_list_is_prose_not_a_fork():
+    # The headline precision fix. A numbered list with NO decision framing is the
+    # agent's default prose shape ("Two findings: 1... 2..."), not a choice it is
+    # leaving the user. Letting it register is what flooded the ledger with ~95%
+    # false forks (and let a stray later "2" bind one). It must be NONE.
+    assert parse_fork(_AGENT_DIGIT_ENUM) is None
+
+
+def test_numbered_list_under_an_option_backreference_is_not_a_fork():
+    # "the implementation of Option A is: 1... 2..." back-references a PRIOR
+    # decision and enumerates its STEPS; a bare "option" in the framing must not
+    # be read as a fresh fork (the real p86 false-positive the ledger exposed).
+    assert parse_fork(_AGENT_DIGIT_BACKREF) is None
+
+
+def test_numbered_fork_with_handoff_framing_is_a_fork():
+    # A numbered list IS a fork when the framing hands the choice to the user.
+    fork = parse_fork(_AGENT_DIGIT_HANDOFF)
+    assert fork is not None
+    assert fork.labels() == ["1", "2", "3"]
+
+
+def test_numbered_fork_with_recommendation_framing_is_a_fork():
+    # ...or when the agent frames a recommendation among the numbered options.
+    fork = parse_fork(_AGENT_DIGIT_REC)
+    assert fork is not None
+    assert fork.labels() == ["1", "2", "3"]
+    assert fork.recommended_option() is not None  # "(recommended)" still marks it
 
 
 def test_prose_without_options_is_not_a_fork():
@@ -137,6 +199,43 @@ def test_recommended_phrase_without_recommendation_is_ambiguous():
     plain.id = "frk_plain"
     b = resolve_selection(plain, "your call")
     assert b is not None and not b.resolved and b.method == BIND_AMBIGUOUS
+
+
+def test_proceed_binds_recommended_option():
+    # "proceed" hands the choice back exactly like "your call": bind the
+    # recommended option, never a recency guess (the deterministic matcher
+    # refuses to guess — that judgment is the LLM layer's, not this seam's).
+    b = resolve_selection(_fork(), "proceed")
+    assert b is not None and b.resolved
+    assert b.label == "c" and b.method == BIND_RECOMMENDED
+
+
+def test_continuation_variants_all_defer_to_recommendation():
+    for text in ("continue", "go on", "keep going", "carry on", "press on",
+                 "proceed then", "proceed please", "proceed with the plan",
+                 "proceed and build"):
+        b = resolve_selection(_fork(), text)
+        assert b is not None and b.resolved and b.label == "c", text
+        assert b.method == BIND_RECOMMENDED, text
+
+
+def test_proceed_without_recommendation_is_ambiguous():
+    # A continuation with no option to defer to is AMBIGUOUS (must-confirm), not
+    # a silent guess and not a no-op — the same bar as "your call".
+    plain = parse_fork(_AGENT_BOLD)  # no recommended option
+    plain.id = "frk_plain2"
+    b = resolve_selection(plain, "proceed")
+    assert b is not None and not b.resolved and b.method == BIND_AMBIGUOUS
+
+
+def test_proceed_with_explicit_label_binds_that_label_not_the_recommendation():
+    # An explicit object after the continuation verb is a real pick and must win
+    # over the recommended option: "proceed with b" binds b, never c.
+    for text, lab in [("proceed with b", "b"), ("continue with a", "a"),
+                      ("go on with b", "b")]:
+        b = resolve_selection(_fork(), text)
+        assert b is not None and b.resolved and b.label == lab, text
+        assert b.method == BIND_LABEL, text
 
 
 def test_label_not_offered_is_ambiguous_not_a_guess():
@@ -188,6 +287,43 @@ def test_tracker_catches_pick_a_then_action_b_as_drift():
     assert tracker.check_action(ctx, "a", session="s1").status == DRIFT_ALIGNED
     # an action that declares no option can't be judged deterministically
     assert tracker.check_action(ctx, "", session="s1").status == DRIFT_UNKNOWN
+
+
+def test_tracker_proceed_binds_recommended_then_catches_drift():
+    # End to end: the agent offers a recommended fork, the user says "proceed",
+    # and a later action on a NON-recommended option is caught as drift — the
+    # "proceed" commitment is a real, enforced binding, not a vague nod.
+    ctx = Context(tenant="acme", project="game")
+    tracker = IntentTracker(store=InMemoryForkStore())
+    tracker.observe_agent_message(ctx, _AGENT_LETTER, session="s1")
+
+    binding = tracker.observe_user_message(ctx, "proceed", session="s1")
+    assert binding is not None and binding.resolved and binding.label == "c"
+    assert tracker.active_binding(ctx, session="s1").label == "c"
+
+    assert tracker.check_action(ctx, "a", session="s1").status == DRIFT_DRIFT
+    assert tracker.check_action(ctx, "c", session="s1").status == DRIFT_ALIGNED
+
+
+def test_committed_fork_returns_the_binding_and_its_fork():
+    # committed_fork pairs the live binding with the fork it resolved so the
+    # intake readout can render the proposal + every option, not a bare p1.f1.c.
+    ctx = Context(tenant="acme", project="game")
+    tracker = IntentTracker(store=InMemoryForkStore())
+    tracker.observe_agent_message(ctx, _AGENT_LETTER, session="s1")
+    tracker.observe_user_message(ctx, "proceed", session="s1")
+
+    b, fork = tracker.committed_fork(ctx, session="s1")
+    assert b is not None and b.label == "c"
+    assert fork is not None and fork.labels() == ["a", "b", "c"]
+    assert fork.recommended_option().label == "c"
+
+
+def test_committed_fork_is_none_without_a_commitment():
+    ctx = Context(tenant="acme", project="game")
+    tracker = IntentTracker(store=InMemoryForkStore())
+    b, fork = tracker.committed_fork(ctx, session="s1")
+    assert b is None and fork is None
 
 
 def test_ambiguous_reply_does_not_become_an_active_binding():
@@ -340,6 +476,31 @@ def test_fork_gets_node_id_and_binding_gets_choice_id():
     assert fork.choice_id("a") == "p1.f1.a"
     assert binding.resolved and binding.choice_id == "p1.f1.a"
     assert tracker.active_binding(ctx).choice_id == "p1.f1.a"
+
+
+def test_superseded_fork_drops_its_binding_from_the_live_commitment():
+    """A binding is the live commitment only while its fork is live. Retiring the
+    fork (superseded — the explicit "this decision is off the table now") must drop
+    its pick from active_binding; otherwise a stale resolved fork keeps surfacing its
+    choice as a "standing commitment" every turn forever. A merely MISSING fork row
+    is not retirement (saddle never deletes forks), so that binding is kept."""
+    tracker, ctx, fork, binding = _bound_letter_fork()
+    assert tracker.active_binding(ctx).choice_id == "p1.f1.a"   # live while the fork lives
+
+    tracker._store.set_fork_status(ctx, fork.id, FORK_SUPERSEDED)
+    assert tracker.active_binding(ctx) is None                  # retired -> no live commitment
+    assert tracker.committed_fork(ctx) == (None, None)          # so the readout goes quiet
+
+
+def test_superseded_fork_drops_its_binding_through_sqlite(tmp_path):
+    # The same guarantee at the SQL seam: latest_binding's LEFT JOIN must filter on
+    # the fork's status, not merely pick the most-recent resolved binding.
+    store = SqliteForkStore(tmp_path / "saddle.db")
+    tracker, ctx, fork, _ = _bound_letter_fork(store=store)
+    assert tracker.active_binding(ctx).choice_id == "p1.f1.a"
+    store.set_fork_status(ctx, fork.id, FORK_SUPERSEDED)
+    assert tracker.active_binding(ctx) is None
+    store.close()
 
 
 def test_cited_choice_aligns_with_committed_fork_choice():

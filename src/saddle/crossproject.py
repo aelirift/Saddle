@@ -1,30 +1,41 @@
 """Cross-project authorization grants for the doctrine scope-fence.
 
-The doctrine ``stay-in-project-focus`` rule blocks any edit / write / delete
-whose target lives outside the focus project, unless the action carries
-``cross_project_task=true`` evidence. That evidence is reachable from the
-``saddle guard`` CLI, but NOT from a tool call:
-:func:`saddle.doctrine.actions_from_tool` builds the Action with no evidence,
-so an agent operating through Edit / Write / Bash has no channel to present a
-legitimate cross-project authorization. The fence's own message says the work
-is allowed when the task is "explicitly cross-project" -- but nothing lets the
-tool path *say so*. This module is that missing channel.
+The doctrine scope-fence governs any edit / write / delete whose target lives
+outside the focus project. The two halves differ by blast radius: a
+cross-project DELETE (``no-cross-project-delete``) is a HARD BLOCK, while a
+cross-project EDIT / WRITE (``stay-in-project-focus``) is a loud WARN -- allowed,
+but surfaced, never silent. Either way the inline override is the same
+``cross_project_task=true`` evidence, reachable from the ``saddle guard`` CLI but
+NOT from a tool call: :func:`saddle.doctrine.actions_from_tool` builds the Action
+with no evidence, so an agent operating through Edit / Write / Bash has no channel
+to present a legitimate cross-project authorization inline. This module is that
+missing channel.
 
-A *grant* is an explicit, persistent, auditable record that the user authorized
-work spanning a named set of project roots. The doctrine hook consults grants
-ONLY when the scope-fence would otherwise block: if the focus root and the
-blocked target both fall under granted roots for the active tenant, the
-cross-project move is authorized and allowed -- with a NOTICE on stderr, never
-silently. A target under no granted root still blocks, so the fence keeps
-protecting against wandering into an unrelated repo. Other rules
-(``no-unwired-delete``, ``disposition-coherent``) are not scope concerns and
-are never overridden here.
+A *grant* is an explicit, persistent, auditable record that THE USER authorized
+work spanning a named set of project roots -- and only a USER-issued grant
+(``source`` in :data:`USER_GRANT_SOURCES`) carries authorization weight, so the
+constrained in-session agent cannot self-issue one to wave its own work through.
+The doctrine hook consults grants ONLY for the scope-fence rules
+(:data:`saddle.doctrine.SCOPE_FENCE_RULE_IDS`), and the effect tracks the rule's
+severity:
+
+  * a cross-project DELETE a grant covers is UNBLOCKED (allowed) -- a genuine
+    capability override, which is exactly why the user-issued-only restriction
+    matters most here;
+  * a cross-project EDIT a grant covers is DEMOTED from a loud alert to a NOTICE
+    (the edit was allowed regardless; the grant only quiets a sanctioned pair).
+
+A target under no user-granted root keeps the fence's default -- a delete stays
+blocked, an edit stays a loud alert -- so wandering into an unrelated repo is
+never quiet. Non-scope rules (``no-unwired-delete``, ``disposition-coherent``)
+are code-safety invariants and are NEVER overridden by a grant.
 
 Grants live in ``<saddle-data-dir>/cross_project.json`` (the dir that holds the
 saddle DB), so they share the install's isolation. Each grant carries its
-authorized roots, the tenant it applies to, a reason, and a timestamp -- a
-reviewer sees exactly what was authorized, for whom, and why. Grants are
-additive and revocable; they never loosen any rule other than the focus fence.
+authorized roots, the tenant it applies to, a reason, a source, and a timestamp
+-- a reviewer sees exactly what was authorized, for whom, by whom, and why.
+Grants are additive and revocable; they never loosen any rule other than the
+focus fence.
 """
 
 from __future__ import annotations
@@ -124,9 +135,37 @@ def _tenant_matches(g: Grant, tenant: str) -> bool:
     return g.tenant in ("", "*") or g.tenant == tenant
 
 
-def authorized_roots(tenant: str) -> list[str]:
+# Sources that represent a USER act — a human ran ``saddle crossproject grant``
+# (``cli``) or the install established the working set (``bootstrap``). The
+# AUTHORIZATION decision (:func:`is_authorized`, which both unblocks a
+# cross-project delete and demotes a cross-project-edit alert to a notice) honors
+# ONLY these. This closes the self-authorization hole the doctrine gate's own
+# review named: a grant carries WEIGHT precisely because the user issued it, so
+# the constrained in-session agent must never be able to self-issue one that
+# quiets its own wander or unblocks its own delete. An agent that records a grant
+# programmatically MUST stamp a non-user ``source`` (e.g. ``"agent"``); such a
+# grant is inert for authorization.
+#
+# CAVEAT (surfaced, not papered over): ``source`` is self-attested — it is not
+# tamper-proof against an adversary that forges ``source="cli"``. A hard
+# mechanism (a user-confirmation channel outside the agent's reach) is the
+# long-term fix; until then this enforces the honest path and the agent's
+# standing rule never to self-issue.
+USER_GRANT_SOURCES: frozenset[str] = frozenset({"cli", "bootstrap"})
+
+
+def _is_user_issued(g: Grant) -> bool:
+    return g.source in USER_GRANT_SOURCES
+
+
+def authorized_roots(tenant: str, *, user_only: bool = False) -> list[str]:
+    """Granted roots visible to ``tenant``. With ``user_only`` (the setting the
+    authorization decision uses) only USER-issued grants count, so an
+    agent-issued grant cannot authorize a cross-project move."""
     roots: list[str] = []
     for g in load_grants():
+        if user_only and not _is_user_issued(g):
+            continue
         if _tenant_matches(g, tenant):
             roots.extend(g.roots)
     return roots
@@ -146,9 +185,10 @@ def _under(root: str, target: str) -> bool:
 
 def is_authorized(target: str, focus: str, *, tenant: str) -> bool:
     """A cross-project target is authorized iff BOTH the focus root and the
-    target fall under granted roots for ``tenant`` -- i.e. the move is between
-    explicitly-authorized projects, not a wander into an ungranted one."""
-    roots = authorized_roots(tenant)
+    target fall under USER-granted roots for ``tenant`` -- i.e. the move is
+    between explicitly user-authorized projects, not a wander into an ungranted
+    one (and not a move the agent self-authorized: see ``user_only``)."""
+    roots = authorized_roots(tenant, user_only=True)
     if not roots:
         return False
     focus_ok = any(_under(r, focus) for r in roots)

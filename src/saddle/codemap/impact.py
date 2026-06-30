@@ -32,7 +32,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from . import refs
+from . import passdown, refs
 from .finding import Finding
 from .pyref import Ref
 from .specs import (
@@ -78,6 +78,11 @@ class ValueImpact:
     # Callee names that receive the resolved value as a call argument — their raw
     # reads are covered one hop out (see pyref.resolved_arg_callees).
     arg_covered_funcs: set[str] = field(default_factory=set)
+    # Resolver-WRAPPER names blessed on an UNVERIFIABLE return (a cast-laundered base, an
+    # empty-literal fallback, a missed-resolved value). Their callers are NOT flagged, so
+    # this is the enumerated fail-OPEN residual surface — a value-drift audit eyeballs each
+    # to confirm the unverifiable return is a legit null-guard, not a buggy raw base.
+    fail_open_wrappers: set[str] = field(default_factory=set)
 
     @property
     def _covering(self) -> set[tuple[str, str | None]]:
@@ -475,6 +480,46 @@ def impact_value(mods: list, spec: ValueSpec) -> ValueImpact:
         imp.all_reads.extend(refs.field_reads(m, spec.field))
         imp.all_writes.extend(refs.field_writes(m, spec.field))
         imp.arg_covered_funcs |= refs.resolved_arg_callees(m, resolver_set)
+    # Resolver-WRAPPERS: a project function that RETURNS a resolved value and never a
+    # base value the scan can syntactically see (R-returning, NOT B-returning — the
+    # return-polarity fixpoint in passdown). A call to one is the structural twin of a
+    # direct resolver call (`def = wrapper(id); use def.field` mirrors the resolver-local
+    # `def = resolve_def(id); use def.field` already covered), so its call-sites join
+    # resolver_sites and feed the SAME flow-insensitive, NOT-base-vetoed `_covering`
+    # mechanism — extending that one documented flow-insensitivity to wrappers, adding NO
+    # new false-negative class. The lone residual is a wrapper that ALSO returns a
+    # cast-laundered base the structural B-veto cannot see (the return-axis twin of the
+    # laundered-base param residual): fail-OPEN, recorded as a known FN class, never
+    # licensed by any runtime assumption. See passdown._run_fixpoint.
+    wrappers = passdown.resolver_wrapper_funcs(mods, resolver_set, spec.base_sources)
+    if wrappers:
+        for m in mods:
+            for w in wrappers:
+                imp.resolver_sites.extend(refs.calls_to(m, w))
+    # Enumerate the fail-OPEN residual rather than leaving it as prose: a blessed wrapper
+    # that also returns a value the scan cannot confirm is resolved (the cast-laundered
+    # base). Carried on the report so a value-drift audit NAMES each wrapper whose bless
+    # rests on faith — the doctrine "keep strict + surface the gap", not "guess and clear".
+    imp.fail_open_wrappers = passdown.laundered_base_wrapper_funcs(
+        mods, resolver_set, spec.base_sources
+    )
+    # Lift one-hop coverage to the whole project: a function whose parameter the
+    # resolved value provably reaches across module/call-frame boundaries has its raw
+    # reads covered. This is what stops "resolve once at entry, thread the resolved
+    # value down" architectures from reading as a field of false positives that bury
+    # real gaps.
+    imp.arg_covered_funcs |= passdown.resolved_passdown_funcs(
+        mods, resolver_set, spec.base_sources
+    )
+    # Then apply the base-veto over the WHOLE covered set — not just the pass-down
+    # portion. The per-module one-hop scan above is base-blind, so a MIXED applier
+    # (reached by a resolved value on one path AND a raw base on another) would be
+    # re-cleared by that union and slip the genuine "un-resolved value passed in" gap.
+    # Subtracting every base-reachable function makes the veto authoritative; it can
+    # only ADD findings, never hide one, so the false-positive cut stays SOUND.
+    imp.arg_covered_funcs -= passdown.base_reachable_funcs(
+        mods, resolver_set, spec.base_sources
+    )
     return imp
 
 
@@ -572,6 +617,58 @@ def _effective_writes(m, fn: str, callees: dict[str, set[str]],
     return out
 
 
+# The engine authority predicates a project guard ultimately reduces to. A mutator
+# that checks authority by calling one of these — directly (``multiplayer.is_server()``),
+# or through a project wrapper that returns ``ms.call("is_server")`` — IS gated. These
+# are PLATFORM tokens, the same class as ``@rpc`` and the ``.call("…")`` dispatch the
+# impact already encodes (the spec's own docstring names ``is_server`` /
+# ``is_multiplayer_authority`` as the canonical guards) — not game vocabulary, so
+# naming them hardcodes no genre. ``calls_to`` matches all three call forms, so a
+# wrapper that dispatches the idiom dynamically is seen like a direct caller.
+_AUTHORITY_IDIOMS = frozenset({
+    "is_server", "is_multiplayer_authority", "get_multiplayer_authority",
+    "is_server_authority",
+})
+
+
+def _guard_funcs(m, guards: set[str], rep_fields: set[str],
+                 callees: dict[str, set[str]]) -> set[str]:
+    """The functions in ``m`` that are authority-GATED — each mutator whose body
+    establishes an authority check. The check vocabulary is DERIVED, not hand-listed:
+    it starts from the spec's ``guard`` tokens plus the engine authority idioms
+    (:data:`_AUTHORITY_IDIOMS`), then grows to include project guard-WRAPPERS — a
+    predicate-shaped function that itself calls a known check (rayxiv4's
+    ``_is_authority`` → ``ms.call("is_server")``). Without this, an incomplete
+    hand-listed guard set misreads a wrapper-gated mutator as ungated and raises a
+    false shape-#1 gap (the ``weekly_vault.claim_choice`` → ``_is_authority`` false
+    positive that motivated this).
+
+    A wrapper qualifies ONLY if it writes no replicated field, even through its public
+    delegates: a genuine MUTATOR that merely calls a guard must never be promoted to a
+    guard, which would mask a real gap. The bias is conservative — an ambiguous
+    function that writes replicated state is left a mutator (a possible false positive,
+    never a missed gap)."""
+    tokens = set(guards) | _AUTHORITY_IDIOMS
+    # Grow the check vocabulary by predicate-shaped wrappers, to a fixpoint, so a chain
+    # of wrappers (_is_owner -> _is_authority -> idiom) is followed end to end.
+    while True:
+        added = set()
+        for tok in tokens:
+            for r in refs.calls_to(m, tok):
+                fn = r.func
+                if not fn or fn in tokens:
+                    continue
+                if any(w.name in rep_fields
+                       for w in _effective_writes(m, fn, callees, follow_public=True)):
+                    continue  # writes replicated state -> a mutator, never a guard
+                added.add(fn)
+        if not added:
+            break
+        tokens |= added
+    # A mutator is gated iff it calls any recognised check token (guard / idiom / wrapper).
+    return {r.func for tok in tokens for r in refs.calls_to(m, tok) if r.func}
+
+
 def impact_congruence(mods: list, spec: CongruenceSpec) -> CongruenceImpact:
     """Derive the whole mirror-congruence fan-out from the parsed project — no
     hand-listed mutators. For every module defining ``mirror_apply`` (a mirror
@@ -612,7 +709,7 @@ def impact_congruence(mods: list, spec: CongruenceSpec) -> CongruenceImpact:
         rep_fields = {w.name for w in _effective_writes(m, spec.mirror_apply, callees)}
         if not rep_fields:
             continue
-        guard_funcs = {r.func for g in guards for r in refs.calls_to(m, g) if r.func}
+        guard_funcs = _guard_funcs(m, guards, rep_fields, callees)
         for fn in refs.function_names(m):
             if fn == spec.mirror_apply or fn in exempt or fn.startswith("_"):
                 continue

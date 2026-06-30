@@ -16,11 +16,15 @@ no parallel implementation:
   todos                   the running open backlog for this (tenant, project)
   kb_search/list  DKB     the Design Knowledge Base (lessons, principles)
   lesson          DKB     record a durable lesson/principle by hand
+  recall          DKB     recall known facts/lessons before reading files or web
+  remember        DKB     cache a fact/lookup so it isn't re-derived next session
+  kb_gc           DKB     bound the memory: evict expired/over-cap cache entries
   codemap_symbols Layer 3 the grounding symbol menu a design must bind to
   guard           Layer 0 the deterministic pre-action doctrine gate
   commitment      dialog  the live fork-choice the user last locked
   observe_agent/user      feed the agent<->user loop to the drift tracker
   check_action    dialog  verdict an action against the commitment (never silent)
+  bubble_recent   outbox  saddle's durable outbound voice (what it bubbled to a human)
   discuss                 saddle's own LLM voice — ask saddle to weigh in / audit
   whoami                  saddle introduces itself: who it speaks for, what it holds
 
@@ -217,6 +221,102 @@ def lesson(
     return f"recorded {kn.kind} [{kn.scope}] {kn.id}: {ttl}"
 
 
+@mcp.tool(name="recall")
+def recall(query: str, k: int = 5, kinds: str = "") -> str:
+    """Recall what saddle already KNOWS about this project relevant to ``query``,
+    before you go read files or search the web.
+
+    This is saddle's long-term memory: durable facts (identity, stable
+    invariants), hard-won lessons, and cached file/web lookups, retrieved by
+    hybrid search (semantic + keyword). Bounded to the top ``k`` matches so it
+    never floods your context. ``kinds`` optionally restricts the search to a
+    comma-separated set (e.g. ``fact,reference`` for plain knowledge, excluding
+    design wisdom). Returns the entries' bodies — treat them as established, and
+    only fall back to reading/searching when recall comes up empty.
+    """
+    from saddle.recall import format_recall
+    from saddle.recall import recall as _recall
+
+    ctx = _ctx()
+    q = (query or "").strip()
+    if not q:
+        return "recall: empty query"
+    kind_list = [k2.strip() for k2 in (kinds or "").split(",") if k2.strip()] or None
+    entries = _recall(ctx, q, k=k, kinds=kind_list)
+    if not entries:
+        return f"recall: nothing known for {q!r} in {ctx.key} (read/search, then remember it)"
+    return format_recall(entries)
+
+
+@mcp.tool(name="remember")
+def remember(
+    text: str,
+    kind: str = "fact",
+    scope: str = "project",
+    title: str | None = None,
+    tags: str = "",
+    source: str = "",
+    ttl: float = 0.0,
+) -> str:
+    """Remember something so saddle (and you, next session) need not re-derive it.
+
+    Use this to cache what you just learned the expensive way — a fact you
+    confirmed by reading code, a lookup you did on the web — so future turns
+    recall it instead of repeating the work. ``kind``: ``fact`` (durable, the
+    default — identity, a stable project invariant) or ``reference`` (a
+    reconstructible cache of a file/web lookup; the store keeps the cache tier
+    bounded and evictable). ``source`` records where a cached value came from (a
+    path/URL) so it can be re-derived; ``ttl`` (seconds) expires a stale cache
+    entry. ``scope`` is global / tenant / project (default project).
+    """
+    import time
+
+    from saddle.dkb import get_dkb
+    from saddle.models import MANUAL, Knowledge
+
+    ctx = _ctx()
+    body = (text or "").strip()
+    if not body:
+        return "remember: empty text"
+    ttl_title = (title or body).strip()
+    if len(ttl_title) > 80:
+        ttl_title = ttl_title[:79].rstrip() + "…"
+    tag_list = [t.strip() for t in (tags or "").split(",") if t.strip()]
+    if scope == "global":
+        scope_tenant, scope_project = "", ""
+    elif scope == "tenant":
+        scope_tenant, scope_project = ctx.tenant, ""
+    else:
+        scope_tenant, scope_project = ctx.tenant, ctx.project
+    now = time.time()
+    expires_at = now + ttl if ttl and ttl > 0 else 0.0
+    provenance = {"source": source, "fetched_at": now} if source else {}
+    kn = Knowledge(
+        kind=kind, title=ttl_title, body=body, tags=tag_list,
+        scope_tenant=scope_tenant, scope_project=scope_project, source=MANUAL,
+        expires_at=expires_at, provenance=provenance,
+    )
+    get_dkb().add_knowledge(kn)
+    tier = "cache" if kn.is_cache else "durable"
+    return f"remembered {kn.kind} [{kn.scope}] ({tier}) {kn.id}: {ttl_title}"
+
+
+@mcp.tool(name="kb_gc")
+def kb_gc(max_cache: int = 0) -> str:
+    """Run the memory cleanup: purge expired cache entries and evict the coldest
+    of any scope over its cache cap, so saddle's store stays bounded. The durable
+    tier (facts, lessons, principles) is never touched. ``max_cache`` overrides
+    the per-scope cap for this run (0 = use the configured default)."""
+    from saddle.dkb import get_dkb
+
+    cap = max_cache if max_cache and max_cache > 0 else None
+    r = get_dkb().cleanup(max_cache_per_scope=cap)
+    return (
+        f"kb gc: {r['expired']} expired + {r['evicted']} over-cap evicted "
+        f"across {r['scopes']} scope(s)"
+    )
+
+
 # -- Layer 3: the grounding symbol menu --------------------------------------
 
 @mcp.tool(name="codemap_symbols")
@@ -351,6 +451,45 @@ def check_action(action_label: str = "", choice_id: str = "") -> str:
     if getattr(v, "announce", False):
         head = f"⚠ MUST SURFACE\n{head}"
     return head
+
+
+# -- the bubble outbox: saddle's outbound voice (read) -----------------------
+
+@mcp.tool(name="bubble_recent")
+def bubble_recent(
+    session: str = "",
+    level: str = "",
+    since_seconds: float = 0.0,
+    limit: int = 50,
+) -> str:
+    """Read saddle's recent outbound voice for this (tenant, project) — the bubbles
+    the hooks (and the staged supervisory runner) emit so a human SEES what saddle
+    said even when a hook's stderr is swallowed under an SDK / service host.
+
+    This is the durable, client-agnostic outbox: the SAME events the launcher panel
+    and the ``saddle bubble`` CLI render, through one shared render contract, so no
+    client drifts in how saddle's voice is shown. Filter to one ``session``, one
+    ``level`` (info / notice / alert — ``alert`` means saddle needs a correction or
+    a decision), and/or the last ``since_seconds``. Returns the rendered block
+    oldest-first (latest at the bottom, panel-style).
+    """
+    import time
+
+    from saddle.bubble import recent_bubbles, render_bubbles
+
+    ctx = _ctx()
+    since_ts = (time.time() - since_seconds) if since_seconds and since_seconds > 0 else None
+    events = recent_bubbles(
+        ctx,
+        session=session or None,
+        since_ts=since_ts,
+        level=level or None,
+        limit=limit,
+    )
+    if not events:
+        where = f" for session {session}" if session else ""
+        return f"no bubbles{where} in {ctx.key}"
+    return render_bubbles(events)
 
 
 # -- saddle's own LLM voice --------------------------------------------------

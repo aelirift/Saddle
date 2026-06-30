@@ -9,10 +9,15 @@ A small subcommand dispatcher over saddle's surfaces:
     saddle todos                    # show the open todo backlog
     saddle directives               # list this project's standing rules
     saddle directives --add "<r>"   # promote a standing rule (--scope global/tenant/project)
-    saddle lesson "<text>"          # record a DKB entry by hand
+    saddle directives --remove "<r>"# curate out a standing rule (--scope ...)
+    saddle lesson "<text>"          # record a DKB design-wisdom entry by hand
+    saddle remember "<text>"        # remember a project FACT (durable memory)
+    saddle remember "<text>" --kind reference --source <path|url> --ttl 86400
+                                    # cache a file/web lookup (bounded, evictable)
     saddle kb                       # list visible DKB entries
-    saddle kb --search "<query>"    # hybrid-search the DKB
+    saddle kb --search "<query>"    # hybrid-search the DKB (semantic ∪ keyword)
     saddle kb --seed                # load the global seed corpus (idempotent)
+    saddle kb --gc                  # evict expired/over-cap cache entries
     saddle codemap <design_id>      # Layer 3: gate a design's surface against code
     saddle codemap --symbols        # dump the project's grounding symbol menu
     saddle converge <design_id>     # Layer 4: drive the coder to satisfy the design's surface
@@ -22,6 +27,9 @@ A small subcommand dispatcher over saddle's surfaces:
     saddle cross-project list              # list cross-project authorization grants
     saddle cross-project grant <root>...   # authorize work spanning these project roots
     saddle cross-project revoke            # revoke all cross-project grants
+    saddle bubble                          # read saddle's outbound voice (the bubble outbox)
+    saddle bubble --level alert            # only the messages that need a decision
+    saddle bubble --session <id> --json    # one session's bubbles, machine-readable
 
 Addressing: every non-chat command takes ``--tenant`` / ``--project`` to
 address a specific tenant+project; omitted, they resolve from the environment
@@ -39,8 +47,12 @@ import sys
 
 from saddle.context import Context, resolve
 
-_KB_KINDS = ["best_practice", "anti_pattern", "lesson", "principle"]
+_KB_KINDS = ["best_practice", "anti_pattern", "lesson", "principle", "fact", "reference"]
+# Kinds the `remember` command writes — the MEMORY family (a durable fact or a
+# reconstructible cache entry), as opposed to `lesson`'s design-wisdom kinds.
+_MEMORY_KINDS = ["fact", "reference"]
 _SCOPES = ["global", "tenant", "project"]
+_BUBBLE_LEVELS = ["info", "notice", "alert"]
 
 
 # -- progress narration ------------------------------------------------------
@@ -196,6 +208,15 @@ def _run_directives(args: argparse.Namespace) -> int:
         verb = "added" if added else "already present"
         print(f"{verb} [{args.scope}]: {text}")
         return 0
+    if args.remove is not None:
+        text = _read_text(args.remove)
+        if not text:
+            print("directives --remove: empty text", file=sys.stderr)
+            return 2
+        removed = policy.demote_directive(ctx, text, scope=args.scope)
+        verb = "removed" if removed else "not found"
+        print(f"{verb} [{args.scope}]: {text}")
+        return 0
     rules = policy.directives(ctx)
     if not rules:
         print(f"no standing directives for {ctx.key}")
@@ -231,7 +252,46 @@ def _run_lesson(args: argparse.Namespace) -> int:
     return 0
 
 
-# -- DKB: list / search / seed -----------------------------------------------
+# -- DKB: remember a project fact / cache a lookup ---------------------------
+
+def _run_remember(args: argparse.Namespace) -> int:
+    """Write a MEMORY entry: a durable ``fact`` (the default — identity, a stable
+    invariant) or a ``reference`` cache of a file/web lookup. A reference is
+    forced non-durable by the DKB, so ``--ttl`` (expiry) and ``--source``
+    (provenance for re-derivation) only make sense there, but are accepted on
+    either kind. This is the write face of the same memory ``recall`` reads."""
+    import time
+
+    from saddle.dkb import get_dkb
+    from saddle.models import MANUAL, Knowledge
+
+    ctx = resolve(args.tenant, args.project)
+    body = _read_text(args.text)
+    if not body:
+        print("remember: empty text (pass text or pipe via stdin)", file=sys.stderr)
+        return 2
+    title = (args.title or body).strip()
+    if len(title) > 80:
+        title = title[:79].rstrip() + "…"
+    tags = [t.strip() for t in (args.tags or "").split(",") if t.strip()]
+    scope_tenant, scope_project = _scope_pair(ctx, args.scope)
+    now = time.time()
+    expires_at = now + args.ttl if args.ttl and args.ttl > 0 else 0.0
+    provenance: dict = {}
+    if args.source:
+        provenance = {"source": args.source, "fetched_at": now}
+    kn = Knowledge(
+        kind=args.kind, title=title, body=body, tags=tags,
+        scope_tenant=scope_tenant, scope_project=scope_project, source=MANUAL,
+        expires_at=expires_at, provenance=provenance,
+    )
+    get_dkb().add_knowledge(kn)
+    tier = "cache" if kn.is_cache else "durable"
+    print(f"remembered {kn.kind} [{kn.scope}] ({tier}) {kn.id}: {title}")
+    return 0
+
+
+# -- DKB: list / search / seed / gc ------------------------------------------
 
 def _run_kb(args: argparse.Namespace) -> int:
     from saddle.dkb import get_dkb
@@ -243,6 +303,14 @@ def _run_kb(args: argparse.Namespace) -> int:
         print(
             f"seed: {r['total']} entries — {r['added']} added, "
             f"{r['skipped']} already present"
+        )
+        return 0
+    if args.gc:
+        cap = args.max_cache if args.max_cache and args.max_cache > 0 else None
+        r = get_dkb().cleanup(max_cache_per_scope=cap)
+        print(
+            f"kb gc: {r['expired']} expired + {r['evicted']} over-cap evicted "
+            f"across {r['scopes']} scope(s)"
         )
         return 0
     if args.search is not None:
@@ -547,6 +615,59 @@ def _run_crossproject(args: argparse.Namespace) -> int:
     return 2  # unreachable — argparse constrains the choices
 
 
+# -- bubble outbox (saddle's client-agnostic outbound voice) -----------------
+
+def _parse_since(raw: str | None) -> float | None:
+    """Interpret ``--since`` as a relative age (``90s`` / ``30m`` / ``2h`` /
+    ``1d``) or a raw epoch-seconds value, returning the absolute ``since_ts``
+    floor recent-bubble queries compare against. Unparseable -> ``None`` (no
+    floor) so a typo widens the window rather than hiding saddle's voice."""
+    if not raw:
+        return None
+    import time
+
+    s = raw.strip().lower()
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if s and s[-1] in units:
+        try:
+            return time.time() - float(s[:-1]) * units[s[-1]]
+        except ValueError:
+            return None
+    try:
+        return float(s)  # raw epoch seconds
+    except ValueError:
+        return None
+
+
+def _run_bubble(args: argparse.Namespace) -> int:
+    """Read saddle's outbound voice — the bubbles the hooks (and, soon, the
+    staged supervisory runner) emit so an AFK / non-TTY human SEES what saddle
+    said when stderr is swallowed under an SDK host. This is the CLI face of the
+    same client-agnostic outbox the launcher panel and the MCP ``bubble_recent``
+    tool read; all three go through one render contract (:func:`render_bubbles`)
+    so they never drift in presentation. For a LIVE feed, ``tail -f`` the JSONL
+    mirror; this is the point-in-time read."""
+    from saddle.bubble import event_to_dict, recent_bubbles, render_bubbles
+
+    ctx = resolve(args.tenant, args.project)
+    events = recent_bubbles(
+        ctx,
+        session=args.session or None,
+        since_ts=_parse_since(args.since),
+        level=args.level,
+        limit=args.limit,
+    )
+    if args.json:
+        print(json.dumps([event_to_dict(e) for e in events], indent=2))
+        return 0
+    if not events:
+        where = f" for session {args.session}" if args.session else ""
+        print(f"no bubbles{where} in [{ctx.key}]")
+        return 0
+    print(render_bubbles(events))
+    return 0
+
+
 # -- parser ------------------------------------------------------------------
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -594,8 +715,10 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_ctx_flags(p_dir)
     p_dir.add_argument("--add", nargs="?", const="-", default=None,
                        metavar="TEXT", help="promote a directive (text or '-'/omit for stdin)")
+    p_dir.add_argument("--remove", nargs="?", const="-", default=None,
+                       metavar="TEXT", help="curate out a directive (text or '-'/omit for stdin)")
     p_dir.add_argument("--scope", choices=_SCOPES, default="project",
-                       help="scope to promote at (default project)")
+                       help="scope to promote / remove at (default project)")
 
     p_les = sub.add_parser("lesson", help="record a DKB entry by hand", parents=[g])
     p_les.add_argument("text", nargs="?", help="lesson text; omit or '-' to read stdin")
@@ -607,12 +730,31 @@ def _build_parser() -> argparse.ArgumentParser:
     p_les.add_argument("--scope", choices=_SCOPES, default="project",
                        help="visibility scope (default project)")
 
-    p_kb = sub.add_parser("kb", help="Design Knowledge Base: list / search / seed",
+    p_rem = sub.add_parser("remember", help="remember a project fact / cache a lookup",
+                           parents=[g])
+    p_rem.add_argument("text", nargs="?", help="fact text; omit or '-' to read stdin")
+    _add_ctx_flags(p_rem)
+    p_rem.add_argument("--kind", choices=_MEMORY_KINDS, default="fact",
+                       help="fact (durable) or reference (evictable cache); default fact")
+    p_rem.add_argument("--title", default=None, help="title (defaults to the text)")
+    p_rem.add_argument("--tags", default="", help="comma-separated tags")
+    p_rem.add_argument("--scope", choices=_SCOPES, default="project",
+                       help="visibility scope (default project)")
+    p_rem.add_argument("--source", default="", metavar="PATH|URL",
+                       help="provenance for a cached lookup (recorded for re-derivation)")
+    p_rem.add_argument("--ttl", type=float, default=0.0, metavar="SECONDS",
+                       help="expire a cache entry after this many seconds (0 = never)")
+
+    p_kb = sub.add_parser("kb", help="Design Knowledge Base: list / search / seed / gc",
                           parents=[g])
     _add_ctx_flags(p_kb)
     p_kb.add_argument("--search", nargs="?", const="-", default=None,
                       metavar="QUERY", help="hybrid-search the DKB (text or '-'/omit for stdin)")
     p_kb.add_argument("--seed", action="store_true", help="load the global seed corpus")
+    p_kb.add_argument("--gc", action="store_true",
+                      help="evict expired + over-cap cache entries (bounded-storage cleanup)")
+    p_kb.add_argument("--max-cache", type=int, default=0, dest="max_cache",
+                      help="override the per-scope cache cap for this gc run (0 = use default)")
     p_kb.add_argument("--kind", choices=_KB_KINDS, default=None, help="filter list by kind")
     p_kb.add_argument("-k", type=int, default=8, dest="k", help="search hits to return")
     p_kb.add_argument("--limit", type=int, default=50, help="max entries to list")
@@ -701,6 +843,22 @@ def _build_parser() -> argparse.ArgumentParser:
     p_xp.add_argument("--reason", default="",
                       help="why this cross-project work is authorized (recorded on the grant)")
 
+    p_bub = sub.add_parser(
+        "bubble",
+        help="read saddle's outbound voice (the client-agnostic bubble outbox)",
+        parents=[g])
+    _add_ctx_flags(p_bub)
+    p_bub.add_argument("--session", default=None,
+                       help="filter to one agent session id")
+    p_bub.add_argument("--level", choices=_BUBBLE_LEVELS, default=None,
+                       help="filter to one level (alert = needs a correction/decision)")
+    p_bub.add_argument("--since", default=None, metavar="AGE",
+                       help="only bubbles newer than AGE (90s/30m/2h/1d, or epoch seconds)")
+    p_bub.add_argument("--limit", type=int, default=50,
+                       help="max bubbles to show (default 50)")
+    p_bub.add_argument("--json", action="store_true",
+                       help="machine-readable list of bubble events")
+
     return parser
 
 
@@ -710,12 +868,14 @@ _DISPATCH = {
     "todos": _run_todos,
     "directives": _run_directives,
     "lesson": _run_lesson,
+    "remember": _run_remember,
     "kb": _run_kb,
     "codemap": _run_codemap,
     "converge": _run_converge,
     "audit": _run_audit,
     "guard": _run_guard,
     "cross-project": _run_crossproject,
+    "bubble": _run_bubble,
 }
 
 

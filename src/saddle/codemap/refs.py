@@ -58,6 +58,14 @@ def resolved_arg_callees(mod, resolvers):
     return _adapter(mod).resolved_arg_callees(mod, resolvers)
 
 
+def passdown_facts(mod, resolvers, base_sources=frozenset()):
+    """This module's facts for the interprocedural resolved-value pass-down fixpoint
+    (see :mod:`saddle.codemap.passdown`): parameter lists, resolver/base-bound
+    locals, and pre-classified call sites. The whole-project fixpoint that consumes
+    these is language-agnostic; this is the one per-language seam it needs."""
+    return _adapter(mod).passdown_facts(mod, resolvers, base_sources)
+
+
 def name_decls(mod, name):
     return _adapter(mod).name_decls(mod, name)
 

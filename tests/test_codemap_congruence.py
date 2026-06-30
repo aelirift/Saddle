@@ -589,6 +589,127 @@ func _on_decline(rid):
     assert {f.detail["func"] for f in check_congruence(mods, spec)} == {"decline_request"}
 
 
+# --- guard-WRAPPER recognition: the weekly_vault false-positive that drove this ----
+
+# RayXI's real weekly_vault gates through a project WRAPPER `_is_authority` that returns
+# `ms.call("is_server")` via the MultiplayerSetup autoload -- NOT the bare `_is_server`
+# the spec happens to name. A guard match that only saw a LITERAL `_is_server` call
+# misread the wrapper-gated `claim_vault` as UNGATED and raised a phantom shape-#1 gap
+# (the actual false positive a live conformance scan produced). The derivation now
+# recognises any predicate-shaped function that reaches an authority idiom
+# (`ms.call("is_server")`) as a guard, so the wrapper-gated mutator reads as gated.
+# `force_reset` is a genuinely UNGATED mutator beside it -- proof the wider vocabulary
+# introduces NO false negative.
+GD_WRAPPER_SERVICE = '''
+func apply_replication_snapshot(owner_key, data):
+    _state = data["state"]
+    vault_synced.emit()
+
+func _is_server() -> bool:
+    if has_node("/root/MultiplayerSetup"):
+        var ms: Node = get_node("/root/MultiplayerSetup")
+        if ms.has_method("is_server"):
+            return bool(ms.call("is_server"))
+    return true
+
+func _is_authority() -> bool:
+    if has_node("/root/MultiplayerSetup"):
+        var ms: Node = get_node("/root/MultiplayerSetup")
+        if ms.has_method("is_server"):
+            return bool(ms.call("is_server"))
+    return true
+
+func claim_vault(track, index, character):
+    if not _is_authority():
+        return {}
+    _state[character] = index
+    return _state
+
+func force_reset(character):
+    _state[character] = 0
+'''
+
+GD_WRAPPER_HUD = '''
+extends CanvasLayer
+
+func _on_claim_pressed(track, index, character):
+    if IntentRouter.send_claim_vault(track, index, character):
+        return
+    _wv.claim_vault(track, index, character)
+
+func _on_force_reset(character):
+    _wv.force_reset(character)
+'''
+
+GD_WRAPPER_ROUTER = '''
+func send_claim_vault(track, index, character):
+    if not _is_client_with_peer():
+        return false
+    _recv_claim_vault.rpc(track, index, character)
+    return true
+
+@rpc("any_peer", "call_remote", "reliable")
+func _recv_claim_vault(track, index, character):
+    var wv: Node = _service("weekly_vault")
+    wv.call("claim_vault", track, index, character)
+'''
+
+
+def _wrapper_mods():
+    return gdref.parse_modules([("weekly_vault.gd", GD_WRAPPER_SERVICE),
+                                ("weekly_vault_hud.gd", GD_WRAPPER_HUD),
+                                ("intent_router.gd", GD_WRAPPER_ROUTER)])
+
+
+def test_gd_authority_wrapper_is_recognised_as_a_guard():
+    # Only the BASE guard `_is_server` is named, but the mutator gates through the
+    # sibling wrapper `_is_authority`. Both reduce to ms.call("is_server"); the
+    # derivation recognises the wrapper, so claim_vault reads as gated -- and
+    # gated+routed -> CLEAN, not the phantom ungated gap the literal match produced.
+    spec = CongruenceSpec(name="weekly_vault",
+                          mirror_apply="apply_replication_snapshot", guard="_is_server")
+    imp = impact_congruence(_wrapper_mods(), spec)
+    claim = next(m for m in imp.mutators if m.name == "claim_vault")
+    assert claim.guarded            # recognised via the _is_authority wrapper ...
+    assert claim.rpc_routed         # ... the dynamic .call route reaches it ...
+    assert claim.raw_client_callers  # ... a raw HUD fallback call invokes it ...
+    assert not claim.is_gap         # ... so gated+routed is CLEAN (no false shape-#1)
+    assert "claim_vault" not in {f.detail["func"]
+                                 for f in check_congruence(_wrapper_mods(), spec)}
+
+
+def test_gd_wrapper_recognition_keeps_a_real_ungated_gap():
+    # The safety direction: a wider guard vocabulary must NOT suppress a genuinely
+    # ungated mutator. force_reset writes _state with NO authority check and a raw HUD
+    # caller -> it stays a shape-#1 gap. (No false negative from the derivation.)
+    spec = CongruenceSpec(name="weekly_vault",
+                          mirror_apply="apply_replication_snapshot", guard="_is_server")
+    mods = _wrapper_mods()
+    imp = impact_congruence(mods, spec)
+    force = next(m for m in imp.mutators if m.name == "force_reset")
+    assert not force.guarded
+    assert force.is_gap and force.gap_kind == "ungated"
+    assert {r.func for r in force.raw_client_callers} == {"_on_force_reset"}
+    assert {f.detail["func"] for f in check_congruence(mods, spec)} == {"force_reset"}
+
+
+def test_gd_wrapper_recognition_needs_no_hand_listed_authority_guard():
+    # The whole point of S1: the project should NOT have to hand-list `_is_authority`.
+    # Listing ONLY `_is_server` yields the SAME clean claim_vault as explicitly listing
+    # both -- the wrapper is derived, so an incomplete guard list cannot reintroduce the
+    # false positive.
+    base = CongruenceSpec(name="weekly_vault",
+                          mirror_apply="apply_replication_snapshot", guard="_is_server")
+    both = CongruenceSpec(name="weekly_vault", mirror_apply="apply_replication_snapshot",
+                          guard=("_is_server", "_is_authority"))
+    # The flagged SET is identical either way (the only ungated mutator, force_reset);
+    # claim_vault is clean in both. The findings' message text differs because it echoes
+    # the spec's guard list, so compare the gap funcs, not the rendered Finding.
+    assert ({f.detail["func"] for f in check_congruence(_wrapper_mods(), base)}
+            == {f.detail["func"] for f in check_congruence(_wrapper_mods(), both)}
+            == {"force_reset"})
+
+
 # --- cross-language parity: the same derivation on the Python adapter ----------
 
 PY_SERVICE = '''

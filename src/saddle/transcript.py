@@ -152,6 +152,47 @@ def read_transcript(
 
 
 @dataclass
+class TurnProposal:
+    """The current turn's pre-edit state, lifted from the transcript for the
+    pre-code design gate (Stage 3).
+
+    ``goal`` is the user prompt that opened the latest turn; ``approach`` is the
+    assistant prose spoken since (the design / plan the agent stated before the
+    edit that triggered the read); ``anchor`` is the user prompt's uuid — the
+    turn's identity, so the gate fires only on the FIRST code edit of a turn and
+    stays silent on the rest. An empty ``anchor`` means no user turn was found
+    (nothing to audit an approach against)."""
+
+    goal: str = ""
+    approach: str = ""
+    anchor: str = ""
+
+
+def latest_turn(path: str | Path) -> TurnProposal:
+    """Lift the latest turn's ``(goal, approach, anchor)`` from a transcript.
+
+    Walk the dialog in order; each user prompt opens a new turn (resetting the
+    collected approach), so the assistant prose after the LAST user prompt is the
+    approach the agent committed to before its edit. Only spoken ``text`` is read,
+    never ``thinking`` — the *recorded design* is what the agent actually SAID it
+    would do (the same discrimination the deterministic drift check makes), so
+    private, messy reasoning ("b is wrong, do a") can't be mistaken for a stated
+    approach. A transcript with no user turn yields an empty :class:`TurnProposal`.
+    """
+    goal = ""
+    anchor = ""
+    approach: list[str] = []
+    for ev in read_transcript(path):
+        if ev.role == "user":
+            goal = ev.text
+            anchor = ev.uuid
+            approach = []  # a new turn starts — only THIS turn's prose is the approach
+        elif ev.role == "assistant" and ev.text:
+            approach.append(ev.text)
+    return TurnProposal(goal=goal, approach="\n\n".join(approach).strip(), anchor=anchor)
+
+
+@dataclass
 class ReplayResult:
     """Outcome of feeding a transcript span into the tracker."""
 

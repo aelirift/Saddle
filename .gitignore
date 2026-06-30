@@ -40,3 +40,6 @@ config/tenants/**/keys*.json
 
 # Claude local-only settings (project-level settings.json IS tracked)
 .claude/settings.local.json
+
+# Runtime lock files
+*.lock

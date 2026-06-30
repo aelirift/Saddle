@@ -67,7 +67,7 @@ class FixtureCaller:
         if label in ("design/body", "design/revise"):
             return "## Design\nRoute cast, sweep, and the tooltip through resolve_cd."
         if label == "design/audit":
-            return json.dumps({"ok": True, "issues": []})
+            return "OK"  # the audit rides a LINE contract now (verdict + issues/line)
         if label == "design/index":
             return json.dumps({"summary": "Resolver-routed cooldown",
                                "satisfies": [], "avoids": [], "heeds": []})

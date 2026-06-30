@@ -309,6 +309,41 @@
       "title": "Common audit false positives: runtime handles, spec-file metadata, intentional markers",
       "body": "Recurring non-issues an audit raises that are not bugs: a runtime instance handle (an opaque per-instance id) flagged for not following a human-readable naming scheme, when the opaque handle is the correct runtime key; cross-system metadata (provides/reads-from wiring, a system's type) reported as missing from a code template, when that metadata legitimately lives in the spec the template is generated from, not in the template; an underscore-prefixed unused parameter called dead, when the prefix is the language's deliberate 'intentionally unused' marker; and a signal or field reuse flagged as a bug when a comment documents it as intended behavior. Verify the substrate and the convention before treating any of these as a defect.",
       "tags": ["audit", "false-positive", "runtime-handle", "spec-metadata", "convention", "lesson"]
+    },
+    {
+      "id": "knowledge_seed_supervision_is_staged",
+      "kind": "lesson",
+      "title": "Supervision is staged across the whole task, not one gate",
+      "body": "Watching an agent's work for drift from intent cannot be a single checkpoint, because divergence enters at several distinct points across a task: the request is mis- or under-understood before any work starts; the request pulls against what the project already is (its prior designs, settled decisions, stated focus); the proposed approach is a band-aid that misreads the root cause; the implementation quietly diverges from the approach that was agreed; and the lesson from this task is never captured, so the same class of drift recurs next time. A reviewer placed only at the approach-versus-vision moment is blind to the other four entry points, and a check that fires once is blind to recurrence. Stage the supervision so each entry point has its own check, make each one surface its finding loudly, and let a later stage re-catch what an earlier one — or a human correction — missed. Drift control is cumulative across stages and across repetitions, never caught-once-and-done.",
+      "tags": ["supervision", "drift", "staged", "review", "intent", "lesson"]
+    },
+    {
+      "id": "knowledge_seed_saddle_identity",
+      "kind": "fact",
+      "title": "'saddle' is this LLM harness itself",
+      "body": "saddle is the name of this system: an agentic LLM harness — a supervisory layer wrapping Claude (and a multi-provider LLM pool) and bound to one focus project. When a user says 'saddle' with no other qualifier, or refers to it in the context of LLMs, agents, or this assistant, they mean THIS harness — never any external product, protocol, or company that happens to share the name. saddle exists because a raw LLM drifts and does not learn between sessions; it is the part that remembers and enforces, deterministically. It intakes each prompt into a tracked, itemized todo list; gates every code mutation against standing doctrine before it lands (blocking cross-project deletes, unclassified removals, straying outside the focus project); maps and audits the codebase for value-drift and half-wired work; and runs a project-scoped agentic chat like Claude Code itself.",
+      "tags": ["saddle", "identity", "self", "harness", "agent", "llm", "what-is-saddle"]
+    },
+    {
+      "id": "knowledge_seed_memory_system",
+      "kind": "fact",
+      "title": "How saddle's long-term memory (the DKB) works",
+      "body": "saddle's persistent memory is the Design Knowledge Base (DKB): one semantically-searchable store holding both design wisdom (best_practice, anti_pattern, lesson, principle) and plain memory (fact = a durable curated truth like identity or a stable invariant; reference = a cached file/web lookup). Retrieval is hybrid — a keyword index (FTS5) and a semantic vector index (sqlite-vec) queried together and fused with Reciprocal Rank Fusion — so an exact term and a paraphrase both surface; semantic search does NOT subsume keyword search, which is why both run. Knowledge is retrieved on demand (top-k, length-bounded, fresh per turn — see saddle.recall), never prepended wholesale, so context cannot balloon. Two tiers by an entry's durable bit: durable knowledge is retired-never-deleted; the cache tier (references) is reconstructible and therefore bounded and evictable — coldest-and-expired rows are dropped so storage never grows without bound. Use memory instead of re-reading the same files or re-searching the web every session.",
+      "tags": ["saddle", "memory", "dkb", "recall", "cache", "semantic", "fact", "how-memory-works"]
+    },
+    {
+      "id": "knowledge_seed_bounded_storage_cleanup",
+      "kind": "principle",
+      "title": "Any data store needs a bounded cleanup process",
+      "body": "A store that only ever grows is a future failure: it bloats, slows, and eventually breaks. Every store of accumulating data must define, up front, how it stays bounded — a cap, a TTL, or an eviction policy — and that cleanup must be loud about what it removed (no silent truncation). The exception that proves the rule is reconstructible data: a cache you can rebuild from its source may be deleted to stay bounded without losing anything, which is exactly why a cache tier is the right home for evictable data while irreproducible knowledge is retired, never deleted.",
+      "tags": ["storage", "cleanup", "eviction", "cache", "retention", "bounded", "principle"]
+    },
+    {
+      "id": "knowledge_seed_memory_retrieved_not_prepended",
+      "kind": "lesson",
+      "title": "Long-term memory is retrieved, never prepended wholesale",
+      "body": "Giving a model its memory by pasting standing facts in front of every prompt does not scale: the preamble grows with every new fact, so the context balloons exactly as the memory accumulates, and most of it is irrelevant to the turn at hand. Instead retrieve: query the memory for the few entries relevant to THIS prompt (semantic plus keyword), inject only the top-k, length-bounded, and recompute fresh each turn. Then memory can grow forever while what any single turn carries stays small and on-topic. Prepend-everything is the anti-pattern; query-scoped top-k retrieval (RAG) is the fix.",
+      "tags": ["memory", "retrieval", "rag", "prepend", "context", "bounded", "lesson"]
     }
   ]
 }

@@ -35,11 +35,24 @@ class ValueSpec:
     `producers` are functions that legitimately read the base to CONSTRUCT the
     value (the def builder, the deserializer) — they are the source of `base`, not
     consumers of the effective value, so their raw reads are exempt just like a
-    resolver's own base read is."""
+    resolver's own base read is.
+
+    `base_sources` are accessors that RETURN the stored, *unresolved* base value
+    (e.g. ``get_def_by_id`` handing back the registry's base def). They are the
+    symmetric twin of `resolvers`: a resolver puts the effective value in scope, a
+    base_source puts the RAW value in scope. Naming them is optional but it powers
+    the interprocedural pass-down coverage (see ``codemap/passdown.py``): a carrier
+    a function receives can be traced to a resolver origin (→ its reads are covered,
+    the value WAS resolved upstream) OR a base_source origin (→ a real gap: the raw
+    value is being passed down un-resolved). Declaring base_sources lets the gate
+    keep the existential resolved-origin coverage SOUND — a parameter reached by a
+    resolved value on one path but a base value on another is NOT cleared — so the
+    false-positive cut never costs a false negative (saddle's cardinal sin)."""
     name: str
     field: str
     accessor: str | tuple[str, ...]
     producers: tuple[str, ...] = ()
+    base_sources: tuple[str, ...] = ()
 
     @property
     def resolvers(self) -> tuple[str, ...]:

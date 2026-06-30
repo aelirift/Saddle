@@ -29,6 +29,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import weakref
 from pathlib import Path
 
 import httpx
@@ -73,7 +74,28 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _provider_deadline_seconds() -> float:
-    return _env_float("RAYXI_LLM_PROVIDER_DEADLINE_SECONDS", 0.0)
+    """Per-provider wall-clock deadline (seconds). A single provider call that
+    runs past this raises ``asyncio.TimeoutError`` -> categorized ``timeout`` ->
+    :class:`FallbackCaller` routes to the NEXT provider. This is the lever that
+    turns a SILENT provider HANG (the local ``claude`` CLI riding out an Opus
+    rate-limit / overload with no exception, producing no tokens) into a
+    fail-over WITHIN budget, instead of wedging the whole inline-hook deadline
+    (~60s) with no alternate ever tried.
+
+    Default 20s: comfortably above the measured happy path (claude 2-4s, minimax
+    2.2s isolated / ~13s under a 3-way burst) yet well under the 60s design-hook
+    budget, leaving room for the fail-over provider's own latency. Set
+    ``RAYXI_LLM_PROVIDER_DEADLINE_SECONDS=0`` to DISABLE (await unbounded) — an
+    EXPLICIT opt-out, never the silent default that caused the converge hang.
+    Read directly (not via ``_env_float``, which coerces 0 -> default and would
+    make the opt-out unreachable)."""
+    raw = os.environ.get("RAYXI_LLM_PROVIDER_DEADLINE_SECONDS")
+    if raw is None or str(raw).strip() == "":
+        return 20.0
+    try:
+        return float(raw)
+    except ValueError:
+        return 20.0
 
 
 def _minimax_stream_idle_seconds() -> float:
@@ -112,6 +134,85 @@ def _circuit_cooldown_s() -> float:
     return _env_float("SADDLE_CIRCUIT_COOLDOWN_S", 60.0)
 
 
+# ---------------------------------------------------------------------------
+# Per-provider concurrency gate for the SUPERVISORY fail-over path
+# ---------------------------------------------------------------------------
+# The LLMPool already caps every *routed* call with a per-provider limiter sized
+# to the provider's tested ``concurrent_request_cap`` (llm_pool.py). But the
+# supervisory chain — ``build_callers()["default"]`` -> :class:`FallbackCaller`
+# — does NOT go through the pool. ``audit/run.py`` fans out ``asyncio.gather``
+# over every target, all sharing ONE FallbackCaller (verified: run.py builds the
+# caller once at line ~148 and the per-target closure captures that single
+# instance), so on fail-over N targets can hit ONE provider at once with nothing
+# capping them. That burst is what maxes the rate-limit-prone Opus CLI
+# (operator: "3 calls will max it out ... run 2 at a time").
+#
+# Cap that burst HERE, at the single chokepoint every FallbackCaller / RaceCaller
+# provider call already passes through. Sized to the SAME tested
+# ``concurrent_request_cap`` the pool uses — one shared source of truth in
+# config, not a parallel number.
+#
+# Why a plain Semaphore and NOT the pool's adaptive ``_DynamicLimiter``: the
+# limiter's AIMD feedback GROWS the cap on saturation and SHRINKS it on a 429.
+# The lead provider here (the local ``claude`` CLI) fails by SILENTLY HANGING on
+# Opus overload — it emits no 429 — so the shrink signal never fires and an
+# adaptive cap would only ever creep UP, straight into the hang zone. A fixed
+# Semaphore is exactly "run N at a time", stable regardless of provider silence.
+# (The pool keeps ``_DynamicLimiter`` because its routed traffic DOES carry 429
+# telemetry to drive the AIMD.)
+#
+# IMPORTANT — this gate is PREVENTION, not the cure. The cure for a hang is the
+# per-provider DEADLINE (below) turning it into a fail-over; the LOUD REPORT
+# (FallbackCaller failover capture) is what SURFACES that it happened. The cap
+# only lowers how often we provoke the overload; it must never become the thing
+# that "makes runs finish" by hiding a hang.
+_provider_gates: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _provider_gate(caller: LLMCaller):
+    """Per-caller, per-loop concurrency gate sized to the caller's tested
+    ``concurrent_request_cap``. Returns ``None`` when the caller declares no
+    positive cap — the gate then degrades to unbounded, the same graceful
+    fallback ``llm_pool._get_cap`` gives stub callers in tests.
+
+    Keyed by caller IDENTITY (provider instances are process-lifetime singletons)
+    AND by running loop, so the Semaphore is always bound to the loop that awaits
+    it (tests spin up fresh loops). WeakKeyDictionary so a discarded caller's gate
+    is collected with it — no leak."""
+    cap = getattr(caller, "concurrent_request_cap", None)
+    try:
+        cap = int(cap)
+    except (TypeError, ValueError):
+        return None
+    if cap <= 0:
+        return None
+    loop = asyncio.get_running_loop()
+    entry = _provider_gates.get(caller)
+    if entry is None or entry[0] is not loop:
+        sem = asyncio.Semaphore(cap)
+        _provider_gates[caller] = (loop, sem)
+        return sem
+    return entry[1]
+
+
+async def _call_under_deadline(
+    caller: LLMCaller,
+    system: str,
+    prompt: str,
+    *,
+    json_mode: bool,
+    label: str,
+) -> str:
+    """Run one provider call under the per-provider wall-clock DEADLINE — the
+    cure that turns a silent HANG into ``asyncio.TimeoutError`` -> fail-over
+    (see :func:`_provider_deadline_seconds`)."""
+    deadline = _provider_deadline_seconds()
+    coro = caller(system, prompt, json_mode=json_mode, label=label)
+    if deadline <= 0:
+        return await coro
+    return await asyncio.wait_for(coro, timeout=deadline)
+
+
 async def _call_with_provider_deadline(
     caller: LLMCaller,
     system: str,
@@ -120,11 +221,27 @@ async def _call_with_provider_deadline(
     json_mode: bool,
     label: str,
 ) -> str:
-    deadline = _provider_deadline_seconds()
-    coro = caller(system, prompt, json_mode=json_mode, label=label)
-    if deadline <= 0:
-        return await coro
-    return await asyncio.wait_for(coro, timeout=deadline)
+    """Gate a single provider call by per-provider CONCURRENCY, then run it under
+    the per-provider DEADLINE.
+
+    The gate is acquired OUTSIDE the deadline: a call that politely WAITS its turn
+    must not have that queue time counted against its own wall-clock budget (it
+    would spuriously "time out" while idle). The queue wait DOES count against the
+    outer inline-hook budget, which is the real ceiling.
+
+    The gate is per-PROVIDER-ATTEMPT, not per FallbackCaller ``__call__``: this
+    helper is invoked once per provider in the fail-over loop, so a minimax call
+    that fails over to claude releases the minimax slot (``async with`` exit)
+    BEFORE claude's slot is acquired — no cross-provider slot is double-booked."""
+    gate = _provider_gate(caller)
+    if gate is None:
+        return await _call_under_deadline(
+            caller, system, prompt, json_mode=json_mode, label=label,
+        )
+    async with gate:
+        return await _call_under_deadline(
+            caller, system, prompt, json_mode=json_mode, label=label,
+        )
 
 
 def _config_candidates() -> list[Path]:
@@ -419,19 +536,6 @@ class GlmCaller:
 # See _build_claude_agent below.
 
 
-# Artifact-name markers (matched as substrings of the call label
-# `{caller_label}:{artifact_name}:attempt{n}`) for the high-volume, schema-
-# bounded content_pack enumeration phases where MiniMax CoT adds latency, not
-# quality. MiniMax thinking is suppressed for these and kept ON elsewhere
-# (creative_design_board / design_record / doctrine / mechanic_graph / world
-# content are low-volume + reasoning-critical).
-_MINIMAX_THINKING_OFF_MARKERS: tuple[str, ...] = (
-    "redesign_class_identity",
-    "redesign_composition",
-    "redesign_naming",
-)
-
-
 class MiniMaxCaller:
     # Concurrent-request admission cap — max in-flight calls to this
     # provider AT ONCE before the IntentRouter routes new calls
@@ -553,25 +657,19 @@ class MiniMaxCaller:
             "max_tokens": self._cfg.get("max_tokens", 32768),
             "temperature": self._cfg.get("temperature", 0.7),
         }
-        # MiniMax-M3 is a reasoning model: it emits <think>…</think> before the
-        # answer (stripped downstream), and GENERATING the CoT is what made
-        # content_pack calls take 40-72s and, under sustained load, drove the
-        # immediate-reject failures that excluded minimax from the chain. But
-        # CoT is QUALITY-CRITICAL for the low-volume creative/design phases —
-        # suppressing it globally collapsed the creative_design_board (its
-        # invented_role_identity gate failed on un-reasoned candidates). So
-        # suppress thinking ONLY for the high-volume, schema-bounded content_pack
-        # enumeration (per-class / per-ability / per-name — ~200 calls/build,
-        # where CoT adds latency not quality); keep it ON everywhere else.
-        # Only `thinking: {type: disabled}` actually stops generation (other
-        # vendor flags were ignored — tested live). cfg.thinking forces a value.
+        # Thinking OFF by default (operator directive 2026-06-27). MiniMax-M3 is
+        # a reasoning model: it emits a <think>…</think> trace before the answer
+        # (stripped downstream). For saddle's use — supervisory verdicts plus the
+        # default structured path — that trace is HIDDEN from the user and only
+        # adds latency; saddle consumes the produced result, never the CoT. So
+        # disable it unless a call explicitly opts back in via
+        # `providers.minimax.thinking` (the rare phase that genuinely wants the
+        # deeper reasoning pass). Only `thinking: {type: disabled}` actually
+        # stops generation — other vendor flags were ignored (tested live).
         _thinking = self._cfg.get("thinking")
-        if _thinking is None and any(
-            m in (label or "") for m in _MINIMAX_THINKING_OFF_MARKERS
-        ):
+        if _thinking is None:
             _thinking = {"type": "disabled"}
-        if _thinking is not None:
-            body["thinking"] = _thinking
+        body["thinking"] = _thinking
         if json_mode:
             body["response_format"] = {"type": "json_object"}
         use_stream = bool(self._cfg.get("stream", False))

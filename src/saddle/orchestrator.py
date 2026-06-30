@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING
 from saddle.context import Context, default as _default_ctx
 from saddle.design import design_for, format_design
 from saddle.dkb import DKB, get_dkb
-from saddle.intake import decompose, format_intake
+from saddle.intake import classify_directive_durability, decompose, format_intake
 from saddle.llm import policy
 from saddle.llm.json_tools import call_json
 from saddle.llm.pool import tenant_gate
@@ -221,15 +221,35 @@ async def _fold(
     return goals
 
 
-def _promote_directives(ctx: Context, intake: Intake, scope: str) -> list[str]:
-    """Persist every directive-kind item as a standing rule; return the new ones."""
+async def _promote_directives(
+    ctx: Context, intake: Intake, scope: str, caller: "LLMCaller"
+) -> list[str]:
+    """Persist DURABLE directive items as standing rules; return the new ones.
+
+    Closes design_issues Gap 4: not every ``directive``-kind ask is a standing
+    rule — many are task-local instructions ("respond with only JSON", "make THIS
+    design game-agnostic") that, persisted as policy, would be enforced on every
+    future task out of context. So directive items are first classified for
+    durability (:func:`saddle.intake.classify_directive_durability`); only the
+    STANDING ones are promoted, and the task-local ones are logged (never silently
+    dropped) so the skip is visible. The classifier fails safe toward not
+    promoting, because over-promotion is the harm this gate exists to prevent."""
+    directive_items = [
+        it for it in intake.items if it.kind == DIRECTIVE and it.ask.strip()
+    ]
+    if not directive_items:
+        return []
+    verdict = await classify_directive_durability(caller, directive_items, ctx)
+    standing, task = verdict["standing"], verdict["task"]
+    if task:
+        _log.info(
+            "directive durability: %d task-local instruction(s) NOT promoted to "
+            "%s policy (would pollute future tasks): %s",
+            len(task), scope, "; ".join(it.ask[:60] for it in task),
+        )
     promoted: list[str] = []
-    for it in intake.items:
-        if it.kind != DIRECTIVE:
-            continue
+    for it in standing:
         text = it.ask.strip()
-        if not text:
-            continue
         try:
             if policy.promote_directive(ctx, text, scope=scope):
                 promoted.append(text)
@@ -237,7 +257,7 @@ def _promote_directives(ctx: Context, intake: Intake, scope: str) -> list[str]:
             _log.warning("could not promote directive %r: %s", text, exc)
     if promoted:
         _log.info(
-            "promoted %d directive(s) to %s scope for %s",
+            "promoted %d standing directive(s) to %s scope for %s",
             len(promoted), scope, ctx.key,
         )
     return promoted
@@ -276,9 +296,11 @@ async def orchestrate(
     # 1. Layer 1 — decompose (manages its own gate + persistence).
     intake = await decompose(text, ctx, caller=caller, store=store, persist=persist)
 
-    # 2. Promote directive-kind items to standing rules BEFORE designing, so the
-    #    design audit enforces them on this very run (promote busts the cache).
-    promoted = _promote_directives(ctx, intake, promote_scope)
+    # 2. Promote DURABLE directive-kind items to standing rules BEFORE designing,
+    #    so the design audit enforces them on this very run (promote busts the
+    #    cache). Task-local instructions are filtered out (Gap 4) so they never
+    #    become forever-rules.
+    promoted = await _promote_directives(ctx, intake, promote_scope, caller)
 
     # 3. Fold the actionable asks into coherent design goals (coverage enforced).
     asks = [it for it in intake.items if it.kind in _DESIGN_KINDS]

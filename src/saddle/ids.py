@@ -45,9 +45,11 @@ KIND_INTAKE = "intake"        # one decomposition of one user prompt
 KIND_ITEM = "item"            # one discrete ask pulled out of a prompt
 KIND_DESIGN = "design"        # one best-practice design (Layer 2)
 KIND_KNOWLEDGE = "knowledge"  # one Design Knowledge Base entry
+KIND_BUBBLE = "bubble"        # one client-agnostic outbound voice message
 ID_KINDS = frozenset({
     KIND_PROMPT, KIND_ASK, KIND_FORK, KIND_CHOICE, KIND_ACTION,
     KIND_BINDING, KIND_INTAKE, KIND_ITEM, KIND_DESIGN, KIND_KNOWLEDGE,
+    KIND_BUBBLE,
 })
 
 # A fork-option label is a single letter or a 1-2 digit number (matching the

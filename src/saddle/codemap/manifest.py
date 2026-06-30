@@ -92,14 +92,16 @@ def _rows(items, conv, kind: str) -> list:
 
 def _value_to_dict(s: ValueSpec) -> dict:
     return {"name": s.name, "field": s.field,
-            "accessor": list(s.resolvers), "producers": list(s.producers)}
+            "accessor": list(s.resolvers), "producers": list(s.producers),
+            "base_sources": list(s.base_sources)}
 
 
 def _value_from_dict(d: dict) -> ValueSpec:
     acc = d.get("accessor")
     accessor = tuple(acc) if isinstance(acc, (list, tuple)) else acc
     return ValueSpec(name=d["name"], field=d["field"], accessor=accessor,
-                     producers=tuple(d.get("producers", ())))
+                     producers=tuple(d.get("producers", ())),
+                     base_sources=tuple(d.get("base_sources", ())))
 
 
 def _identity_to_dict(s: IdentitySpec) -> dict:

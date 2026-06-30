@@ -42,7 +42,8 @@ def test_manifest_round_trip_preserves_specs():
     m = SurfaceManifest(
         values=[ValueSpec(name="cooldown", field="cooldown_s",
                           accessor=("resolve_cd", "apply_modifiers"),
-                          producers=("build_def",))],
+                          producers=("build_def",),
+                          base_sources=("get_def_by_id",))],
         identities=[IdentitySpec(name="status_type",
                                  canonical={"burn", "slow", "stun"},
                                  source_symbol="STATUS",
@@ -55,6 +56,7 @@ def test_manifest_round_trip_preserves_specs():
     v = back.values[0]
     assert v.resolvers == ("resolve_cd", "apply_modifiers")  # tuple accessor kept
     assert v.producers == ("build_def",)
+    assert v.base_sources == ("get_def_by_id",)  # base-veto tokens survive the JSON hop
     assert back.identities[0].canonical == {"burn", "slow", "stun"}  # set from sorted list
     assert back.boundaries[0].replication_func == "replicate"
     assert back.to_dict() == m.to_dict()             # idempotent

@@ -21,9 +21,12 @@ route around the gate because the gate already ran. Two enforcement shapes (the
   * **data rules** — authorable as plain JSON in policy ``check_rules``:
       - ``require_evidence``: a verb on a target is forbidden unless named
         evidence is present (removing a symbol needs a *disposition*).
-      - ``scope_fence``: a verb on a path outside the focus project is
-        forbidden unless explicitly marked cross-project (the "don't wander
-        off and 'fix' a sibling repo" guard).
+      - ``scope_fence``: a verb on a path outside the focus project is fenced
+        unless explicitly marked cross-project (the "don't wander off and
+        'fix' a sibling repo" guard). The fence splits by blast radius: a
+        cross-project DELETE is a HARD BLOCK, while a cross-project EDIT / WRITE
+        is a loud WARN (allowed but surfaced, never silent) — file edits are no
+        longer hard-gated, only deletions are.
   * **code predicates** — registered Python, for checks data can't express:
       - ``disposition_coherent``: a removal's disposition must NAME its
         replacement / wire-target / domain reason, not merely *exist*.
@@ -33,15 +36,18 @@ stay LLM-audited in design.py — this gate is only for invariants that can be
 made red/green. :data:`SEED_RULES` is saddle's standing doctrine; :func:`evaluate`
 is the gate; :func:`guard` is the passthrough entry point that converge calls
 before it lets a coder mutation land (and that ``saddle guard`` exposes on the
-CLI). The two seed rules are the exact lessons that drift kept defeating: stay
-in the focus project, and never delete code without classifying it first.
+CLI). The seed rules are the exact lessons that drift kept defeating: stay in
+the focus project (a cross-project EDIT warns, a cross-project DELETE blocks),
+and never delete code without classifying it first.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import shlex
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
@@ -245,15 +251,34 @@ SEED_RULES: tuple[CheckRule, ...] = (
     CheckRule(
         id="stay-in-project-focus",
         kind="scope_fence",
-        verbs=frozenset({"edit", "write", "create", "delete"}),
+        verbs=frozenset({"edit", "write", "create"}),
         target_kind="path",
+        severity="warn",
         override_evidence="cross_project_task",
         message=(
-            "this action targets a path OUTSIDE the focus project. Editing, "
-            "creating, or deleting files that live outside the focus root shown "
-            "below — in a sibling repo or any other project — is off-limits "
-            "unless the task is explicitly cross-project (evidence "
-            "cross_project_task=true)."
+            "this action EDITS / CREATES a path OUTSIDE the focus project — a "
+            "sibling repo or another project. By standing policy a cross-project "
+            "EDIT no longer BLOCKS (file edits are not hard-gated); it is ALLOWED "
+            "but SURFACED loudly so a wander into the wrong project is never "
+            "silent. Mark the task explicitly cross-project (evidence "
+            "cross_project_task=true) — or record a grant — to render it a "
+            "sanctioned notice instead of an out-of-focus alert."
+        ),
+    ),
+    CheckRule(
+        id="no-cross-project-delete",
+        kind="scope_fence",
+        verbs=frozenset({"delete"}),
+        target_kind="path",
+        severity="block",
+        override_evidence="cross_project_task",
+        message=(
+            "DELETING a file OUTSIDE the focus project — in a sibling repo or any "
+            "other project — is off-limits. Unlike a cross-project edit (now a "
+            "warning), a delete stays a HARD BLOCK: file removal is never "
+            "downgraded to a warning. Authorize it explicitly (evidence "
+            "cross_project_task=true, or a recorded grant) if the task genuinely "
+            "spans projects."
         ),
     ),
     CheckRule(
@@ -277,6 +302,18 @@ SEED_RULES: tuple[CheckRule, ...] = (
         predicate="disposition_coherent",
         message="the removal's disposition is incomplete.",
     ),
+)
+
+
+# The scope-fence rule ids — the rules whose ENTIRE concern is "is this path
+# inside the focus project". The PreToolUse hook consults cross-project grants
+# ONLY for these: a grant authorizes work spanning named roots, which is a scope
+# concern. A non-scope rule (no-unwired-delete, disposition-coherent) is a
+# code-safety invariant a grant must NEVER override. Derived from SEED_RULES so
+# adding a scope_fence rule wires the hook automatically — coverage is a property
+# of the rule's kind, not a second hand-maintained list that can drift.
+SCOPE_FENCE_RULE_IDS: frozenset[str] = frozenset(
+    r.id for r in SEED_RULES if r.kind == "scope_fence"
 )
 
 
@@ -425,41 +462,189 @@ _WRITE_TOOLS: frozenset[str] = frozenset({"Write"})
 _DELETE_CMDS: frozenset[str] = frozenset({"rm", "unlink", "shred"})
 _SHELL_SEPS: frozenset[str] = frozenset({"&&", "||", ";", "|", "&"})
 
+# Shell WRITE channels — the mutate-the-other-way half of the back-door. A
+# delete is not the only way a ``Bash`` call mutates a file: a redirection, a
+# ``tee``, a ``cp``/``mv`` destination all WRITE one, and (like ``rm``) must face
+# the scope-fence so a coder can't create/overwrite a sibling project's file by
+# shelling out instead of using the gated Edit/Write tools.
+_WRITE_CMDS_ALL_OPERANDS: frozenset[str] = frozenset({"tee"})        # writes every file arg
+_WRITE_CMDS_DEST_LAST: frozenset[str] = frozenset({"cp", "mv", "install", "ln"})  # dest = last operand
+
+# Redirections are classified over shlex TOKENS, not a raw-string regex — shlex
+# already does the one hard thing (quote handling), so an echoed ``>`` inside a
+# string (``echo "a > b"`` -> token ``a > b``) keeps the glyph INSIDE a token and
+# is never seen as an operator, while a real ``> 'my file.py'`` yields a clean
+# standalone ``>`` operator + an unquoted target token. The two flavours:
+#   output (``>`` ``>>`` ``2>`` ``&>``) -> the target is WRITTEN (the gate cares)
+#   input  (``<``)                      -> the target is READ (ignored)
+# A bare fd-dup (``2>&1`` ``>&2``) names no file (target starts with ``&``), so it
+# yields nothing. Both a standalone operator (next token is the target) and an
+# attached one (``>foo`` -> target ``foo``) are recognised.
+_REDIR_OUT_OP_ONLY = re.compile(r"^(?:&|\d+)?>>?$")   # `>` `>>` `2>` `&>` (target = next token)
+_REDIR_OUT_ATTACHED = re.compile(r"^((?:&|\d+)?>>?)(.+)$")  # `>foo` / `2>foo` / `&>foo` / `2>&1`
+
+
+def _is_non_project_sink(target: str) -> bool:
+    """True for a shell-write target that is NOT another project's file — a
+    device/kernel node (``/dev/null``, ``/proc``, ``/sys``) or ephemeral scratch
+    (``/tmp`` / ``$TMPDIR``). The scope-fence guards against straying into OTHER
+    PROJECTS; writing to ``/dev/null`` or a temp file is not that threat, so these
+    are excluded to avoid false blocks on ubiquitous redirects (``cmd >
+    /dev/null``, ``… > /tmp/scratch``) — symmetric with the Edit/Write tools,
+    which agents never point at a device or temp sink either."""
+    t = (target or "").strip().strip("\"'")
+    if not t:
+        return True
+    if t.startswith(("/dev/", "/proc/", "/sys/")) or t in ("/dev/null", "/tmp"):
+        return True
+    if t.startswith("/tmp/"):
+        return True
+    try:
+        p = Path(t).expanduser()
+        if p.is_absolute():
+            tmp = Path(tempfile.gettempdir()).resolve()
+            pr = p.resolve()
+            if pr == tmp or tmp in pr.parents:
+                return True
+    except Exception:  # noqa: BLE001 — can't resolve -> treat as a real path, let the fence judge
+        pass
+    return False
+
+
+def _classify_redirect(tok: str) -> tuple[str, str]:
+    """Classify one shlex token as a redirection. Returns ``(kind, target)``:
+      ``("op_out", "")``  a standalone OUTPUT operator (``>`` ``>>`` ``2>`` ``&>``)
+                          — the WRITE target is the *next* token (caller consumes).
+      ``("op_in", "")``   a standalone ``<`` — the next token is a READ (skip it).
+      ``("write", path)`` an attached output redirect (``>foo`` -> ``foo``).
+      ``("skip", "")``    an attached input (``<foo``) or fd-dup (``2>&1``) — names
+                          no project file, consume the token and move on.
+      ``("none", "")``    not a redirection (an ordinary operand / separator).
+    Quote handling is already done by shlex, so a ``>`` *inside* a token (an echoed
+    string) never reaches here as an operator."""
+    if _REDIR_OUT_OP_ONLY.match(tok):
+        return ("op_out", "")
+    if tok == "<":
+        return ("op_in", "")
+    m = _REDIR_OUT_ATTACHED.match(tok)
+    if m:
+        rem = m.group(2)
+        if rem.startswith("&"):          # fd-dup (``2>&1`` / ``>&2``) — no file
+            return ("skip", "")
+        return ("write", rem)
+    if tok.startswith("<") and len(tok) > 1:  # ``<infile`` — a READ
+        return ("skip", "")
+    return ("none", "")
+
+
+def _segment_write_targets(seg: list[str]) -> list[str]:
+    """The file(s) a single command segment's *program* writes — ``tee`` (every
+    file arg), ``cp``/``mv``/``install``/``ln`` (the last operand = destination),
+    ``dd of=FILE``, and ``sed -i`` (in-place edit). For ``sed`` the substitution
+    SCRIPT (``s/a/b/g``) carries no file suffix while the file operand does, so a
+    suffix filter separates them cleanly. Redirections are NOT handled here (they
+    are peeled from the token stream before segmentation)."""
+    head, rest = seg[0], seg[1:]
+    nonflag = [a for a in rest if not a.startswith("-")]
+    if head in _WRITE_CMDS_ALL_OPERANDS:
+        return nonflag
+    if head in _WRITE_CMDS_DEST_LAST:
+        return nonflag[-1:] if len(nonflag) >= 2 else []
+    if head == "dd":
+        return [a.split("=", 1)[1] for a in rest if a.startswith("of=") and len(a) > 3]
+    if head == "sed" and any(
+        a == "--in-place" or a.startswith("--in-place=") or re.match(r"^-i", a)
+        for a in rest
+    ):
+        return [a for a in nonflag if a.lower().endswith(_CODE_SUFFIXES + _DATA_SUFFIXES)]
+    return []
+
 
 def _bash_actions(command: str, project_root: str) -> list[Action]:
-    """Best-effort scan of a shell command for the obvious *mutating* operations
-    the gate cares about — file deletes (``rm``/``unlink``/``shred``/``git rm``).
+    """Best-effort scan of a shell command for the *mutating* operations the gate
+    cares about — file DELETES (``rm``/``unlink``/``shred``/``git rm``) and file
+    WRITES (redirections, ``tee``, ``cp``/``mv``/``install``/``ln`` dest,
+    ``dd of=``, ``sed -i``).
 
     The precise mutation channel is the Edit/Write tools, which map exactly; this
-    closes the shell back-door so a delete can't dodge the gate merely by being a
-    ``Bash`` call. A command we can't tokenise yields nothing — the gate does not
-    assert on what it cannot read."""
+    closes the shell back-door so neither a delete NOR a write can dodge the gate
+    merely by being a ``Bash`` call. ONE shlex pass does it all — shlex handles
+    quoting (so an echoed ``>`` stays inert), then the token stream is walked once
+    to peel redirections (emitting a write for each output target, skipping
+    input/fd-dup), splitting the remainder into command segments. A command we
+    cannot tokenise (an unbalanced quote) yields nothing — the gate does not
+    assert on what it cannot read. OPAQUE interpreter writes (``python -c``,
+    ``sh -c``, a program fed a heredoc) hide their target inside an argument the
+    gate cannot soundly parse; they are deliberately NOT asserted here (a fragile
+    guess would false-block legitimate reads) and are left for the supervisory
+    layer to surface."""
+    out: list[Action] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _add(verb: str, target: str) -> None:
+        t = target.strip().strip("\"'")
+        if not t:
+            return
+        if verb == "write" and (not re.search(r"\w", t) or _is_non_project_sink(t)):
+            return  # punctuation-only noise, or a device/scratch sink — not a project write
+        key = (verb, t)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(Action(verb, t, "path", project_root=project_root))
+
     try:
         tokens = shlex.split(command)
     except ValueError:
-        return []
+        return out  # unparseable (unbalanced quote) — assert on nothing we can't read
+
+    # Walk the tokens once: peel redirections (output target -> write, input/fd-dup
+    # -> ignored), and split what remains into ``&&`` / ``|`` / ``;`` segments.
     segments: list[list[str]] = []
     cur: list[str] = []
-    for tok in tokens:
+    i, n = 0, len(tokens)
+    while i < n:
+        tok = tokens[i]
+        kind, target = _classify_redirect(tok)
+        if kind == "op_out":            # ``>`` ``>>`` ... — the next token is the write target
+            if i + 1 < n:
+                _add("write", tokens[i + 1])
+            i += 2
+            continue
+        if kind == "op_in":             # ``<`` — the next token is a READ, consume + ignore
+            i += 2
+            continue
+        if kind == "write":             # ``>foo`` attached
+            _add("write", target)
+            i += 1
+            continue
+        if kind == "skip":              # ``<foo`` read / ``2>&1`` fd-dup — names no project file
+            i += 1
+            continue
         if tok in _SHELL_SEPS:
             segments.append(cur)
             cur = []
-        else:
-            cur.append(tok)
+            i += 1
+            continue
+        cur.append(tok)
+        i += 1
     segments.append(cur)
 
-    out: list[Action] = []
     for seg in segments:
         if not seg:
             continue
         head, rest = seg[0], seg[1:]
         if head == "git" and rest[:1] == ["rm"]:
-            operands = [a for a in rest[1:] if not a.startswith("-")]
+            for a in rest[1:]:
+                if not a.startswith("-"):
+                    _add("delete", a)
         elif head in _DELETE_CMDS:
-            operands = [a for a in rest if not a.startswith("-")]
+            for a in rest:
+                if not a.startswith("-"):
+                    _add("delete", a)
         else:
-            continue
-        out += [Action("delete", a, "path", project_root=project_root) for a in operands]
+            for t in _segment_write_targets(seg):
+                _add("write", t)
     return out
 
 

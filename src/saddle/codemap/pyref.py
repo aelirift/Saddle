@@ -335,6 +335,76 @@ def resolved_arg_callees(mod: Module, resolvers: set[str]) -> set[str]:
     return out
 
 
+def passdown_facts(mod: Module, resolvers: set[str], base_sources=frozenset()):
+    """Python extractor for the interprocedural pass-down fixpoint — the
+    cross-module generalisation of :func:`resolved_arg_callees`. Returns a
+    :class:`saddle.codemap.passdown.ModuleFacts`: ordered parameter names per
+    function, the resolver-bound and base_source-bound locals per function, and
+    every call site with its positional arguments pre-classified as resolver /
+    base / bare-name / other. The fixpoint in ``passdown.py`` stitches these across
+    modules; AST-exact here, the Python twin of :func:`gdref.passdown_facts`."""
+    from .passdown import ModuleFacts
+
+    facts = ModuleFacts()
+    if not resolvers:
+        return facts
+    resolvers = set(resolvers)
+    base_sources = set(base_sources)
+
+    def _atom(arg):
+        if isinstance(arg, ast.Call):
+            cn = _callee_name(arg.func)
+            if cn in resolvers:
+                return "R"
+            if cn in base_sources:
+                return "B"
+            # A BARE direct call (``fn(...)``, not ``obj.fn(...)``) carries fn's return
+            # polarity — a resolver-wrapper passes its resolved-ness through. Restricted
+            # to bare calls so a method name colliding with an unrelated top-level
+            # wrapper can't leak a polarity it doesn't have.
+            if isinstance(arg.func, ast.Name):
+                return ("call", cn)
+            return None
+        if isinstance(arg, ast.Name):
+            return ("n", arg.id)
+        return None
+
+    def _visit(node, cur):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                facts.params[child.name] = [
+                    a.arg for a in (child.args.posonlyargs + child.args.args)
+                ]
+                _visit(child, child.name)
+                continue
+            if isinstance(child, ast.Assign):
+                if isinstance(child.value, ast.Call):
+                    cn = _callee_name(child.value.func)
+                    bucket = (facts.resolved_locals if cn in resolvers
+                              else facts.base_locals if cn in base_sources else None)
+                    if bucket is not None:
+                        for t in child.targets:
+                            if isinstance(t, ast.Name):
+                                bucket.setdefault(cur, set()).add(t.id)
+                    elif isinstance(child.value.func, ast.Name):
+                        # a local bound from a bare PROJECT call carries that callee's
+                        # RETURN polarity (so ``d = wrap(id)`` resolves if wrap is a
+                        # resolver-wrapper). Resolver/base bindings above take priority.
+                        for t in child.targets:
+                            if isinstance(t, ast.Name):
+                                facts.call_locals.setdefault(cur, {})[t.id] = cn
+            if isinstance(child, ast.Return) and child.value is not None and cur is not None:
+                facts.returns.setdefault(cur, []).append(_atom(child.value))
+            if isinstance(child, ast.Call):
+                callee = _callee_name(child.func)
+                if callee is not None and callee not in resolvers:
+                    facts.sites.append((cur, callee, [_atom(a) for a in child.args]))
+            _visit(child, cur)
+
+    _visit(mod.tree, None)
+    return facts
+
+
 def name_decls(mod: Module, name: str) -> list[Ref]:
     """Declaration sites of a script-scope symbol `name`: a module/class-level
     assignment (`NAME = ...`) or annotated assignment (`NAME: T = ...`). A

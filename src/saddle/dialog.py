@@ -77,6 +77,24 @@ _REC_FORK_RES = (
     ),
 )
 
+# Decision-frame cues — the language a message uses when it actually leaves the
+# USER a choice (a question, a choice verb, a second-person hand-off, or a
+# recommendation among the options), as opposed to merely listing numbered
+# items. Used to gate DIGIT-labeled lists only (see :func:`_frames_a_decision`):
+# a bare "Two findings: 1... 2..." is prose, not a fork. Deliberately omits a
+# bare "option" — "the implementation of Option A is: 1... 2..." back-references
+# a prior decision and enumerates its steps; it is not a new fork.
+_DECISION_CUE_RE = re.compile(
+    r"\?"
+    r"|\bvs\.?\b"
+    r"|\b(?:pick|choose|chooses|select|selects|prefer|prefers|either|versus"
+    r"|decide|decides|decision|decisions"
+    r"|recommend|recommends|recommended|recommendation|recommendations"
+    r"|do\s+you\s+want|would\s+you|should\s+i|shall\s+i|want\s+me\s+to"
+    r"|your\s+call|you\s+decide|up\s+to\s+you|for\s+you)\b",
+    re.I,
+)
+
 
 def _match_option_line(line: str) -> tuple[str, str] | None:
     for pat in _OPT_PATTERNS:
@@ -95,6 +113,15 @@ def parse_options(text: str) -> list[ForkOption]:
     Dedupes by label and keeps only one *consistent* group — all-letter or
     all-digit, whichever is larger — so a stray "1." in an a/b/c list can't
     masquerade as a fourth option. Returns ``[]`` unless >=2 options survive.
+
+    A DIGIT-labeled group is held to a higher bar than a letter one. A bare
+    numbered list is the agent's default *prose* shape ("Two findings: 1... 2...",
+    "The fix: 1... 2..."), NOT a choice it is leaving the user — so a digit group
+    is a fork only when the message actually FRAMES a decision
+    (:func:`_frames_a_decision`). Letter labels (a/b/c) are intentional choice
+    markers by convention and pass through unconditionally. Without this gate
+    every numbered list the agent writes is mis-ingested as a fork, which is what
+    flooded the ledger with ~95% false forks (and let stray "2"s bind them).
     """
     found: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -113,6 +140,8 @@ def parse_options(text: str) -> list[ForkOption]:
     digit = [(l, t) for (l, t) in found if l.isdigit()]
     group = alpha if len(alpha) >= len(digit) else digit
     if len(group) < 2:
+        return []
+    if group[0][0].isdigit() and not _frames_a_decision(text or ""):
         return []
     return [ForkOption(label=l, text=t) for (l, t) in group]
 
@@ -149,6 +178,22 @@ def _extract_prompt(text: str) -> str:
     return ""
 
 
+def _frames_a_decision(text: str) -> bool:
+    """True when the message actually FRAMES a choice for the user rather than
+    merely listing numbered items — the gate that keeps a digit-labeled list
+    from masquerading as a :class:`Fork`.
+
+    The signal is explicit decision language (:data:`_DECISION_CUE_RE`) on the
+    line that *introduces* the list: an interrogative, a choice verb, a
+    second-person hand-off ("your call", "decisions for you"), or a
+    recommendation among the options. Scoped to that framing line on purpose —
+    an incidental "option 2" buried in the body must not resurrect an
+    enumeration into a fork (the exact false bind the ledger already suffered).
+    """
+    frame = _extract_prompt(text)
+    return bool(frame and _DECISION_CUE_RE.search(frame))
+
+
 def parse_fork(text: str) -> Fork | None:
     """Extract a :class:`Fork` from an agent message, or ``None`` if it offered
     no clear >=2-option choice. Unstamped — the store stamps id/ts/scope."""
@@ -166,7 +211,8 @@ def parse_fork(text: str) -> Fork | None:
 # === Selection parsing: user message -> which option =====================
 _SOLO_LABEL_RE = re.compile(r"^\(?([A-Za-z]|\d{1,2})\)?\s*[.!]?$")
 _VERB_LABEL_RE = re.compile(
-    r"\b(?:option|opt|choice|go with|go for|let'?s (?:do|go with|pick)|"
+    r"\b(?:option|opt|choice|go with|go for|go on with|proceed with|continue with|"
+    r"let'?s (?:do|go with|pick)|"
     r"i'?ll (?:take|go with|do|pick)|i(?:'d| would)? (?:like|prefer|pick|choose)|"
     r"going with|pick|choose|select)\s+\(?([A-Za-z]|\d{1,2})\)?(?=[\s.,;:!?\)]|$)",
     re.I,
@@ -181,10 +227,21 @@ _THE_X_POSITION_RE = re.compile(
     r"(?:one|option|choice)\b",
     re.I,
 )
-_RECOMMEND_RE = re.compile(
+# Defer family: the user hands the choice back to the agent ("go", "your call")
+# OR tells it to keep moving ("proceed", "continue", "go on"). Both resolve the
+# SAME way — bind the recommended option if the fork has one, else AMBIGUOUS — so a
+# "proceed" reply commits to the option the agent already recommended rather than
+# guessing by recency (which would make the deterministic matcher guess, the seam
+# it explicitly refuses). A trailing object is allowed ONLY when it's a bare defer
+# pronoun ("proceed with it/that/the plan"); an explicit label ("proceed with b")
+# must fall through to _VERB_LABEL_RE, so the label-bearing tail is excluded here.
+_DEFER_RE = re.compile(
     r"^(?:go|go for it|go ahead|do it|your call|you (?:decide|choose|pick)|"
     r"up to you|whatever you (?:recommend|think|suggest|prefer)|i'?ll trust you|"
-    r"trust your call|sounds good)\s*[.!]?$",
+    r"trust your call|sounds good|"
+    r"proceed|continue|carry on|go on|keep going|press on|onward|onwards)"
+    r"(?:\s+(?:then|please|now|and build|with (?:it|that|this|the plan|the approach|the design)))?"
+    r"\s*[.!]?$",
     re.I,
 )
 _POSITION_INDEX = {
@@ -242,11 +299,15 @@ def resolve_selection(fork: Fork, user_text: str) -> Binding | None:
     if m:
         return _by_position(fork, m.group(1).lower(), t)
 
-    if _RECOMMEND_RE.match(t):
+    if _DEFER_RE.match(t):
         rec = fork.recommended_option()
         if rec is not None:
             return _bind(fork, rec.label, t, BIND_RECOMMENDED, 0.85)
-        return _ambiguous(fork, t, "deferred to recommendation but no option was recommended")
+        return _ambiguous(
+            fork, t,
+            "a continuation / defer ('proceed', 'go', 'your call') with no "
+            "recommended option to resolve to — which option?",
+        )
 
     m = _VERB_LABEL_RE.search(t)
     if m:
@@ -385,10 +446,31 @@ class IntentTracker:
 
     def active_binding(self, ctx: Context, *, session: str = "") -> Binding | None:
         """The latest confidently-resolved binding (the live commitment) for this
-        project/session."""
+        project/session.
+
+        A binding whose fork was later RETIRED (superseded) is no longer a live
+        commitment, so ``live_fork_only=True`` skips it — otherwise a stale resolved
+        fork keeps surfacing its pick as a "standing commitment" every turn even
+        after it was explicitly retired. A binding whose fork row is merely missing
+        is kept (saddle never deletes forks; absence is an anomaly, not retirement)."""
         return self._store.latest_binding(
-            ctx, session=session or None, resolved_only=True
+            ctx, session=session or None, resolved_only=True, live_fork_only=True
         )
+
+    def committed_fork(
+        self, ctx: Context, *, session: str = ""
+    ) -> tuple[Binding | None, Fork | None]:
+        """The live commitment PLUS the fork it resolved — the binding alone names
+        only the chosen label, not the question it answered or the options it chose
+        among. The intake readout pairs them so the agent re-reads the actual
+        decision (proposal + every option, the committed one marked) after a
+        compaction wipes the transcript, not a bare ``p1.f1.a``. Returns
+        ``(None, None)`` when there is no live commitment, and ``(binding, None)``
+        only if the fork row was pruned out from under a surviving binding."""
+        b = self.active_binding(ctx, session=session)
+        if b is None:
+            return None, None
+        return b, self._store.get_fork(ctx, b.fork_id)
 
     # -- the drift verdict (fork-identity, never silent) ------------------
 

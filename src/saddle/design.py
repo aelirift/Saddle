@@ -43,6 +43,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -50,7 +52,7 @@ from saddle.codemap import Finding, SurfaceManifest, refs
 from saddle.context import Context, default as _default_ctx
 from saddle.dkb import DKB, get_dkb
 from saddle.llm import policy
-from saddle.llm.json_tools import call_json
+from saddle.llm.json_tools import call_json, strip_think
 from saddle.llm.pool import tenant_gate
 from saddle.models import (
     ANTI_PATTERN,
@@ -219,11 +221,111 @@ _SYS_AUDIT = (
     "- hand-waving — a vague claim with no concrete mechanism behind it;\n"
     "- a band-aid — a symptom patch rather than a root-cause structure;\n"
     "- any part of the GOAL left uncovered.\n"
+    "APPLICABILITY FIRST. A binding directive binds only the kind of task it was "
+    "written for. Before flagging a directive as violated, check it actually "
+    "GOVERNS this work: a directive about producing a specific project artifact (a "
+    "required output format, a target-project constraint) does NOT bind unrelated "
+    "work, and SELF-DIRECTED work on the assistant/harness ITSELF — changing its "
+    "own code, gates, prompts, configuration, or behavior — is NOT bound by "
+    "directives meant for the projects it builds or operates on. Do not flag an "
+    "inapplicable directive, and do not raise a coverage gap against a goal a "
+    "directive was never about. Enforce the directives that DO apply, hard.\n"
     "Each issue must name what is wrong and where. Do not invent issues; if the "
-    "design is sound, return none.\n"
-    "Respond with ONLY JSON: "
-    '{"ok": true/false, "issues": ["..."]}. ok=true only when issues is empty.'
+    "design is sound, flag nothing.\n\n"
+    "Reply as PLAIN TEXT, NOT JSON — the issues are long prose, and prose escaped "
+    "into a JSON string is fragile (one stray quote would discard every issue at "
+    "once). Use this EXACT line format:\n"
+    "- The FIRST line is the verdict and contains ONLY one word: OK if the design "
+    "is sound, or ISSUES if you found any. Put nothing else on that line.\n"
+    "- If the verdict is ISSUES, write each issue on its OWN line below — one "
+    "issue per line, naming what is wrong and where. Every non-blank line after "
+    "the verdict is read as exactly one issue.\n"
+    "Emit nothing else: no preamble, no JSON, no code fence, no closing remark."
 )
+
+
+class _AuditParseError(ValueError):
+    """The design-audit reply did not present a recognizable ``OK`` / ``ISSUES``
+    verdict. Raised LOUDLY (never swallowed into a fabricated 'sound') so a
+    malformed verdict fails the stage — :func:`saddle.supervisor.run_stage` turns
+    it into a classified ALERT naming what saddle could not verify this turn. The
+    cardinal sin this guards is the opposite: silently reading a no-verdict reply
+    as OK and dropping the real issues with it.
+
+    It surfaces through the retry taxonomy as ``other`` (a soft, surfaced
+    disposition — the loud ALERT already carries this message verbatim), NOT as a
+    swallow; coupling :mod:`saddle.llm.retry_category` to this design-layer type to
+    relabel it would be an inversion for no behavioural gain."""
+
+
+# A leading list bullet / number on an issue line — stripped COSMETICALLY when
+# collecting issues. Removing the glyph never drops the issue's CONTENT; it only
+# tidies the surfaced text.
+_AUDIT_BULLET_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+")
+
+
+def _audit_verdict_token(line: str) -> str:
+    """The verdict line reduced to its bare alpha token: every non-letter dropped,
+    upper-cased. ``**OK.**`` -> ``OK``; ``issues:`` -> ``ISSUES``; ``OK looks
+    good`` -> ``OKLOOKSGOOD`` (NOT a verdict). Demanding the WHOLE line reduce to
+    exactly ``OK`` / ``ISSUES`` is the cardinal-sin guard: an issue crammed onto
+    the verdict line can never be silently read as a bare OK — it fails the match
+    and raises."""
+    return re.sub(r"[^A-Za-z]", "", line or "").upper()
+
+
+def _parse_audit_reply(text: str) -> tuple[bool, list[str]]:
+    """Parse the design-audit reply's LINE contract into ``(ok, issues)``.
+
+    NOT JSON — and that is the FIX, not an accident. The audit's issues are long
+    free prose, and prose hand-escaped into a JSON array is the harness's most
+    fragile parse (the same reason the design BODY rides as text — module
+    docstring): one unescaped quote in ONE issue throws the WHOLE ``json.loads``
+    and discards every OTHER issue with it — a fabricated 'sound', the cardinal
+    sin. A line contract has no per-issue escaping to break, so a single ugly issue
+    can never take the rest of the review down.
+
+    Loud-accounting invariants — each closes the false-negative seam:
+      • empty / whitespace-only reply                 -> raise (no verdict to
+        trust; never guessed into a pass).
+      • first non-blank line is the VERDICT and must reduce to EXACTLY ``OK`` or
+        ``ISSUES`` (:func:`_audit_verdict_token`); any other first line -> raise. A
+        missing / misplaced verdict, or an issue crammed onto the verdict line, is
+        never read as OK.
+      • ``OK`` is honored ONLY when no non-blank line follows it; ``OK`` with
+        trailing content is a contradiction -> raise (never trust OK over content
+        the model also chose to write).
+      • ``ISSUES`` -> EVERY following non-blank line is exactly one issue, verbatim
+        (a leading bullet is stripped cosmetically). No per-line marker is required,
+        so there is no marker a model can forget that would silently drop a line,
+        and no per-line parse step that could fail mid-stream.
+      • ``ISSUES`` with no following content -> ``(False, [])``, preserving the
+        prior contract's 'flagged not-ok but named nothing actionable' semantics.
+
+    A think-block (reasoning models) is stripped first so it never counts as the
+    verdict / a preamble. Raises :class:`_AuditParseError` on any unrecognized
+    verdict — fail-loud for the supervisory runner to classify and bubble."""
+    clean = strip_think(text or "").strip()
+    lines = clean.splitlines()
+    head_idx = next((i for i, ln in enumerate(lines) if ln.strip()), None)
+    if head_idx is None:
+        raise _AuditParseError("empty audit reply — no verdict to trust")
+    token = _audit_verdict_token(lines[head_idx])
+    rest = [ln.strip() for ln in lines[head_idx + 1:] if ln.strip()]
+    if token == "OK":
+        if rest:
+            raise _AuditParseError(
+                "audit reply opened OK but also wrote content — refusing to trust "
+                f"OK over {len(rest)} trailing line(s): {rest[0]!r}"
+            )
+        return True, []
+    if token != "ISSUES":
+        raise _AuditParseError(
+            "audit reply did not open with an OK / ISSUES verdict: "
+            f"{lines[head_idx]!r}"
+        )
+    issues = [_AUDIT_BULLET_RE.sub("", ln).strip() for ln in rest]
+    return False, [i for i in issues if i]
 
 _SYS_HARVEST = (
     "You are the lesson-harvest stage of a design harness. A design just went "
@@ -411,8 +513,37 @@ def _audit_prompt(goal: str, body: str, directives: list[str], anti: str) -> str
         f"DESIGN:\n{body}\n\n"
         f"BINDING DIRECTIVES:\n{_format_directives(directives)}\n\n"
         f"ANTI-PATTERNS TO AVOID:\n{anti}\n\n"
-        "Return the issues found (empty if the design is sound)."
+        "Return the verdict line (OK / ISSUES) and, if ISSUES, one issue per line."
     )
+
+
+async def _audit_call(
+    caller: "LLMCaller",
+    goal: str,
+    body: str,
+    directives: list[str],
+    anti: str,
+    *,
+    label: str,
+) -> tuple[bool, list[str]]:
+    """Run the audit stage and parse its LINE-contract reply into ``(ok, issues)``.
+
+    The single audit entry point BOTH call sites share — :func:`design_for`'s
+    self-audit of its OWN generated body, and :func:`audit_proposal`'s gate over
+    the agent's prose — so the bar AND the parse are identical no matter who
+    authored the design. Deliberately ``json_mode=False``: the reply is the plain
+    verdict-line contract (:func:`_parse_audit_reply`), not JSON, because long
+    prose issues escaped into a JSON array are the harness's most fragile parse —
+    one stray quote would discard every issue at once. A malformed verdict raises
+    (:class:`_AuditParseError`) and PROPAGATES for ``run_stage`` to classify and
+    bubble; it is never swallowed into a false pass."""
+    text = await caller(
+        _SYS_AUDIT,
+        _audit_prompt(goal, body, directives, anti),
+        json_mode=False,
+        label=label,
+    )
+    return _parse_audit_reply(text)
 
 
 def _harvest_prompt(goal: str, issues: list[str]) -> str:
@@ -425,19 +556,21 @@ def _harvest_prompt(goal: str, issues: list[str]) -> str:
 
 async def _harvest(
     caller: "LLMCaller", ctx: Context, dkb: DKB, goal: str, issues: list[str]
-) -> int:
-    """File generalizable lessons from caught flaws into the DKB (source=audit)."""
+) -> list[Knowledge]:
+    """File generalizable lessons from caught flaws into the DKB (source=audit).
+    Returns the lessons actually filed — deduped against existing titles — so a
+    caller can name them (the turn-end harvest bubbles the titles it learned)."""
     payload = await call_json(
         caller, _SYS_HARVEST, _harvest_prompt(goal, issues), label="design/harvest"
     )
     raw = payload.get("entries")
     if not isinstance(raw, list) or not raw:
-        return 0
+        return []
     existing_titles = {
         _norm(k.title)
         for k in await asyncio.to_thread(dkb.list_knowledge, ctx, limit=1000)
     }
-    added = 0
+    added: list[Knowledge] = []
     for e in raw:
         if not isinstance(e, dict):
             continue
@@ -455,9 +588,9 @@ async def _harvest(
         )
         await asyncio.to_thread(dkb.add_knowledge, kn)
         existing_titles.add(_norm(title))
-        added += 1
+        added.append(kn)
     if added:
-        _log.info("harvested %d lesson(s) into the DKB for %s", added, ctx.key)
+        _log.info("harvested %d lesson(s) into the DKB for %s", len(added), ctx.key)
     return added
 
 
@@ -543,16 +676,17 @@ async def design_for(
             json_mode=False, label="design/body",
         )
 
-        # 6: audit + bounded revise loop — operates on the prose body.
+        # 6: audit + bounded revise loop — operates on the prose body. The audit
+        # rides a LINE contract (verdict line + one issue per line), NOT JSON: the
+        # issues are long prose and JSON-escaped prose is the harness's most fragile
+        # parse — one stray quote would discard every issue at once (the same reason
+        # the body above is text). _parse_audit_reply already strips/filters.
         for _ in range(max(0, max_audits)):
-            verdict = await call_json(
-                caller, _SYS_AUDIT,
-                _audit_prompt(goal, body, directives, anti_block),
-                label="design/audit",
+            ok_audit, issues = await _audit_call(
+                caller, goal, body, directives, anti_block, label="design/audit",
             )
             audits_run += 1
-            issues = [str(i).strip() for i in verdict.get("issues", []) if str(i).strip()]
-            if bool(verdict.get("ok")) and not issues:
+            if ok_audit and not issues:
                 clean = True
                 break
             if not issues:
@@ -574,7 +708,7 @@ async def design_for(
         # 8: harvest the caught flaws into the DKB.
         harvested = 0
         if harvest and all_issues:
-            harvested = await _harvest(caller, ctx, dkb, goal, all_issues)
+            harvested = len(await _harvest(caller, ctx, dkb, goal, all_issues))
 
     design = Design(
         ask=goal,
@@ -609,6 +743,129 @@ async def design_for(
     return design
 
 
+@dataclass
+class AuditVerdict:
+    """The result of auditing an ALREADY-WRITTEN approach — Stage 3's engine, as
+    opposed to :func:`design_for` which GENERATES a design and audits its own
+    output. ``ok`` is True only when the approach is sound; ``issues`` names each
+    flaw the audit caught — a band-aid, a misread root cause, hand-waving, an
+    uncovered ask, a violated directive. ``considered`` is how many DKB
+    anti-patterns were weighed against it (0 = nothing to measure against)."""
+
+    ok: bool = True
+    issues: list[str] = field(default_factory=list)
+    considered: int = 0
+
+    @property
+    def has_issues(self) -> bool:
+        return bool(self.issues)
+
+
+async def audit_proposal(
+    goal: str,
+    approach: str,
+    ctx: Context | None = None,
+    *,
+    caller: "LLMCaller | None" = None,
+    dkb: DKB | None = None,
+    directives: list[str] | None = None,
+    retrieve_k: int = 6,
+) -> AuditVerdict:
+    """Audit an approach the agent has ALREADY proposed against the goal it
+    serves — the pre-code design gate's engine (Stage 3).
+
+    Distinct from :func:`design_for`, which runs the whole diagnose → … → harvest
+    pipeline to PRODUCE a design: the supervised agent designs in its own
+    transcript and never calls saddle, so Stage 3 lifts that prose out and audits
+    IT — through the EXACT ``_SYS_AUDIT`` stage the design pipeline applies to its
+    own body. The bar is therefore identical whether saddle authored the design or
+    merely watched the agent author it: did the approach reach the root cause (not
+    a symptom), honor the binding directives, avoid a band-aid (tolerant default /
+    hardcoded backstop / swallow-and-log) instead of a structural fix, and cover
+    the whole goal?
+
+    The anti-patterns are pulled from the DKB with the GLOBAL seed corpus
+    INCLUDED — measuring an approach against universal engineering wisdom is
+    exactly Stage 3's job, the deliberate complement to Stage 2 (``intent``),
+    which weighs only THIS project's own settled state. A failed classify
+    PROPAGATES (fail-loud) for the supervisory runner to classify and bubble — it
+    is never swallowed into a false 'looked fine'.
+    """
+    goal = (goal or "").strip()
+    approach = (approach or "").strip()
+    if not approach:
+        raise ValueError("cannot audit an empty approach")
+    ctx = ctx or _default_ctx()
+    dkb = dkb or get_dkb()
+    if directives is None:
+        directives = policy.directives(ctx)
+    if caller is None:
+        from saddle.llm.callers import build_callers
+        caller = build_callers(ctx)["default"]
+
+    async with tenant_gate(ctx):
+        anti_hits = await _search(
+            dkb, ctx, f"{goal}\n{approach}", k=retrieve_k, kinds=[ANTI_PATTERN]
+        )
+        anti_block = _format_knowledge([k for k, _ in anti_hits])
+        ok_audit, issues = await _audit_call(
+            caller, goal, approach, directives, anti_block, label="design/gate-audit",
+        )
+    return AuditVerdict(
+        ok=ok_audit and not issues,
+        issues=issues,
+        considered=len(anti_hits),
+    )
+
+
+@dataclass
+class HarvestResult:
+    """What a turn-end lesson harvest filed (Stage 5). ``titles`` names the durable
+    lessons written to the DKB this turn; ``considered`` is how many caught flaws
+    were fed in. ``harvested == 0`` with ``considered > 0`` means nothing cleared
+    the 'genuinely general, not obvious' bar, or every lesson was already on file —
+    a real outcome, not a failure (the gate is deliberately conservative)."""
+
+    titles: list[str] = field(default_factory=list)
+    considered: int = 0
+
+    @property
+    def harvested(self) -> int:
+        return len(self.titles)
+
+
+async def harvest_turn(
+    goal: str,
+    issues: list[str],
+    ctx: Context | None = None,
+    *,
+    caller: "LLMCaller | None" = None,
+    dkb: DKB | None = None,
+) -> HarvestResult:
+    """Stage 5's engine: distil the flaws CAUGHT this turn into durable, reusable
+    DKB lessons (``source=audit``), so the NEXT turn's design/intent retrieval
+    stands on them — saddle's cumulative, not 'caught once and done', guarantee.
+
+    Reuses :func:`_harvest` — the EXACT lesson-extraction the design pipeline runs
+    over its OWN caught flaws — so a flaw caught by the live supervisor and one
+    caught by ``design_for`` teach the DKB the same way. Deduped against existing
+    titles, scoped to this tenant/project. No caught flaws ⇒ no LLM call ⇒ empty
+    result (a clean turn teaches nothing). A failed classify PROPAGATES (fail-loud)
+    for the supervisory runner to surface — never swallowed into a false 'learned'.
+    """
+    issues = [str(i).strip() for i in (issues or []) if str(i).strip()]
+    if not issues:
+        return HarvestResult()
+    ctx = ctx or _default_ctx()
+    dkb = dkb or get_dkb()
+    if caller is None:
+        from saddle.llm.callers import build_callers
+        caller = build_callers(ctx)["default"]
+    async with tenant_gate(ctx):
+        added = await _harvest(caller, ctx, dkb, goal, issues)
+    return HarvestResult(titles=[k.title for k in added], considered=len(issues))
+
+
 def intent_drift(
     design: Design,
     *,
@@ -641,6 +898,94 @@ def intent_drift(
             return []  # no code to compare the intent against — not a drift
         mods = refs.parse_project(rp)
     return manifest.gate(mods, root=rp)
+
+
+@dataclass
+class ConformanceDrift:
+    """One settled design whose committed completeness surface the code, as it
+    stands now, no longer satisfies. ``findings`` are the exact unsatisfied
+    touchpoints :func:`intent_drift` raised; ``has_error`` is True when any of
+    them is error-grade (a hard conformance break, not a soft gap)."""
+
+    design_id: str
+    summary: str
+    findings: list[Finding] = field(default_factory=list)
+
+    @property
+    def has_error(self) -> bool:
+        return any(f.severity == "error" for f in self.findings)
+
+
+@dataclass
+class ConformanceResult:
+    """Stage 4's verdict: which settled designs the current code has DRIFTED from.
+    ``designs_checked`` is how many surfaced designs were gated (0 ⇒ nothing to
+    verify — no settled design declared a surface, or there is no code); a
+    non-empty ``drifts`` is always a real divergence (``intent_drift``'s
+    guarantee)."""
+
+    drifts: list[ConformanceDrift] = field(default_factory=list)
+    designs_checked: int = 0
+
+    @property
+    def has_drift(self) -> bool:
+        return bool(self.drifts)
+
+    @property
+    def has_error(self) -> bool:
+        return any(d.has_error for d in self.drifts)
+
+
+def conformance_scan(
+    ctx: Context,
+    *,
+    dkb: DKB | None = None,
+    root: str | Path | None = None,
+    limit: int = 8,
+    status: str = DESIGN_FINAL,
+) -> ConformanceResult:
+    """Re-verify the project's SETTLED designs against the code as it stands now —
+    Stage 4's engine (turn-end code-vs-design conformance).
+
+    Each design that reached the SURFACE stage carries a persisted
+    :class:`SurfaceManifest` (``design.meta['surface']``) — the completeness floor
+    the design committed to. This lists the project's most-recent ``limit``
+    designs in ``status`` (default :data:`DESIGN_FINAL` — only a *settled* design
+    is a contract the code must honor; a still-flagged design never converged, so
+    gating code against it is premature), keeps the ones that declared a surface,
+    parses the target tree ONCE, and re-runs each design's own gate
+    (:func:`intent_drift`) against that fresh parse. The surface is intent, the
+    code is truth; a design that turns up in ``drifts`` is one the agent's edits
+    left unsatisfied — the "committed to a structural fix, then quietly wrote the
+    swallow anyway" miss, caught retrospectively.
+
+    No resolvable code root, or no settled design with a surface ⇒ an empty result
+    (nothing can drift) — the documented silent case. Parsing once and threading
+    ``mods`` into every gate keeps a turn-end scan O(one parse), not O(designs).
+    The scan is read-only: it never mutates a design or its status (an
+    implementation outcome is not a re-verdict on the design's quality)."""
+    dkb = dkb or get_dkb()
+    rp = _resolve_code_root(root)
+    if rp is None:
+        return ConformanceResult()  # no code to compare the intent against
+    designs = dkb.list_designs(ctx, status=status, limit=limit)
+    surfaced = [
+        d for d in designs
+        if not SurfaceManifest.from_dict(d.meta.get("surface")).is_empty()
+    ]
+    if not surfaced:
+        return ConformanceResult()  # nothing declared a surface ⇒ nothing to gate
+    mods = refs.parse_project(rp)
+    result = ConformanceResult(designs_checked=len(surfaced))
+    for d in surfaced:
+        findings = intent_drift(d, root=rp, mods=mods)
+        if findings:
+            result.drifts.append(
+                ConformanceDrift(
+                    design_id=d.id, summary=d.summary or d.ask, findings=findings
+                )
+            )
+    return result
 
 
 def format_design(design: Design) -> str:

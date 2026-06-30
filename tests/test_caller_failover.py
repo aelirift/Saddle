@@ -23,8 +23,10 @@ from saddle import supervise
 from saddle.llm.callers import (
     FallbackCaller,
     MiniMaxCaller,
+    _call_with_provider_deadline,
     _count_thinking_chunks,
     _is_retryable_status,
+    _provider_gate,
     _retry_same_provider,
 )
 from saddle.llm.claude_agent import ClaudeAgentUnavailable
@@ -438,3 +440,133 @@ def test_circuit_breaker_disabled_with_zero_threshold_retries_every_call():
         assert asyncio.run(fc("s", "p")) == "ok"
     # threshold 0 disables the breaker — the lead is re-tried on every call.
     assert down.calls == 5
+
+
+# --- Per-provider concurrency gate + the silent-hang cure ---------------------
+# The supervisory chain (FallbackCaller) does NOT go through the LLMPool, so its
+# per-provider _DynamicLimiter never caps it. audit/run.py fans out asyncio.gather
+# over every target sharing ONE FallbackCaller, so on fail-over N targets can hit
+# ONE provider at once — the burst that maxes the rate-limit-prone Opus CLI
+# ("3 calls will max it out ... run 2 at a time"). _call_with_provider_deadline
+# now gates each provider attempt by the provider's tested concurrent_request_cap.
+# These pin: the cap is enforced, the burst still COMPLETES (queued not dropped),
+# no cross-provider slot is double-booked on fail-over, and — the real cure — a
+# SILENT hang becomes a deadline -> fail-over within budget.
+
+class _RecordingProvider:
+    """Records peak concurrent in-flight; configurable cap + behavior.
+
+    behavior: "ok" returns after work_s; "hang" sleeps effectively forever with
+    NO exception (the exact claude-CLI-on-overload failure mode)."""
+
+    def __init__(self, cap, name, behavior="ok", work_s=0.02):
+        self.concurrent_request_cap = cap
+        self.name = name
+        self.behavior = behavior
+        self.work_s = work_s
+        self.in_flight = 0
+        self.peak = 0
+        self.calls = 0
+
+    async def __call__(self, system, prompt, *, json_mode=False, label=""):
+        self.calls += 1
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        try:
+            if self.behavior == "hang":
+                await asyncio.sleep(3600)
+            await asyncio.sleep(self.work_s)
+            return f"{self.name}:ok"
+        finally:
+            self.in_flight -= 1
+
+
+def test_provider_gate_caps_in_flight_at_cap_yet_runs_every_call(monkeypatch):
+    # An 8-wide burst against a cap-2 provider must never exceed 2 in-flight, AND
+    # all 8 must still complete — excess calls QUEUE (await the slot), never drop.
+    monkeypatch.setenv("RAYXI_LLM_PROVIDER_DEADLINE_SECONDS", "5")
+    p = _RecordingProvider(cap=2, name="claude")
+
+    async def _burst():
+        await asyncio.gather(*(
+            _call_with_provider_deadline(p, "s", "h", json_mode=False, label="t")
+            for _ in range(8)
+        ))
+
+    asyncio.run(_burst())
+    assert p.peak == 2, f"gate must cap in-flight at the cap, saw peak={p.peak}"
+    assert p.calls == 8, "every queued call must still run (none dropped)"
+
+
+def test_provider_gate_is_none_when_no_positive_cap_declared():
+    # A caller without concurrent_request_cap (legacy/stub) degrades to UNBOUNDED
+    # rather than crashing — same graceful contract as llm_pool._get_cap.
+    class _NoCap:
+        async def __call__(self, *a, **k):
+            return "x"
+
+    class _ZeroCap:
+        concurrent_request_cap = 0
+        async def __call__(self, *a, **k):
+            return "x"
+
+    async def _check():
+        return _provider_gate(_NoCap()), _provider_gate(_ZeroCap())
+
+    g_none, g_zero = asyncio.run(_check())
+    assert g_none is None and g_zero is None
+
+
+def test_provider_gate_does_not_double_book_across_failover(monkeypatch):
+    # The gate is per-PROVIDER-ATTEMPT, not per FallbackCaller.__call__. A lead
+    # that hangs (holding its OWN slot until the deadline) must NOT also hold the
+    # backup's slot: the backup must run at its own full cap. Here lead cap=1; a
+    # 3-wide burst would deadlock the backup IF the lead's gate leaked across the
+    # fail-over hop. It doesn't — the lead slot releases on deadline before the
+    # backup slot is acquired, so all 3 complete on the backup.
+    monkeypatch.setenv("RAYXI_LLM_PROVIDER_DEADLINE_SECONDS", "0.3")
+    lead = _RecordingProvider(cap=1, name="claude", behavior="hang")
+    backup = _RecordingProvider(cap=36, name="minimax")
+    fc = FallbackCaller([lead, backup], failure_threshold=0)
+
+    async def _burst():
+        return await asyncio.gather(*(
+            fc("s", "h", json_mode=False, label="t") for _ in range(3)
+        ))
+
+    res = asyncio.run(_burst())
+    assert all(r == "minimax:ok" for r in res), f"all must complete on backup: {res}"
+    assert lead.peak <= 1, f"lead gate breached: peak={lead.peak}"
+    assert backup.calls == 3, "backup must serve all three despite lead's held slots"
+
+
+def test_provider_deadline_turns_silent_hang_into_failover(monkeypatch):
+    # THE cure (separate from the gate): a lead that SILENTLY HANGS — no
+    # exception, no tokens — must not wedge the run. The per-provider deadline
+    # raises asyncio.TimeoutError -> categorized "timeout" -> FallbackCaller
+    # routes to the backup, all within the deadline. This is the regression that
+    # left the converge run hung with minimax never tried.
+    monkeypatch.setenv("RAYXI_LLM_PROVIDER_DEADLINE_SECONDS", "0.3")
+    lead = _RecordingProvider(cap=2, name="claude", behavior="hang")
+    backup = _RecordingProvider(cap=36, name="minimax")
+    fc = FallbackCaller([lead, backup], failure_threshold=0)
+
+    t0 = time.monotonic()
+    out = asyncio.run(fc("s", "h", json_mode=False, label="t"))
+    dt = time.monotonic() - t0
+
+    assert out == "minimax:ok", "a silent hang must fail over to the backup"
+    assert dt < 1.0, f"failover must happen within the deadline, took {dt:.2f}s"
+    assert lead.calls == 1 and backup.calls == 1
+
+
+def test_provider_deadline_zero_disables_the_clock(monkeypatch):
+    # Explicit opt-out: RAYXI_LLM_PROVIDER_DEADLINE_SECONDS=0 awaits unbounded
+    # (no asyncio.wait_for wrap). A fast call still returns normally — proving 0
+    # is read as "disabled", not coerced back to the 20s default by _env_float.
+    monkeypatch.setenv("RAYXI_LLM_PROVIDER_DEADLINE_SECONDS", "0")
+    p = _RecordingProvider(cap=4, name="claude")
+    out = asyncio.run(
+        _call_with_provider_deadline(p, "s", "h", json_mode=False, label="t")
+    )
+    assert out == "claude:ok"

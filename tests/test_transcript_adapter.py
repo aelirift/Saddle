@@ -9,7 +9,12 @@ import json
 from saddle.context import Context
 from saddle.dialog import IntentTracker
 from saddle.dialog_store import InMemoryForkStore
-from saddle.transcript import parse_transcript_line, read_transcript, replay
+from saddle.transcript import (
+    latest_turn,
+    parse_transcript_line,
+    read_transcript,
+    replay,
+)
 
 
 def _asst(text="", thinking="", *, session="s1", uuid="", sidechain=False):
@@ -198,3 +203,71 @@ def test_replay_surfaces_ambiguous_bare_label_as_must_confirm(tmp_path):
     assert len(res.surfaced) == 1
     c = res.confirms[0]
     assert not c.is_drift and c.announce
+
+
+# === latest_turn — the pre-code design gate's transcript view ============
+
+def test_latest_turn_lifts_goal_approach_and_anchor(tmp_path):
+    objs = [
+        _user("fix the cache bug", uuid="u1"),
+        _asst(text="The root cause is an unbounded map.",
+              thinking="secret messy reasoning", uuid="u2"),
+        _asst(text="I'll bound it with an LRU and evict.", uuid="u3"),
+    ]
+    p = _write(tmp_path, objs)
+    turn = latest_turn(p)
+    assert turn.goal == "fix the cache bug"
+    assert turn.anchor == "u1"
+    assert "root cause is an unbounded map" in turn.approach
+    assert "bound it with an LRU" in turn.approach
+    assert "secret" not in turn.approach        # thinking is NOT the recorded design
+
+
+def test_latest_turn_uses_only_the_last_turns_prose(tmp_path):
+    """Each user prompt opens a new turn, resetting the approach — the gate audits
+    THIS turn's plan, not prose carried over from an earlier ask."""
+    objs = [
+        _user("first ask", uuid="u1"),
+        _asst(text="approach for the first ask", uuid="u2"),
+        _user("second ask", uuid="u3"),
+        _asst(text="approach for the second ask", uuid="u4"),
+    ]
+    p = _write(tmp_path, objs)
+    turn = latest_turn(p)
+    assert turn.goal == "second ask" and turn.anchor == "u3"
+    assert turn.approach == "approach for the second ask"
+    assert "first ask" not in turn.approach
+
+
+def test_latest_turn_empty_approach_when_agent_jumps_to_edit(tmp_path):
+    """A user prompt with NO spoken approach before the edit -> empty approach but a
+    real anchor; the 'no recorded design' finding is the hook's to make from this."""
+    p = _write(tmp_path, [_user("just do it", uuid="u1")])
+    turn = latest_turn(p)
+    assert turn.goal == "just do it" and turn.anchor == "u1"
+    assert turn.approach == ""
+
+
+def test_latest_turn_no_user_turn_has_empty_anchor(tmp_path):
+    p = _write(tmp_path, [_asst(text="musing with no prompt", uuid="u1")])
+    turn = latest_turn(p)
+    assert turn.anchor == "" and turn.goal == ""
+
+
+def test_latest_turn_missing_transcript_is_empty(tmp_path):
+    turn = latest_turn(tmp_path / "nope.jsonl")
+    assert turn.anchor == "" and turn.approach == ""
+
+
+def test_latest_turn_ignores_tool_results_and_sidechains(tmp_path):
+    objs = [
+        _user("the ask", uuid="u1"),
+        _tool_result(uuid="u2"),                                   # not the user
+        _asst(text="real approach", uuid="u3"),
+        _asst(text="sidechain noise", uuid="u4", sidechain=True),  # sub-agent, skipped
+    ]
+    p = _write(tmp_path, objs)
+    turn = latest_turn(p)
+    assert turn.goal == "the ask" and turn.anchor == "u1"
+    assert turn.approach == "real approach"
+    assert "sidechain" not in turn.approach

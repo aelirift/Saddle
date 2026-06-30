@@ -27,9 +27,12 @@ def _v(action: Action) -> Verdict:
 
 # --- scope fence (stay-in-project-focus) -----------------------------------
 
-def test_blocks_edit_outside_focus():
+def test_warns_edit_outside_focus():
+    # Option A: a cross-project EDIT is ALLOWED but WARNED (not blocked) — it
+    # surfaces loudly, it does not hard-gate a file edit.
     v = _v(Action("edit", "/work/sibling/src/x.py", "path", project_root=ROOT))
-    assert not v.allowed
+    assert v.allowed
+    assert v.severity == "warn"
     assert v.rule_id == "stay-in-project-focus"
     assert "cross_project_task" in v.required_evidence
 
@@ -54,11 +57,23 @@ def test_allows_cross_project_with_explicit_evidence():
     assert v.allowed
 
 
-def test_scope_fence_fires_for_every_mutating_verb():
-    for verb in ("edit", "write", "create", "delete", "rm", "patch", "overwrite"):
+def test_scope_fence_warns_every_cross_project_edit_verb():
+    # every edit/write/create spelling outside focus WARNS (allowed, surfaced).
+    for verb in ("edit", "write", "create", "patch", "overwrite", "modify"):
+        v = _v(Action(verb, "/work/sibling/x.py", "path", project_root=ROOT))
+        assert v.allowed, verb
+        assert v.severity == "warn", verb
+        assert v.rule_id == "stay-in-project-focus", verb
+
+
+def test_scope_fence_blocks_every_cross_project_delete_verb():
+    # every delete spelling outside focus stays a HARD BLOCK — file removal in a
+    # sibling repo is never downgraded to a warning.
+    for verb in ("delete", "rm", "unlink", "purge", "remove"):
         v = _v(Action(verb, "/work/sibling/x.py", "path", project_root=ROOT))
         assert not v.allowed, verb
-        assert v.rule_id == "stay-in-project-focus", verb
+        assert v.rule_id == "no-cross-project-delete", verb
+        assert "cross_project_task" in v.required_evidence, verb
 
 
 # --- no-unwired-delete + disposition-coherent ------------------------------
@@ -118,10 +133,11 @@ def test_allows_delete_domain_excluded():
 
 
 def test_cross_project_delete_blocks_on_scope_first():
-    # first-block-wins, and the scope fence is listed before the delete rule
+    # first-block-wins: the cross-project DELETE fence is listed before the
+    # in-focus disposition rule, so an out-of-focus code delete blocks on scope.
     v = _v(Action("delete", "/work/sibling/x.py", "code", project_root=ROOT))
     assert not v.allowed
-    assert v.rule_id == "stay-in-project-focus"
+    assert v.rule_id == "no-cross-project-delete"
 
 
 # --- verb normalisation + non-mutating verbs -------------------------------

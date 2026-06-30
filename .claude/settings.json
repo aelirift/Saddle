@@ -13,6 +13,22 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHONPATH=${CLAUDE_PROJECT_DIR}/src python3 -m saddle.stop_hook"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "additionalDirectories": [
+      "/home/aeli/projects/rayxiv4",
+      "/home/aeli/projects/MCP_backpack"
     ]
   }
 }

@@ -22,14 +22,28 @@ Two latency classes, handled deliberately:
   the live commitment (the "picked a) then did b)" drift). Then bind THIS prompt
   if it's a pick, and read back the standing commitment. No LLM, milliseconds —
   so drift is surfaced immediately and never blocks the turn.
-* **Slow / LLM — substantive prompts only, bounded, fail-open.** Run Layer 1
+* **Slow / LLM — substantive prompts only, bounded, fail-LOUD.** Run Layer 1
   :func:`saddle.intake.decompose` (itemize -> coverage-audit -> focus-scope) and
   render the typed know/do list plus any out-of-focus scope warning. A bare
   continuation ("go", "proceed", "a then b") has no braided asks to untangle, so
   it skips the LLM and gets only the fast surface — the iteration loop stays
-  instant instead of paying ~20s per "proceed". Itemization is bounded by a
-  timeout and fails OPEN: a slow or failed call degrades to the fast surface, it
-  never wedges the prompt.
+  instant instead of paying ~20s per "proceed". Itemization is the supervisory
+  **intake stage** (Stage 1), driven through :func:`saddle.supervisor.run_stage`
+  under a deadline: a slow or failed call no longer degrades to a swallowed
+  "(unavailable)" string — that silent fail-open is exactly what
+  ``knowledge_seed_fail_loud`` forbids. Instead the failure is CLASSIFIED
+  (wall-clock vs provider outage vs oversized-input contract gap) and surfaced as
+  a LOUD ALERT naming what saddle did NOT verify this turn, in both the durable
+  bubble and the agent's ``additionalContext`` — so the human AND the agent learn
+  supervision was incomplete. It still never *blocks* the turn (observation, not
+  enforcement); it just refuses to pretend it ran. A SECOND bounded, fail-loud LLM
+  check rides the same path — the **intent stage** (Stage 2) project/design/history
+  axis (:func:`saddle.intent.history_drift`): it retrieves the project's settled
+  designs + closed decisions from the DKB and flags a prompt that contradicts one,
+  re-opens a closed decision, or creeps past the focus. Same discipline — a clean
+  compare is silent, a divergence bubbles (ALERT for a hard contradiction, NOTICE
+  for scope-creep), a failed check is a classified ALERT, never a swallowed pass —
+  and a brand-new project with nothing settled skips the LLM call entirely.
 
 Isolation: the (tenant, project) this hook speaks for is fixed by
 ``SADDLE_TENANT`` / ``SADDLE_PROJECT`` and the code root by ``SADDLE_CODE_ROOT``,
@@ -47,19 +61,30 @@ Knobs (env, all optional):
 * ``SADDLE_HOOK_ITEMIZE``        "0" disables the LLM itemize (fast-only mode); default on.
 * ``SADDLE_HOOK_INTAKE_TIMEOUT`` seconds ceiling on decompose; default 150.
 * ``SADDLE_HOOK_MAX_AUDITS``     coverage-audit passes in the hook path; default 1.
+* ``SADDLE_HOOK_INTENT``         "0" disables the LLM project/design/history check; default on.
+* ``SADDLE_HOOK_INTENT_TIMEOUT`` seconds ceiling on the history check; default 60.
 * ``SADDLE_HOOK_MIN_WORDS``      below this word count a prompt is a trivial
-                                 continuation (skip itemize); default 4.
+                                 continuation (skip the LLM checks); default 4.
 
 Protocol: emits the ``UserPromptSubmit`` ``additionalContext`` decision JSON on
-stdout (injected into the agent's context) and a human-readable copy on stderr
-(shown on screen); **exit 0 always, never exit 2** — this hook observes, it does
-not block (blocking is the doctrine hook's job). Fails OPEN on any error: a hook
-crash must never wedge the agent, but it says so loudly on stderr.
+stdout (injected into the agent's context — the COMBINED agent channel over every
+stage's sections) and a human-readable copy on stderr (shown on screen in an
+interactive TTY). The durable copy to the client-agnostic bubble outbox
+(:mod:`saddle.bubble`) is emitted PER-STAGE by :func:`saddle.supervisor.run_stage`
+— because under an SDK / service host stderr is swallowed, so the outbox is the
+only channel an AFK or non-TTY human can still read saddle's voice from, and a
+per-stage bubble lets a stage failure be its OWN alert instead of buried in a
+batch. **Exit 0 always, never exit 2** — this hook observes, it does not block
+(blocking is the doctrine hook's job). Two failure regimes, deliberately
+different: a HOOK-LEVEL infra error (unparseable payload, ctx resolution) fails
+**open** — exit 0, a stderr log, no false verdict — because saddle cannot speak
+for a turn it never parsed; but a STAGE that cannot run fails **loud** — a
+classified ALERT bubble naming what saddle did NOT verify — because there the
+turn IS understood and a swallowed check would be a silent fail-open.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import sys
@@ -69,7 +94,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # pragma: no cover
     from saddle.context import Context
     from saddle.dialog import IntentTracker
-    from saddle.models import Binding, DriftVerdict
+    from saddle.models import Binding, DriftVerdict, Fork
+    from saddle.supervisor import StageOutcome
 
 # Cap how many surfaced drift/confirm lines the bubble-up shows. A first wire-up
 # against a long existing transcript can surface a backlog; the ledger keeps all
@@ -79,17 +105,36 @@ _MAX_SURFACED = 6
 
 # -- emit --------------------------------------------------------------------
 
-def _emit(ctx_key: str, sections: list[str]) -> None:
-    """Print the bubble-up: ``additionalContext`` JSON on stdout (the agent's
-    context channel) and a human-readable copy on stderr (the on-screen view)."""
-    body = f"━━ saddle [{ctx_key}] ━━\n" + "\n\n".join(sections)
-    print(json.dumps({
-        "hookSpecificOutput": {
+def _emit_context(ctx: "Context", sections: list[str], *, system_msg: str = "") -> None:
+    """Emit saddle's voice on all THREE channels for the turn:
+
+    * ``additionalContext`` JSON on stdout — the MODEL reads every stage's sections
+      once (the combined agent channel);
+    * ``systemMessage`` on the same stdout JSON — the ONE channel Claude Code
+      renders to the watching HUMAN, so saddle is no longer invisible on screen
+      under a non-TTY / SDK host (the "I don't see any outputs" gap);
+    * a human-readable copy on stderr — the on-screen view in an interactive TTY.
+
+    The DURABLE per-stage bubbles already went out via
+    :func:`saddle.supervisor.run_stage`; this is the agent's single read + the
+    human heralds. Empty sections AND an empty ``system_msg`` render to nothing, so
+    a silent turn stays silent on stdout."""
+    from saddle.supervisor import render_sections
+
+    body = render_sections(ctx, sections)
+    if not body and not system_msg:
+        return
+    out: dict = {}
+    if body:
+        out["hookSpecificOutput"] = {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": body,
         }
-    }))
-    print(body, file=sys.stderr)
+    if system_msg:
+        out["systemMessage"] = system_msg
+    print(json.dumps(out))
+    if body:
+        print(body, file=sys.stderr)
 
 
 # -- per-session replay cursor (idempotent transcript tailing) ---------------
@@ -138,12 +183,47 @@ def _render_verdict(v: "DriftVerdict") -> str:
     return f"⚠ MUST CONFIRM — {v.reason}"
 
 
-def _render_binding(b: "Binding") -> str:
+def _clip(text: str, limit: int = 160) -> str:
+    """One-line, length-bounded view of possibly-long fork prose: collapse
+    whitespace so multi-line option text stays a single readout line, and cap the
+    length so a verbose proposal can't flood the agent's context (a real risk — a
+    fork's prompt/option text can run to a full paragraph)."""
+    s = " ".join((text or "").split())
+    return s if len(s) <= limit else s[: limit - 1] + "…"
+
+
+def _render_binding(b: "Binding", fork: "Fork | None" = None) -> str:
+    """The carry-forward readout for the agent channel.
+
+    NOT a reminder that a decision happened ("the user said a)") — that nags
+    without helping. Instead it restates WHAT the chosen option actually was, as a
+    directive the agent can act on: the proposal it answered, the substance of the
+    committed option foregrounded as the thing to do now, the unchosen options
+    demoted to a drift-guard aside, and the qualified choice-id last as a citation
+    hint. The fork row is saddle's durable store, so this survives a context-window
+    wipe; rendering is the only gap, and this closes it."""
     choice = b.choice_id or b.label or "?"
-    return (
-        f"standing commitment: {choice} — {b.user_text!r} "
-        f"(via {b.method}, confidence {b.confidence:.2f})"
-    )
+    label = b.label or (choice.rsplit(".", 1)[-1] if "." in choice else choice)
+    lead = "↳ carry-forward context (already decided — act on it, don't re-ask):"
+    if fork is None or not fork.options:
+        tail = f" — {_clip(b.user_text)!r}" if b.user_text else ""
+        return f"{lead} the user chose {choice}{tail}"
+    chosen = next((o for o in fork.options if b.label and o.label == b.label), None)
+    lines = [lead]
+    if fork.prompt:
+        lines.append(f"  on your proposal {_clip(fork.prompt)!r}, the user chose {label}):")
+    else:
+        lines.append(f"  the user chose {label}):")
+    if chosen is not None:
+        lines.append(f"  → {_clip(chosen.text)}   ← this is what to do now")
+    else:
+        lines.append(f"  → (chosen option {label} is not among the fork's options)")
+    others = [o for o in fork.options if o is not chosen]
+    if others:
+        alt = "; ".join(f"{o.label}) {_clip(o.text, 80)}" for o in others)
+        lines.append(f"  not chosen (so you don't drift to them): {alt}")
+    lines.append(f"  [ref {choice} — cite it when you act]")
+    return "\n".join(lines)
 
 
 # -- fast section: replay drift + catch the ledger up ------------------------
@@ -171,6 +251,25 @@ def _replay_section(
     return ["\n".join(lines)]
 
 
+def _replay_outcome(
+    ctx: "Context", tracker: "IntentTracker", transcript_path: str, session: str
+) -> "StageOutcome | None":
+    """Stage 2 (intent), pick-drift axis — the fast transcript replay as a
+    supervisory stage. Surfaced "committed a) then acted on b)" drift is always
+    correction-worthy, so a non-empty replay is an ALERT; nothing surfaced is a
+    silent clean run. Wrapping it in a stage (vs the old swallowed try/except)
+    means a replay that itself THROWS becomes a classified ALERT, not a lost log.
+
+    This is only the pick-drift axis; the cross-project axis (out-of-focus scope)
+    rides in the intake stage's ``format_intake`` today, and the
+    project/design/history axis is the gap Stage 2 proper (item 14) adds here."""
+    from saddle.models import BUBBLE_ALERT
+    from saddle.supervisor import StageOutcome
+
+    lines = _replay_section(ctx, tracker, transcript_path, session)
+    return StageOutcome(sections=lines, level=BUBBLE_ALERT) if lines else None
+
+
 # -- slow section: the itemized know/do list ---------------------------------
 
 def _is_trivial(prompt: str) -> bool:
@@ -195,21 +294,63 @@ async def _itemize(ctx: "Context", prompt: str) -> str:
     return format_intake(intake)
 
 
-def _itemize_section(ctx: "Context", prompt: str) -> list[str]:
-    """The LLM know/do list — substantive prompts only, bounded, fail-open."""
+def _itemize_outcome(ctx: "Context", prompt: str) -> "StageOutcome | None":
+    """Stage 1 (intake) — the itemized know/do list, fail LOUD.
+
+    Returns the rendered list as a NOTICE :class:`StageOutcome`, or ``None`` when
+    there is nothing to itemize (the LLM pass is disabled, or the prompt is a
+    trivial continuation with no braided asks). It does **not** catch the itemize
+    failure: a slow or failed ``decompose`` is the recurring drift-blind hang, so
+    it is driven under a deadline by :func:`saddle.supervisor.run_bounded` and
+    allowed to PROPAGATE to :func:`run_stage`, which classifies it (a wall-clock
+    :class:`~saddle.supervise.DeadlineExceeded`, a provider outage, or an
+    oversized-input contract gap) and bubbles a LOUD ALERT naming what saddle did
+    NOT verify. That replaces the old swallow-to-"(unavailable)" fail-open — the
+    silent degrade ``knowledge_seed_fail_loud`` forbids. A bounded RETRY is the
+    caller's policy for an external rate-limit alone (``knowledge_seed_blind_retry``);
+    every other failure surfaces its root cause here instead of being papered over."""
     if os.environ.get("SADDLE_HOOK_ITEMIZE", "1") == "0" or _is_trivial(prompt):
-        return []
+        return None
+    from saddle.supervisor import StageOutcome, run_bounded
+
     try:
         timeout = float(os.environ.get("SADDLE_HOOK_INTAKE_TIMEOUT", "150") or 150)
     except ValueError:
         timeout = 150.0
+    text = run_bounded(_itemize(ctx, prompt), seconds=timeout,
+                       what="the prompt decomposition")
+    return StageOutcome(sections=[text]) if text and text.strip() else None
+
+
+def _history_outcome(ctx: "Context", prompt: str) -> "StageOutcome | None":
+    """Stage 2 (intent), project/design/history axis — the gap the other two
+    intent axes don't cover. Does THIS prompt pull against what the project has
+    ALREADY settled: contradict a committed design, re-open a closed decision, or
+    creep past the stated focus? (The cross-project axis rides in the intake
+    stage's scope warning; the pick-drift axis is :func:`_replay_outcome`.)
+
+    Returns the divergence section(s) at the report's level — an ALERT for a hard
+    contradiction / re-opened decision, a NOTICE for scope-creep — or ``None`` when
+    the check is disabled, the prompt is a trivial continuation (no new intent to
+    weigh against the settled state), or nothing drifted. Like the itemize stage it
+    does **not** catch a failure: the single classify call runs under a deadline via
+    :func:`saddle.supervisor.run_bounded` and PROPAGATES to :func:`run_stage`, which
+    classifies and bubbles a LOUD ALERT naming what saddle did NOT verify — never a
+    swallowed "looked fine". A brand-new project with no settled state short-circuits
+    inside :func:`saddle.intent.history_drift` with no LLM call at all."""
+    if os.environ.get("SADDLE_HOOK_INTENT", "1") == "0" or _is_trivial(prompt):
+        return None
+    from saddle.intent import history_drift
+    from saddle.supervisor import StageOutcome, run_bounded
+
     try:
-        return [asyncio.run(asyncio.wait_for(_itemize(ctx, prompt), timeout))]
-    except (Exception, asyncio.TimeoutError) as exc:  # noqa: BLE001 — fail OPEN
-        # The itemize is the costly part; a slow/failed call degrades to the fast
-        # surface rather than wedging the prompt. The drift/commitment sections
-        # already ran, so saddle still spoke.
-        return [f"(saddle: itemization unavailable this turn — {exc!r})"]
+        timeout = float(os.environ.get("SADDLE_HOOK_INTENT_TIMEOUT", "60") or 60)
+    except ValueError:
+        timeout = 60.0
+    report = run_bounded(history_drift(prompt, ctx), seconds=timeout,
+                         what="the project/design/history check")
+    sections = report.sections()
+    return StageOutcome(sections=sections, level=report.level) if sections else None
 
 
 # -- entry point -------------------------------------------------------------
@@ -242,34 +383,74 @@ def main(argv: list[str] | None = None) -> int:
         print(f"intake_hook: import/ctx error ({exc!r}); allowing", file=sys.stderr)
         return 0
 
-    sections: list[str] = []
+    from saddle.models import STAGE_INTAKE, STAGE_INTENT
+    from saddle.supervisor import run_stage, system_message
 
-    # 1) fast: catch the ledger up + surface drift the agent committed since last.
-    try:
-        sections += _replay_section(ctx, tracker, transcript_path, session)
-    except Exception as exc:  # noqa: BLE001
-        print(f"intake_hook: replay error ({exc!r}); continuing", file=sys.stderr)
+    results = []
 
-    # 2) fast: bind THIS prompt if it's a pick, so the commitment surface below
-    #    reflects the choice the user just made (immediate, not a turn late).
+    # Stage 2 (intent), pick-drift axis — fast, deterministic: surface any
+    # "committed a) then acted on b)" drift the agent made since the last prompt.
+    # Through run_stage it gets its OWN bubble (an ALERT when drift surfaces) and
+    # the fail-classification the old swallowed try/except lacked — a replay that
+    # itself throws now becomes a loud classified ALERT, not a lost stderr line.
+    results.append(run_stage(
+        ctx, STAGE_INTENT,
+        lambda: _replay_outcome(ctx, tracker, transcript_path, session),
+        session=session, what="this prompt against the standing commitment",
+    ))
+
+    # Stage 2 (intent), project/design/history axis — the gap: does THIS prompt
+    # pull against a settled design / closed decision / the stated focus? Its OWN
+    # STAGE_INTENT bubble (ALERT for a hard contradiction, NOTICE for scope-creep),
+    # and a failed check (timeout / provider / malformed) is a classified ALERT,
+    # never a swallowed "looked fine". Skipped (silent) on a trivial continuation.
+    results.append(run_stage(
+        ctx, STAGE_INTENT,
+        lambda: _history_outcome(ctx, prompt),
+        session=session,
+        what="this prompt against the project's settled designs & decisions",
+    ))
+
+    # bind THIS prompt if it's a pick, so the commitment surface below reflects the
+    # choice the user just made (immediate, not a turn late). A pure state mutation
+    # with no section of its own; a failure here is logged, never a false verdict.
     try:
         tracker.observe_user_message(ctx, prompt, session=session)
     except Exception as exc:  # noqa: BLE001
         print(f"intake_hook: observe error ({exc!r}); continuing", file=sys.stderr)
 
-    # 3) slow: the itemized know/do list (+ scope warning), fail-open.
-    sections += _itemize_section(ctx, prompt)
+    # Stage 1 (intake) — the itemized know/do list (+ scope warning), fail LOUD.
+    # run_stage owns the discipline: a clean itemize is a NOTICE bubble; a slow /
+    # failed one is a CLASSIFIED ALERT naming what saddle did not verify — never
+    # the old silent degrade.
+    results.append(run_stage(
+        ctx, STAGE_INTAKE,
+        lambda: _itemize_outcome(ctx, prompt),
+        session=session, what="the prompt decomposition (itemize → scope)",
+    ))
 
-    # 4) fast: the standing commitment the agent must honor.
+    # the standing commitment the agent must honor — a dialog readout for the
+    # agent channel, not a fail-classified stage (it is a reminder, not drift).
+    commitment = ""
     try:
-        b = tracker.active_binding(ctx, session=session)
+        b, fork = tracker.committed_fork(ctx, session=session)
         if b is not None:
-            sections.append(_render_binding(b))
+            commitment = _render_binding(b, fork)
     except Exception as exc:  # noqa: BLE001
         print(f"intake_hook: commitment error ({exc!r}); continuing", file=sys.stderr)
 
-    if sections:
-        _emit(ctx.key, sections)
+    # Two channels, deliberately different audiences:
+    #  * agent-context (additionalContext): EVERY stage's sections + the standing
+    #    commitment — the model's single read, including the routine reminders.
+    #  * user-screen (systemMessage): ONLY what a stage SPOKE — drift caught, an
+    #    itemization, or a could-not-run ALERT — so a clean turn stays quiet on
+    #    screen but saddle is never invisible when it has something to say. The
+    #    commitment is an agent reminder, not a screen herald, so it is NOT passed.
+    sections = [s for r in results for s in r.sections]
+    if commitment:
+        sections.append(commitment)
+    sm = system_message(ctx, results)
+    _emit_context(ctx, sections, system_msg=sm)
     return 0
 
 

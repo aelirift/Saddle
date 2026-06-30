@@ -190,29 +190,32 @@ def test_hook_allows_granted_cross_project_edit(tmp_path, monkeypatch, capsys):
     assert "cross-project ALLOW" in out.err     # and it says so, loudly
 
 
-def test_hook_blocks_ungranted_sibling_even_with_a_grant(tmp_path, monkeypatch, capsys):
+def test_hook_warns_ungranted_sibling_edit_even_with_a_grant(tmp_path, monkeypatch, capsys):
     a, b, c = _projects(tmp_path)
     crossproject.grant([str(a), str(b)], tenant="*")   # grants A<->B, not C
     rc, out = _run_hook(
         {"tool_name": "Edit", "tool_input": {"file_path": str(c / "src/x.py")}},
         focus=a, monkeypatch=monkeypatch, capsys=capsys)
     assert rc == 0
-    assert json.loads(out.out)["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert out.out.strip() == ""                  # an EDIT is never denied now
+    # C is under no grant -> a genuine wander -> the loud ALERT surface, not a notice
+    assert "WARN out-of-focus" in out.err
 
 
-def test_hook_no_grant_blocks_sibling(tmp_path, monkeypatch, capsys):
+def test_hook_no_grant_warns_sibling_edit(tmp_path, monkeypatch, capsys):
     a, b, _ = _projects(tmp_path)
     rc, out = _run_hook(
         {"tool_name": "Edit", "tool_input": {"file_path": str(b / "src/x.py")}},
         focus=a, monkeypatch=monkeypatch, capsys=capsys)
     assert rc == 0
-    assert json.loads(out.out)["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert out.out.strip() == ""                  # an EDIT is never denied now
+    assert "WARN out-of-focus" in out.err         # no grant -> loud alert, never silent
 
 
 def test_hook_grant_does_not_override_code_delete(tmp_path, monkeypatch, capsys):
-    """A grant overrides ONLY the scope-fence. An in-focus code delete trips
-    ``no-unwired-delete``; even with a grant covering the focus, that block must
-    stand -- the hook consults grants only when rule_id is stay-in-project-focus."""
+    """A grant overrides ONLY the scope-fence rules (SCOPE_FENCE_RULE_IDS). An
+    in-focus code delete trips ``no-unwired-delete`` -- a non-scope code-safety
+    invariant -- so even with a grant covering the focus, that block must stand."""
     a, b, _ = _projects(tmp_path)
     crossproject.grant([str(a), str(b)], tenant="*")
     rc, out = _run_hook(

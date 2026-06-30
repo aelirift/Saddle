@@ -71,6 +71,7 @@ GLM all flow through the same categorizer.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -271,10 +272,27 @@ def categorize_retry(
     if exception is not None:
         exc_name = type(exception).__name__
         exc_str = str(exception).lower()
-        if exc_name in ("TimeoutError", "CancelledError"):
+        # isinstance, not an exact-name match: every TimeoutError SUBCLASS is the
+        # wall-clock class and must classify as timeout. saddle's own typed
+        # liveness errors (supervise.DeadlineExceeded / Stalled) and
+        # asyncio.TimeoutError all subclass TimeoutError but carry their own
+        # __name__, so an exact-name check let them fall through to "other" —
+        # exactly the supervisory-stage deadline we need categorized. CancelledError
+        # is BaseException (not a TimeoutError), so it stays an explicit name match.
+        if isinstance(exception, TimeoutError) or exc_name == "CancelledError":
             return "timeout"
         if "timeout" in exc_name.lower() or "timeout" in exc_str:
             return "timeout"
+        # A JSON parse failure that arrives as a RAISED exception (a staged
+        # call_json reply that wasn't valid JSON — diagnose / surface / index /
+        # harvest / intake still ride JSON) is the SAME contract gap as the
+        # call_structured loop's parse_error param: classify it identically so the
+        # surfacing layer gives the JSON-contract remedy, not an opaque "other".
+        # json.JSONDecodeError subclasses ValueError, so match by TYPE, never by
+        # message text. (The design-audit path no longer reaches here — it rides a
+        # line contract whose own _AuditParseError surfaces loudly as a stage ALERT.)
+        if isinstance(exception, json.JSONDecodeError):
+            return "parse_error"
         # Match text hints before falling through.
         for marker in _RATE_LIMIT_TEXT_HINTS:
             if marker in exc_str:

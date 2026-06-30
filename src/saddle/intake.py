@@ -22,6 +22,7 @@ can't starve another's.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -67,6 +68,11 @@ _SYSTEM_ITEMIZE = (
     "rule or preference, a piece of background, or a decision to make MUST "
     "become its own item. When in doubt, emit an item rather than drop it. "
     "Split compound asks — 'do X and also tell me Y' is two items.\n\n"
+    "The message may be preceded by a RELEVANT KNOWLEDGE block of facts already "
+    "established about this project (its identity, conventions, prior lessons). "
+    "Use it to interpret the message correctly — a term defined there means what "
+    "it says there — but do NOT itemize the background; decompose only the USER "
+    "MESSAGE.\n\n"
     "Classify each item's kind as exactly one of:\n"
     "- question: the user wants an answer or information back.\n"
     "- task: a concrete action to perform.\n"
@@ -160,7 +166,13 @@ def _norm(ask: str) -> str:
     return " ".join(ask.lower().split())
 
 
-def _itemize_prompt(prompt: str) -> str:
+def _itemize_prompt(prompt: str, grounding: str = "") -> str:
+    """The itemizer's user message, optionally prefixed with a bounded RELEVANT
+    KNOWLEDGE block (from :mod:`saddle.recall`) so the model interprets the prompt
+    against what the project already knows — e.g. that 'saddle' names THIS harness,
+    not some same-named external product."""
+    if grounding:
+        return f"{grounding}\n\nUSER MESSAGE:\n{prompt}"
     return f"USER MESSAGE:\n{prompt}"
 
 
@@ -258,6 +270,106 @@ async def _classify_scope(
     }
 
 
+# -- directive durability gate (closes design_issues Gap 4) ------------------
+#
+# A `directive` item is a candidate STANDING rule. But not every directive a user
+# states is durable: many are TASK-LOCAL instructions ("respond with only JSON",
+# "make THIS design game-agnostic", "limit THIS audit to X"). Persisting those as
+# standing policy pollutes every FUTURE task — they get enforced forever, out of
+# context (the live failure that buried saddle-self work under rayxiv4-audit
+# directives). This gate classifies durability so only genuinely-standing rules
+# are promoted; task-local ones still guide the current task but are never stored.
+
+_SYSTEM_DURABILITY = (
+    "You are the directive-durability gate of an assistant. You are given "
+    "candidate STANDING RULES — directive-type asks pulled from a user's message. "
+    "For each, decide whether it is a DURABLE standing rule or a TASK-LOCAL "
+    "instruction.\n"
+    "- standing: a preference, constraint, or principle the user wants honored on "
+    "EVERY FUTURE task, indefinitely — it is about HOW work should ALWAYS be done "
+    "('always fail loud', 'no band-aids', 'never delete code without classifying "
+    "it', 'prefer structural fixes over patches').\n"
+    "- task: an instruction tied to the CURRENT request — an output format for "
+    "this one answer, a constraint on this one artifact/design, one-off scope or "
+    "framing ('respond with only JSON', 'make THIS design game-agnostic', 'limit "
+    "THIS audit to drifts', 'slice THIS work'). It should guide the current task "
+    "but must NOT become a forever-rule.\n"
+    "When unsure, choose 'task'. Wrongly persisting a one-off instruction as a "
+    "standing rule pollutes every future task (it is enforced forever, out of "
+    "context) — far worse than declining to persist a borderline rule the user can "
+    "simply restate or add explicitly.\n\n"
+    "Respond with ONLY a JSON object: "
+    '{"verdicts": [{"index": <the item\'s number>, "durability": "standing" | '
+    '"task", "reason": "<short why>"}]}. '
+    "Include EVERY item exactly once."
+)
+
+
+def _durability_prompt(items: list[Item]) -> str:
+    lines = [f"{i + 1}. {it.ask}" for i, it in enumerate(items)]
+    listing = "\n".join(lines) if lines else "(none)"
+    return (
+        f"CANDIDATE STANDING RULES:\n{listing}\n\n"
+        "Classify each as a durable standing rule or a task-local instruction."
+    )
+
+
+async def classify_directive_durability(
+    caller: "LLMCaller", directive_items: list[Item], ctx: Context
+) -> dict[str, Any]:
+    """Split directive items into durable STANDING rules vs TASK-LOCAL instructions.
+
+    Returns ``{"standing": [Item], "task": [Item], "checked": bool}``. Only
+    ``standing`` items should be persisted to policy; ``task`` ones still ride with
+    the current request but are never stored. Fails SAFE toward Gap 4: an item the
+    model does not classify, and the whole set if the call fails, default to
+    ``task`` (NOT promoted), because the harm this gate exists to stop is
+    over-promotion — a real standing rule left un-persisted is recoverable (the
+    user restates or runs ``saddle directives --add``); a one-off persisted forever
+    is not, short of curation. Runs inside ``ctx``'s tenant fairness gate."""
+    items = [it for it in directive_items if it.ask.strip()]
+    if not items:
+        return {"standing": [], "task": [], "checked": True}
+
+    try:
+        async with tenant_gate(ctx):
+            raw = await _call_json(
+                caller, _SYSTEM_DURABILITY, _durability_prompt(items),
+                label="intake/directive-durability",
+            )
+    except Exception as exc:  # noqa: BLE001 — fail safe: promote nothing, surface why
+        _log.warning(
+            "directive-durability classify failed (%s); promoting no directives "
+            "this run (fail-safe against policy pollution)", exc,
+        )
+        return {"standing": [], "task": list(items), "checked": False}
+
+    verdicts = raw.get("verdicts")
+    standing_idx: set[int] = set()
+    classified: set[int] = set()
+    if isinstance(verdicts, list):
+        for v in verdicts:
+            if not isinstance(v, dict):
+                continue
+            try:
+                sub = int(v.get("index", 0)) - 1
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= sub < len(items)) or sub in classified:
+                continue
+            classified.add(sub)
+            if str(v.get("durability", "")).strip().lower() == "standing":
+                standing_idx.add(sub)
+    # Unclassified items default to task (conservative against pollution).
+    standing = [it for i, it in enumerate(items) if i in standing_idx]
+    task = [it for i, it in enumerate(items) if i not in standing_idx]
+    return {
+        "standing": standing,
+        "task": task,
+        "checked": len(classified) >= len(items),
+    }
+
+
 async def decompose(
     prompt: str,
     ctx: Context | None = None,
@@ -267,6 +379,7 @@ async def decompose(
     persist: bool = True,
     max_audits: int = 2,
     check_focus: bool = True,
+    ground: bool = True,
 ) -> Intake:
     """Decompose ``prompt`` into a recorded :class:`Intake` for ``ctx``.
 
@@ -280,6 +393,13 @@ async def decompose(
     whole decomposition runs inside ``ctx``'s tenant fairness gate. Persists to
     the store unless ``persist=False``. Pass ``caller`` to bypass provider
     resolution (tests); otherwise the context's default fallback chain is used.
+
+    ``ground`` (default on) grounds the itemizer in the project's memory: a
+    bounded :func:`saddle.recall.recall_block` is retrieved for ``prompt`` and
+    prefixed to the itemize call, so a term the project has already defined (its
+    own identity, a convention) is read correctly instead of guessed. It is
+    retrieval, not prepend — top-k and length-bounded (see :mod:`saddle.recall`)
+    — and best-effort: a down embed server or empty DKB simply yields no block.
     """
     text = (prompt or "").strip()
     if not text:
@@ -290,6 +410,14 @@ async def decompose(
         from saddle.llm.callers import build_callers
         caller = build_callers(ctx)["default"]
 
+    # Ground the itemizer in project memory (bounded, off the event loop). Done
+    # before the fairness gate: recall is a local retrieval, not a provider call,
+    # so it does not belong inside the tenant's LLM quota.
+    grounding = ""
+    if ground:
+        from saddle.recall import recall_block
+        grounding = await asyncio.to_thread(recall_block, ctx, text)
+
     audits_run = 0
     audit_complete = False
     # Focus gate result — populated below unless check_focus is off / no items.
@@ -298,7 +426,8 @@ async def decompose(
     }
     async with tenant_gate(ctx):
         first = await _call_json(
-            caller, _SYSTEM_ITEMIZE, _itemize_prompt(text), label="intake/itemize"
+            caller, _SYSTEM_ITEMIZE, _itemize_prompt(text, grounding),
+            label="intake/itemize",
         )
         summary = str(first.get("summary", "")).strip()
         items = _items_from_list(first.get("items"))

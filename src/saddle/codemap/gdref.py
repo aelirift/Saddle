@@ -206,21 +206,75 @@ def _code_lines(mod: GDModule):
         yield idx + 1, ln
 
 
+def _string_spans(line: str) -> list[tuple[int, int]]:
+    """Half-open ``[start, end)`` interiors of every CLOSED single-line string
+    literal on ``line`` (the text between the quotes, delimiters excluded), quote-
+    and escape-aware like :func:`_strip_inline_comment` and :func:`_paren_span`.
+
+    A field-access pattern whose match STARTS inside one of these spans is text
+    inside a string — a generated doc ``"description": "... primary_swing.damage ..."``
+    or an attribute-path string ``"auto_target.range_m"`` — never a real read, so the
+    caller rejects it. Only a string CLOSED on the same line yields a span: an
+    UNTERMINATED quote contributes nothing, leaving its tail treated as code, so a
+    real read after it is KEPT. That is the FP-safe bias — saddle never drops a
+    finding on a tokenizer guess (a missed real read is the cardinal sin; an extra
+    false positive is merely noise)."""
+    spans: list[tuple[int, int]] = []
+    quote: str | None = None
+    esc = False
+    start = 0
+    for i, ch in enumerate(line):
+        if quote:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == quote:
+                spans.append((start, i))
+                quote = None
+            continue
+        if ch in "\"'":
+            quote = ch
+            start = i + 1
+    return spans
+
+
+def _in_string(pos: int, spans: list[tuple[int, int]]) -> bool:
+    return any(s <= pos < e for s, e in spans)
+
+
 def field_reads(mod: GDModule, field: str) -> list[Ref]:
     """`x.get("field"...)` (always read), `x["field"]` / `x.field` when NOT
-    immediately assigned to."""
+    immediately assigned to.
+
+    Inline comments are stripped and any match that starts INSIDE a string literal
+    is rejected, so a field name merely MENTIONED in a comment or a generated doc /
+    attribute-path string (``"... primary_swing.damage ..."``, ``"auto_target.range_m"``)
+    is never miscounted as a real read. Those mentions are the regex adapter's
+    false-positive class — pyref is immune because it walks the AST, where a string
+    constant can't be confused with an attribute access — and unchecked they bury the
+    genuine un-resolved base reads under noise (the meta-failure saddle exists to
+    avoid). The legitimate forms all start in CODE (``.get(``, ``[``, a bare ``.``
+    outside quotes), so this only ever removes false positives, never a real read."""
     f = re.escape(field)
     get_re = re.compile(r'\.get\(\s*["\']%s["\']' % f)
     sub_re = re.compile(r'\[\s*["\']%s["\']\s*\]' % f)
     attr_re = re.compile(r"\.%s\b" % f)
     refs: list[Ref] = []
-    for lineno, ln in _code_lines(mod):
-        for _ in get_re.finditer(ln):
-            refs.append(_mk(mod, lineno, "get_read", field))
+    for lineno, raw in _code_lines(mod):
+        ln = _strip_inline_comment(raw)
+        spans = _string_spans(ln)
+        for m in get_re.finditer(ln):
+            if not _in_string(m.start(), spans):
+                refs.append(_mk(mod, lineno, "get_read", field))
         for m in sub_re.finditer(ln):
+            if _in_string(m.start(), spans):
+                continue
             if not _ASSIGN_AHEAD.match(ln[m.end():]):
                 refs.append(_mk(mod, lineno, "subscript_read", field))
         for m in attr_re.finditer(ln):
+            if _in_string(m.start(), spans):
+                continue
             # don't double-count the `.get(` head as an attr read of `get`
             if not _ASSIGN_AHEAD.match(ln[m.end():]):
                 refs.append(_mk(mod, lineno, "attr_read", field))
@@ -228,14 +282,20 @@ def field_reads(mod: GDModule, field: str) -> list[Ref]:
 
 
 def field_writes(mod: GDModule, field: str) -> list[Ref]:
+    """`x["field"] = ...` / `x.field = ...` (and the augmented forms). Inline
+    comments are stripped and in-string matches rejected for the same reason as
+    :func:`field_reads`: a ``"set foo.damage = 5"`` doc string is text, not a write.
+    The FP-safe bias holds — a real write is in code, so it is never dropped."""
     f = re.escape(field)
     sub_w = re.compile(r'\[\s*["\']%s["\']\s*\]\s*(?:=(?!=)|\+=|-=|\*=|/=)' % f)
     attr_w = re.compile(r"\.%s\b\s*(?:=(?!=)|\+=|-=|\*=|/=)" % f)
     refs: list[Ref] = []
-    for lineno, ln in _code_lines(mod):
-        if sub_w.search(ln):
+    for lineno, raw in _code_lines(mod):
+        ln = _strip_inline_comment(raw)
+        spans = _string_spans(ln)
+        if any(not _in_string(m.start(), spans) for m in sub_w.finditer(ln)):
             refs.append(_mk(mod, lineno, "subscript_write", field))
-        elif attr_w.search(ln):
+        elif any(not _in_string(m.start(), spans) for m in attr_w.finditer(ln)):
             refs.append(_mk(mod, lineno, "attr_write", field))
     return refs
 
@@ -319,6 +379,38 @@ _GD_IDENT = re.compile(r"[A-Za-z_]\w*")
 # handed to a consumer named after the method, so they are never the "covered"
 # callee. (`def = obj.call("resolve_def", aid, def)` must not mark `call` covered.)
 _GD_DISPATCH_METHODS = frozenset({"call", "call_deferred", "callv", "rpc", "rpc_id"})
+# A `return <expr>` line and a simple `[var] name[: T] [:]= <rhs>` binding — the two
+# statement shapes the return-polarity fixpoint reads (a function's own returns, and
+# the locals it binds from project calls). `:?=` accepts GDScript's inferred-type
+# `:=` alongside plain `=`; the `(?<!...)`-free form is safe because a return line
+# never matches the assign RE and an augmented/compare line (`+=`, `==`) fails the
+# bare `=` after the name (see _call_callee's callers, which reject non-call RHS).
+_GD_RETURN_RE = re.compile(r"^\s*return\s+(.+?)\s*$")
+_GD_ASSIGN_RE = re.compile(r"^\s*(?:var\s+)?(\w+)\s*(?::\s*[^=]+?)?\s*:?=\s*(.+?)\s*$")
+
+
+def _call_callee(expr: str) -> str | None:
+    """If ``expr`` is EXACTLY one direct call ``callee(...)`` spanning the WHOLE
+    expression — not a method/attribute call (``obj.callee(...)``) and not part of a
+    larger expression (``callee(...) + 1``, ``a if callee(...) else b``) — return
+    ``callee``; else None. The GDScript mirror of pyref's bare-``ast.Name``-func
+    guard: only an unambiguous top-level direct call carries a ``("call", fn)``
+    return-polarity atom, so a method name colliding with an unrelated top-level
+    wrapper cannot leak a polarity it does not have."""
+    s = expr.strip()
+    m = re.match(r"([A-Za-z_]\w*)\s*\(", s)
+    if not m:
+        return None
+    callee = m.group(1)
+    if callee in _GD_KEYWORDS:
+        return None
+    open_idx = m.end() - 1                       # index of the '(' (paren may follow ws)
+    span = _paren_span(s, open_idx)
+    if span is None:                             # unbalanced on this line -> no atom
+        return None
+    if s[open_idx + len(span) + 2:].strip():     # anything after the matching ')' -> compound
+        return None
+    return callee
 
 
 def resolved_arg_callees(mod: GDModule, resolvers: set[str]) -> set[str]:
@@ -352,11 +444,18 @@ def resolved_arg_callees(mod: GDModule, resolvers: set[str]) -> set[str]:
         r'(?:(?:%s)\s*\(|[\w.]+\.call\w*\(\s*["\'](?:%s)["\'])' % (res_alt, res_alt)
     )
 
+    # Group every code line under its enclosing func in ONE forward pass. The old
+    # form called mod.enclosing_func(lineno) per line, and that scans BACKWARD to
+    # line 0 each time — O(lines^2) per module, ~220s over a 237-file project. Only
+    # `func` lines move the boundary and they all survive _code_lines (a func is
+    # never a comment), so tracking the last-seen func forward is identical and O(n).
     per_func: dict[str | None, list[str]] = {}
+    cur_fn: str | None = None
     for lineno, ln in _code_lines(mod):
-        per_func.setdefault(mod.enclosing_func(lineno), []).append(
-            _strip_inline_comment(ln)
-        )
+        fm = _FUNC_RE.match(ln)
+        if fm:
+            cur_fn = fm.group(1)
+        per_func.setdefault(cur_fn, []).append(_strip_inline_comment(ln))
 
     out: set[str] = set()
     for codes in per_func.values():
@@ -381,6 +480,166 @@ def resolved_arg_callees(mod: GDModule, resolvers: set[str]) -> set[str]:
                 ):
                     out.add(callee)
     return out
+
+
+def _ordered_param_names(mod: GDModule, func_name: str) -> list[str]:
+    """Parameter names of ``func func_name`` IN ORDER (``_func_param_names`` returns
+    a set; the pass-down fixpoint needs positions). Empty list for a zero-param or
+    unparseable signature."""
+    parts = _func_params(mod, func_name)
+    if not parts:
+        return []
+    out: list[str] = []
+    for part in parts:
+        mm = re.match(r"\s*(\w+)", part)
+        out.append(mm.group(1) if mm else "")
+    return out
+
+
+def _passdown_atom(arg: str, res_call_re, base_call_re):
+    """Classify one call argument OR return expression for the pass-down fixpoint
+    (see codemap/passdown.Atom): an inline resolver call -> ``"R"``, an inline
+    base_source call -> ``"B"``, a bare identifier -> ``("n", name)``, a bare DIRECT
+    call to a project function -> ``("call", fn)`` (carries fn's RETURN polarity, so a
+    resolver-wrapper passes its resolved-ness through), anything else -> ``None``.
+    Resolver/base checks win first, so ``apply_ability_modifiers(...)`` is ``"R"``,
+    never ``("call", ...)``.
+
+    What this CANNOT see is the documented fail-OPEN residual: a base value laundered
+    through a cast/reassignment (``base = raw as Dictionary; return base``) reads as
+    neither ``"B"`` nor a base-local, so a wrapper that returns it on one path and a
+    resolved value on another is still blessed (existential-R, structural-B-veto).
+    That is the return-axis twin of the laundered-base *param* residual — recorded as
+    a known false-negative class, never papered over with a runtime assumption."""
+    if res_call_re.search(arg):
+        return "R"
+    if base_call_re is not None and base_call_re.search(arg):
+        return "B"
+    s = arg.strip()
+    if re.fullmatch(r"\w+", s):
+        return ("n", s)
+    callee = _call_callee(s)
+    if callee is not None:
+        return ("call", callee)
+    return None
+
+
+def passdown_facts(mod: GDModule, resolvers: set[str], base_sources=frozenset()):
+    """GDScript extractor for the interprocedural pass-down fixpoint — the
+    cross-module generalisation of :func:`resolved_arg_callees`. Returns a
+    :class:`saddle.codemap.passdown.ModuleFacts`: this module's function parameter
+    lists, its resolver-bound and base_source-bound locals per function, and every
+    outgoing call site with its positional arguments pre-classified as resolver /
+    base / bare-name / other. The fixpoint in ``passdown.py`` stitches these across
+    modules; this stays purely per-module and regex-derived, same fidelity trade as
+    the one-hop scan (line-scoped, balanced-paren args)."""
+    from .passdown import ModuleFacts
+
+    facts = ModuleFacts()
+    if not resolvers:
+        return facts
+    res_alt = "|".join(re.escape(r) for r in resolvers)
+    res_call_re = re.compile(
+        r'(?:(?:%s)\s*\(|\.call\w*\(\s*["\'](?:%s)["\'])' % (res_alt, res_alt)
+    )
+    assign_re = re.compile(
+        r'^\s*(?:var\s+)?(\w+)\s*(?::\s*[^=]+?)?\s*=\s*'
+        r'(?:(?:%s)\s*\(|[\w.]+\.call\w*\(\s*["\'](?:%s)["\'])' % (res_alt, res_alt)
+    )
+    base_call_re = base_assign_re = None
+    if base_sources:
+        base_alt = "|".join(re.escape(b) for b in base_sources)
+        base_call_re = re.compile(
+            r'(?:(?:%s)\s*\(|\.call\w*\(\s*["\'](?:%s)["\'])' % (base_alt, base_alt)
+        )
+        base_assign_re = re.compile(
+            r'^\s*(?:var\s+)?(\w+)\s*(?::\s*[^=]+?)?\s*=\s*'
+            r'(?:(?:%s)\s*\(|[\w.]+\.call\w*\(\s*["\'](?:%s)["\'])' % (base_alt, base_alt)
+        )
+
+    # Ordered parameter names for every function this module defines.
+    for name in symbols(mod)["funcs"].keys():
+        facts.params[name] = _ordered_param_names(mod, name)
+
+    # Group every code line under its enclosing func in ONE forward pass. The old
+    # form called mod.enclosing_func(lineno) per line, and that scans BACKWARD to
+    # line 0 each time — O(lines^2) per module, ~220s over a 237-file project. Only
+    # `func` lines move the boundary and they all survive _code_lines (a func is
+    # never a comment), so tracking the last-seen func forward is identical and O(n).
+    per_func: dict[str | None, list[str]] = {}
+    cur_fn: str | None = None
+    for lineno, ln in _code_lines(mod):
+        fm = _FUNC_RE.match(ln)
+        if fm:
+            cur_fn = fm.group(1)
+        per_func.setdefault(cur_fn, []).append(_strip_inline_comment(ln))
+
+    dyn_name_re = re.compile(r'\.call\w*\(\s*["\'](\w+)["\']')
+    for fn, codes in per_func.items():
+        resolved: set[str] = set()
+        based: set[str] = set()
+        called: dict[str, str] = {}   # local -> project callee it is bound from
+        rets: list = []               # one classified atom per `return <expr>`
+        for code in codes:
+            am = assign_re.match(code)
+            if am:
+                resolved.add(am.group(1))
+            bm = base_assign_re.match(code) if base_assign_re is not None else None
+            if bm:
+                based.add(bm.group(1))
+            # call_locals: a local bound from a bare PROJECT call (not a resolver/base
+            # binding, which the two branches above already claimed) carries that
+            # callee's return polarity -> `var d = wrap(id)` resolves if wrap is a
+            # resolver-wrapper. The fixpoint stitches d's polarity in passdown.py.
+            if am is None and bm is None:
+                gm = _GD_ASSIGN_RE.match(code)
+                if gm:
+                    callee = _call_callee(gm.group(2))
+                    if (callee is not None and callee not in resolvers
+                            and callee not in base_sources):
+                        called[gm.group(1)] = callee
+            # returns: classify this function's own return expressions so the fixpoint
+            # can decide whether IT is a resolver-wrapper (R-returning, not B-returning).
+            rm = _GD_RETURN_RE.match(code)
+            if rm:
+                rets.append(_passdown_atom(rm.group(1), res_call_re, base_call_re))
+        if resolved:
+            facts.resolved_locals[fn] = resolved
+        if based:
+            facts.base_locals[fn] = based
+        if called:
+            facts.call_locals[fn] = called
+        if rets:
+            facts.returns[fn] = rets
+        for code in codes:
+            if code.lstrip().startswith("func "):
+                continue  # the signature line is a definition, not a call
+            # direct + method calls: callee(args) / obj.callee(args)
+            for cm in list(_GD_DIRECT_CALL.finditer(code)) + list(
+                _GD_METHOD_CALL.finditer(code)
+            ):
+                callee = cm.group(1)
+                if (callee in resolvers or callee in _GD_KEYWORDS
+                        or callee in _GD_DISPATCH_METHODS):
+                    continue
+                span = _paren_span(code, cm.end() - 1)
+                if span is None:
+                    continue
+                args = [a for a in _split_top_level(span)] if span.strip() else []
+                atoms = [_passdown_atom(a, res_call_re, base_call_re) for a in args]
+                facts.sites.append((fn, callee, atoms))
+            # dynamic dispatch: obj.call("callee", args) — drop the method-name arg
+            for dm in dyn_name_re.finditer(code):
+                callee = dm.group(1)
+                oi = code.find("(", dm.start())
+                span = _paren_span(code, oi) if oi >= 0 else None
+                if span is None:
+                    continue
+                parts = [a for a in _split_top_level(span)] if span.strip() else []
+                args = parts[1:]
+                atoms = [_passdown_atom(a, res_call_re, base_call_re) for a in args]
+                facts.sites.append((fn, callee, atoms))
+    return facts
 
 
 def _carrier_alt(carrier: str) -> str:

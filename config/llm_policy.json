@@ -1,9 +1,24 @@
 {
   "keys_from": "/home/aeli/projects/rayxiv4/config/llm_config.json",
-  "priority": ["claude_agent", "minimax"],
+  "priority": [
+    "minimax",
+    "claude_agent"
+  ],
   "providers": {
-    "claude_agent": {"concurrent_request_cap": 4},
-    "minimax": {"concurrent_request_cap": 36}
+    "claude_agent": {
+      "concurrent_request_cap": 2
+    },
+    "minimax": {
+      "concurrent_request_cap": 36
+    }
   },
-  "pool": {"max_procs": 24, "mem_ceiling_pct": 80, "mem_resume_pct": 70}
+  "pool": {
+    "max_procs": 24,
+    "mem_ceiling_pct": 80,
+    "mem_resume_pct": 70
+  },
+  "directives": [
+    "Operating posture (user-ratified 2026-06): saddle is the safety layer, not a permission prompt. It must NOT block routine work. It hard-BLOCKS exactly two classes: (1) deleting files — a code delete without a coherent disposition, or ANY cross-project delete; and (2) intent-drift that the design review judges to be a real divergence. A cross-project EDIT/WRITE is ALLOWED and surfaced as a loud WARN (notice if a user grant covers it, alert if it is a genuine wander) — never hard-blocked. The supervisor runs with tool permissions bypassed; saddle is the backstop, so its blocks are reserved for deletes and intent-drift only.",
+    "AFK long-goal protocol (user-ratified 2026-06): when the user is away and the active goal is long, do NOT stop and wait at an intent-drift flag or a design fork. Proceed to OTHER items within the same goal, and DOCUMENT each as you go: (a) work completed on other goal items, (b) every design fork that needs the user to decide, (c) any other item awaiting user input. On the user next prompt, surface all of (a)/(b)/(c) as the first thing, so nothing pending is lost. Intent drift must be DISCUSSED with the user (confirm/correct via the dialog channel), and that discussion must name the specific SURFACES (SurfaceManifest sites — values/identities/boundaries/references/persistence/lifecycle/authority) the change drifts on, not just say drift in the abstract."
+  ]
 }

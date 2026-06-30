@@ -37,15 +37,40 @@ if TYPE_CHECKING:  # pragma: no cover
 _log = logging.getLogger("saddle.llm.claude_agent")
 
 
-# saddle's standard Agent-SDK model + effort. Opus 4.8 at xhigh effort.
+# saddle's standard Agent-SDK model. Opus 4.8 for both workload classes.
 # The local `claude` CLI's --effort accepts low/medium/high/xhigh/max; the
 # Python SDK's Literal type lags (lists only up to "max") but the transport
 # passes the string straight through to the CLI, and we build options from an
-# untyped kwargs dict, so "xhigh" rides through unflagged. Both are
+# untyped kwargs dict, so "xhigh" rides through unflagged. Model + effort are
 # overridable per-provider (providers.claude_agent.{model,effort}) or via the
 # SADDLE_AGENT_MODEL / SADDLE_AGENT_EFFORT env vars; empty falls back here.
 _DEFAULT_MODEL = "claude-opus-4-8"
-_DEFAULT_EFFORT = "xhigh"
+
+# TWO effort defaults, because saddle has two LLM workload classes with
+# DIFFERENT latency SLAs — conflating them under one "xhigh" is what made the
+# supervisory hooks time out:
+#
+#   * the CODER (ChatSession) runs a multi-turn, tool-using converge loop that
+#     legitimately takes minutes and wants the deepest reasoning pass -> xhigh.
+#     It is bounded by an IDLE heartbeat, not a wall-clock the human waits on.
+#   * the STRUCTURED/SUPERVISORY one-shot caller (ClaudeAgentCaller, max_turns=1)
+#     backs every Stage 1-5 drift check, which runs INLINE inside a Claude Code
+#     hook under a ~60s deadline (a PreToolUse/UserPromptSubmit hook BLOCKS the
+#     turn until it returns). Measured at xhigh, a one-shot design audit took
+#     40-54s — at/over that deadline — so the check intermittently raised
+#     DeadlineExceeded and bubbled "could not verify ... (timeout)" INSTEAD of
+#     actually catching drift: a coverage gap in the drift-checker itself, and a
+#     latency the watching human felt on every first edit of a turn. At "high"
+#     the same audit runs in ~10-12s with the SAME findings (measured: it still
+#     catches the swallow-and-log / fail-open band-aid), leaving budget for the
+#     minimax fallback and not stalling the turn.
+#
+# Raising the hook deadline instead would only paper over the latency (the
+# timeout-equivalent of bumping max_retries — see the every-retry-is-a-bug
+# seed); the root cause is a bounded inline drift-check inheriting the coder's
+# effort, so the fix lives here, at the caller's default.
+_DEFAULT_CODER_EFFORT = "xhigh"
+_DEFAULT_STRUCTURED_EFFORT = "high"
 
 
 def _env_model() -> str:
@@ -53,7 +78,18 @@ def _env_model() -> str:
 
 
 def _env_effort() -> str:
+    """Global effort override (``SADDLE_AGENT_EFFORT``) — wins for BOTH workload
+    classes when set, so an operator can pin everything to one effort. Empty
+    leaves each class on its own default (coder=xhigh, structured=high)."""
     return (os.environ.get("SADDLE_AGENT_EFFORT", "") or "").strip()
+
+
+def _env_structured_effort() -> str:
+    """Structured/supervisory-only effort override (``SADDLE_STRUCTURED_EFFORT``)
+    — tune the inline drift-check effort WITHOUT touching the coder's xhigh.
+    Takes precedence over the global ``SADDLE_AGENT_EFFORT`` for the one-shot
+    caller only."""
+    return (os.environ.get("SADDLE_STRUCTURED_EFFORT", "") or "").strip()
 
 
 def _env_float(name: str, default: float) -> float:
@@ -178,14 +214,20 @@ class ClaudeAgentCaller:
                 self.concurrent_request_cap = max(1, int(cap))
             except (TypeError, ValueError):
                 pass
-        # Resolve model + effort: explicit cfg > env var > saddle default
-        # (opus 4.8 / xhigh). Never empty — saddle pins the model rather than
-        # deferring to the CLI's configured default.
+        # Resolve model + effort. Model: explicit cfg > env > opus 4.8. Effort:
+        # explicit cfg > SADDLE_STRUCTURED_EFFORT > global SADDLE_AGENT_EFFORT >
+        # the STRUCTURED default ("high"). This is the one-shot supervisory
+        # caller — it runs inside the hook deadline, so it does NOT inherit the
+        # coder's xhigh (see the effort-defaults comment above). Never empty —
+        # saddle pins the model rather than deferring to the CLI's default.
         self._model: str = (
             self._cfg.get("model") or _env_model() or _DEFAULT_MODEL
         ).strip()
         self._effort: str = (
-            self._cfg.get("effort") or _env_effort() or _DEFAULT_EFFORT
+            self._cfg.get("effort")
+            or _env_structured_effort()
+            or _env_effort()
+            or _DEFAULT_STRUCTURED_EFFORT
         ).strip()
 
     def _options(
@@ -205,6 +247,18 @@ class ClaudeAgentCaller:
             kwargs["model"] = self._model
         if self._effort:
             kwargs["effort"] = self._effort
+        # Thinking OFF by default for this one-shot SUPERVISORY caller (operator
+        # directive 2026-06-27): its output is a drift VERDICT that saddle
+        # consumes as a result — the hidden reasoning trace only adds latency to
+        # a call that already runs inside a ~60s inline-hook deadline. Tested
+        # live: coexists with `effort` (no provider rejection, unlike DeepSeek).
+        # Override via providers.claude_agent.thinking (an enabled config to
+        # restore it); `"thinking": null` defers to the SDK default. The CODER
+        # (ChatSession._build_options) deliberately KEEPS thinking — it is
+        # heartbeat-bounded and its reasoning IS the code it emits.
+        thinking = self._cfg.get("thinking", {"type": "disabled"})
+        if thinking is not None:
+            kwargs["thinking"] = thinking
         if stderr_sink is not None:
             # Capture the `claude` CLI subprocess stderr. The SDK otherwise
             # drops it on a crash, leaving only the opaque "Check stderr
@@ -290,7 +344,11 @@ class ChatSession:
     ) -> None:
         self._system_prompt = system_prompt
         self._model = (model or _env_model() or _DEFAULT_MODEL).strip()
-        self._effort = (effort or _env_effort() or _DEFAULT_EFFORT).strip()
+        # The CODER: a multi-turn converge loop that wants the deepest pass and
+        # is bounded by an idle heartbeat, not a ~60s hook deadline — so it keeps
+        # xhigh (global SADDLE_AGENT_EFFORT still overrides), unlike the one-shot
+        # structured caller above.
+        self._effort = (effort or _env_effort() or _DEFAULT_CODER_EFFORT).strip()
         self._cwd = cwd
         self._permission_mode = permission_mode
         # Behave like Claude Code: honor the user's + project's settings,

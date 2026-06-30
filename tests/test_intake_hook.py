@@ -70,6 +70,14 @@ def _context(out) -> str:
     return json.loads(out.out)["hookSpecificOutput"]["additionalContext"]
 
 
+def _system_msg(out) -> str:
+    """The on-screen ``systemMessage`` saddle emitted (stdout JSON), or '' if it had
+    nothing screen-worthy to herald (the user-screen channel — ask #3)."""
+    if not out.out.strip():
+        return ""
+    return json.loads(out.out).get("systemMessage", "")
+
+
 # --- fail-open / no-op edges -----------------------------------------------
 
 def test_empty_stdin_is_silent(monkeypatch, capsys, tmp_path):
@@ -94,7 +102,12 @@ def test_blank_prompt_is_silent(monkeypatch, capsys, tmp_path):
     assert rc == 0 and out.out.strip() == ""
 
 
-def test_itemize_failure_degrades_not_blocks(monkeypatch, capsys, tmp_path):
+def test_itemize_failure_fails_loud_not_open(monkeypatch, capsys, tmp_path):
+    """Stage 1's whole point: a failed itemize is no longer swallowed to a quiet
+    "(unavailable)" degrade — it is CLASSIFIED and surfaced LOUD. The hook still
+    never blocks (rc 0 — observation, not enforcement), but the agent context now
+    names what saddle did NOT verify and the root-cause exception, AND a durable
+    ALERT bubble lands so an AFK / non-TTY human sees the gap."""
     async def boom(*a, **k):
         raise RuntimeError("llm down")
     monkeypatch.setattr("saddle.intake.decompose", boom)
@@ -102,8 +115,17 @@ def test_itemize_failure_degrades_not_blocks(monkeypatch, capsys, tmp_path):
         {"prompt": "audit the whole pipeline end to end please", "session_id": "s1"},
         monkeypatch, capsys, tmp_path,
     )
-    assert rc == 0                                  # never blocks
-    assert "itemization unavailable" in _context(out)
+    assert rc == 0                                  # observation never blocks
+    c = _context(out)
+    assert "could not run" in c                     # loud, not swallowed
+    assert "did NOT verify" in c                    # names the unverified subject
+    assert "RuntimeError" in c                      # the root cause is surfaced
+    assert "itemization unavailable" not in c       # the old fail-open string is gone
+    # the durable ALERT bubble landed under the intake stage (the AFK channel).
+    from saddle.bubble import recent_bubbles
+    from saddle.context import Context
+    alerts = recent_bubbles(Context(tenant="acme", project="game"), level="alert")
+    assert any(b.stage == "intake" and "could not run" in b.text for b in alerts)
 
 
 # --- the slow path: itemized know/do list + scope warning ------------------
@@ -140,13 +162,150 @@ def test_substantive_prompt_itemizes_and_surfaces_scope(monkeypatch, capsys, tmp
     assert "saddle [acme/game]" in ctx                        # spoken under the isolation key
 
 
-def test_trivial_prompt_skips_the_llm(monkeypatch, capsys, tmp_path):
-    async def boom(*a, **k):                                   # must NOT be reached
+def test_trivial_prompt_skips_both_llm_checks(monkeypatch, capsys, tmp_path):
+    """A bare continuation has no braided asks AND no new intent to weigh, so BOTH
+    LLM stages — the intake itemize (Stage 1) and the intent history axis (Stage 2)
+    — are skipped, and skipped is SILENT, not a failure. (run_stage would otherwise
+    CLASSIFY a wrongly-called engine into a loud ALERT and mask the regression, so
+    we assert NEITHER engine was reached via sentinels AND that the turn stayed
+    fully silent — no spurious section or bubble.)"""
+    reached = {"itemize": False, "history": False}
+    async def no_itemize(*a, **k):                             # must NOT be reached
+        reached["itemize"] = True
         raise AssertionError("decompose called for a trivial prompt")
-    monkeypatch.setattr("saddle.intake.decompose", boom)
+    async def no_history(*a, **k):                             # must NOT be reached
+        reached["history"] = True
+        raise AssertionError("history_drift called for a trivial prompt")
+    monkeypatch.setattr("saddle.intake.decompose", no_itemize)
+    monkeypatch.setattr("saddle.intent.history_drift", no_history)
     rc, out = _run_hook({"prompt": "proceed", "session_id": "s1"}, monkeypatch, capsys, tmp_path)
     assert rc == 0
-    assert "itemization unavailable" not in _context(out)      # it was skipped, not failed
+    assert reached == {"itemize": False, "history": False}     # neither engine reached
+    assert _context(out) == ""                                 # trivial turn is silent
+
+
+# --- Stage 2 history axis: this prompt vs the project's settled state -------
+
+def test_history_axis_surfaces_design_drift(monkeypatch, capsys, tmp_path):
+    """The genuine new intent axis wired into the hook: a prompt that contradicts
+    a settled design surfaces a hard divergence in the agent context AND as a
+    durable stage=intent ALERT. Itemize is disabled so only the history finding
+    shows — proving the history stage is what bubbled it."""
+    from saddle import intent
+    def history(*a, **k):                                      # async -> awaitable report
+        async def _r():
+            return intent.IntentReport(
+                divergences=[intent.IntentDivergence(
+                    kind=intent.CONTRADICTS_DESIGN,
+                    what="switches the cache to redis", ref="design_1")],
+                checked=True, considered=2,
+            )
+        return _r()
+    monkeypatch.setattr("saddle.intent.history_drift", history)
+    rc, out = _run_hook(
+        {"prompt": "rip out the LRU cache and switch to redis", "session_id": "s1"},
+        monkeypatch, capsys, tmp_path, env={"SADDLE_HOOK_ITEMIZE": "0"},
+    )
+    ctx = _context(out)
+    assert rc == 0
+    assert "CONTRADICTS A SETTLED DESIGN" in ctx               # the history finding rendered
+    assert "switches the cache to redis" in ctx
+    from saddle.bubble import recent_bubbles
+    from saddle.context import Context
+    alerts = recent_bubbles(Context(tenant="acme", project="game"), level="alert")
+    assert any(b.stage == "intent" and "CONTRADICTS" in b.text for b in alerts)
+
+
+def test_history_axis_failure_fails_loud(monkeypatch, capsys, tmp_path):
+    """A FAILED history check is not swallowed: like the intake stage it classifies
+    and bubbles a loud stage=intent ALERT naming what saddle did NOT verify, and the
+    hook still never blocks (rc 0 — observation, not enforcement)."""
+    async def boom(*a, **k):
+        raise RuntimeError("dkb down")
+    monkeypatch.setattr("saddle.intent.history_drift", boom)
+    rc, out = _run_hook(
+        {"prompt": "does this contradict the cache design we settled on?", "session_id": "s1"},
+        monkeypatch, capsys, tmp_path, env={"SADDLE_HOOK_ITEMIZE": "0"},
+    )
+    assert rc == 0
+    c = _context(out)
+    assert "could not run" in c and "did NOT verify" in c and "RuntimeError" in c
+    from saddle.bubble import recent_bubbles
+    from saddle.context import Context
+    alerts = recent_bubbles(Context(tenant="acme", project="game"), level="alert")
+    assert any(b.stage == "intent" and "could not run" in b.text for b in alerts)
+
+
+# --- the user-screen channel (ask #3: saddle visible on screen) -------------
+
+def test_itemization_heralds_on_screen(monkeypatch, capsys, tmp_path):
+    """ask #3 — a successful intake itemization is visible to the HUMAN on the
+    ``systemMessage`` channel (the one Claude Code renders on screen), not only
+    injected into the agent's ``additionalContext``. So the user SEES that saddle
+    read and decomposed the prompt."""
+    async def fake(prompt, ctx=None, **k):
+        return _fake_intake(prompt)
+    monkeypatch.setattr("saddle.intake.decompose", fake)
+    rc, out = _run_hook(
+        {"prompt": "fix the camera follow bug and build the matrix launcher", "session_id": "s1"},
+        monkeypatch, capsys, tmp_path,
+    )
+    assert rc == 0
+    sm = _system_msg(out)
+    assert "Fix the camera-follow bug" in sm
+    assert "saddle [acme/game]" in sm
+
+
+def test_itemize_failure_heralds_on_screen(monkeypatch, capsys, tmp_path):
+    """The cardinal case: a could-not-run intake stage heralds 'did NOT verify' to
+    the HUMAN on screen, not just to the agent — so an AFK/non-TTY user can never
+    miss that saddle's check was incomplete this turn."""
+    async def boom(*a, **k):
+        raise RuntimeError("llm down")
+    monkeypatch.setattr("saddle.intake.decompose", boom)
+    rc, out = _run_hook(
+        {"prompt": "audit the whole pipeline end to end please", "session_id": "s1"},
+        monkeypatch, capsys, tmp_path,
+    )
+    assert rc == 0
+    sm = _system_msg(out)
+    assert "could not run" in sm and "did NOT verify" in sm
+
+
+def test_replay_drift_heralds_on_screen(monkeypatch, capsys, tmp_path):
+    """A pick-drift caught from the transcript ('committed a) then acted on b)') —
+    saddle's signature catch — reaches the screen via systemMessage, not only the
+    agent's context."""
+    tp = _write_transcript(tmp_path, [
+        _user("let's decide the cache", uuid="u1"),
+        _asst(text=_FORK, uuid="u2"),
+        _user("a", uuid="u3"),
+        _asst(text="Going with option b — it's faster.", uuid="u4"),
+    ])
+    rc, out = _run_hook(
+        {"prompt": "what's the status?", "session_id": "s1", "transcript_path": str(tp)},
+        monkeypatch, capsys, tmp_path, env={"SADDLE_HOOK_ITEMIZE": "0"},
+    )
+    assert rc == 0
+    assert "DRIFT" in _system_msg(out) and "you committed" in _system_msg(out)
+
+
+def test_commitment_is_agent_only_not_an_on_screen_herald(monkeypatch, capsys, tmp_path):
+    """The standing commitment is an AGENT reminder, not a screen herald: when the
+    only thing to surface is the commitment (a clean pick, itemize off), the agent
+    sees it via additionalContext but the systemMessage stays empty — so the user's
+    screen isn't spammed every turn there's an active binding."""
+    tp = _write_transcript(tmp_path, [
+        _user("decide the cache", uuid="u1"),
+        _asst(text=_FORK, uuid="u2"),
+    ])
+    rc, out = _run_hook(
+        {"prompt": "a", "session_id": "s1", "transcript_path": str(tp)},
+        monkeypatch, capsys, tmp_path, env={"SADDLE_HOOK_ITEMIZE": "0"},
+    )
+    assert rc == 0
+    assert "carry-forward" in _context(out)          # the agent sees the carry-forward
+    assert _system_msg(out) == ""                    # but the screen stays quiet
 
 
 # --- the fast path: drift caught from the transcript -----------------------
@@ -180,7 +339,29 @@ def test_current_prompt_pick_binds_commitment(monkeypatch, capsys, tmp_path):
     )
     ctx = _context(out)
     assert rc == 0
-    assert "standing commitment" in ctx and "p1.f1.a" in ctx
+    assert "carry-forward" in ctx and "p1.f1.a" in ctx
+
+
+def test_commitment_readout_surfaces_the_proposal_and_every_option(monkeypatch, capsys, tmp_path):
+    # The readout must carry the DECISION, not a bare locator: the proposal it
+    # answered and EVERY option (the committed one marked) so the agent re-reads
+    # what p1.f1.a actually meant after the transcript compacts — the fork row is
+    # saddle's durable store, so only the rendering was missing.
+    tp = _write_transcript(tmp_path, [
+        _user("decide the cache", uuid="u1"),
+        _asst(text=_FORK, uuid="u2"),
+    ])
+    rc, out = _run_hook(
+        {"prompt": "a", "session_id": "s1", "transcript_path": str(tp)},
+        monkeypatch, capsys, tmp_path, env={"SADDLE_HOOK_ITEMIZE": "0"},
+    )
+    ctx = _context(out)
+    assert rc == 0
+    assert "carry-forward" in ctx and "p1.f1.a" in ctx         # choice id rides as a [ref]
+    assert "proposal" in ctx and "caching" in ctx              # the question it answered
+    # every option surfaces — the chosen one as the directive, the rest as a guard ...
+    assert "in-memory LRU" in ctx and "redis" in ctx and "sqlite cache" in ctx
+    assert "this is what to do now" in ctx                # ... the chosen one foregrounded
 
 
 def test_cursor_makes_replay_idempotent(monkeypatch, capsys, tmp_path):

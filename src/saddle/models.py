@@ -84,13 +84,29 @@ class Intake:
 # is shared while a project's hard-won lessons stay private.
 
 # --- Knowledge kinds: the DKB taxonomy -----------------------------------
+# Two families share one store (one schema, one hybrid index, one scope ladder):
+#
+#   * DESIGN WISDOM — curated, hard-won, irreproducible. The reason saddle
+#     designs on everything learned so far instead of re-deriving cold.
+#   * MEMORY — plain facts saddle would otherwise re-derive every session by
+#     re-reading files or re-searching the web. A FACT is a durable, curated
+#     truth (saddle's own identity, a project's stable invariant); a REFERENCE
+#     is a *cache* entry — a materialized file/web lookup that is reconstructible
+#     and therefore bounded + evictable (see ``durable`` and the DKB's cleanup).
 BEST_PRACTICE = "best_practice"   # a way of doing things that works — to follow
 ANTI_PATTERN = "anti_pattern"     # a tempting bad practice — to avoid
 LESSON = "lesson"                 # learnt from a real bug / issue / design gap
 PRINCIPLE = "principle"           # a standing design value (e.g. "no band-aids")
+FACT = "fact"                     # a durable truth (identity, a stable invariant)
+REFERENCE = "reference"           # a cached file/web lookup — bounded + evictable
 KNOWLEDGE_KINDS: frozenset[str] = frozenset(
-    {BEST_PRACTICE, ANTI_PATTERN, LESSON, PRINCIPLE}
+    {BEST_PRACTICE, ANTI_PATTERN, LESSON, PRINCIPLE, FACT, REFERENCE}
 )
+# The cache tier: kinds whose entries are reconstructible from their source, so
+# eviction may DELETE them (the no-delete rule protects irreproducible knowledge;
+# a cache you can rebuild by re-reading its source is exempt and must be bounded).
+# A REFERENCE is always non-``durable``; the DKB enforces that invariant on write.
+CACHE_KINDS: frozenset[str] = frozenset({REFERENCE})
 
 # Provenance — where an entry came from. Powers the auto-harvest loop: the
 # harness files AUDIT/RUNTIME entries itself as it catches flaws and hits bugs.
@@ -116,6 +132,23 @@ class Knowledge:
     ``scope_project`` place it on the visibility ladder — both empty = global
     (everyone), tenant set + project empty = tenant-wide, both set = that one
     project. ``id``/``ts`` are stamped by the store on save.
+
+    The cache dimension (only meaningful for the MEMORY family; see
+    :data:`CACHE_KINDS`):
+
+    * ``durable`` — pinned. A durable entry is hard-won/curated and is NEVER
+      auto-evicted (retire-not-delete still applies). A non-durable entry is a
+      reconstructible cache row the DKB's cleanup may delete to stay bounded. A
+      :data:`REFERENCE` is forced non-durable on write; everything else defaults
+      durable.
+    * ``hits`` / ``last_used`` — access tracking the cleanup uses to evict the
+      COLDEST cache rows first (LRU with an LFU tie-break). Bumped on retrieval.
+    * ``expires_at`` — optional TTL as an epoch second (0 = never). A cache fact
+      derived from something that goes stale carries when it should be dropped;
+      an expired entry is excluded from retrieval and purged by cleanup.
+    * ``provenance`` — for a cache entry, where it came from so it can be
+      re-derived / invalidated: e.g. ``{"source": "<path|url>", "fingerprint":
+      "<hash>", "fetched_at": <ts>}``. Empty for curated knowledge.
     """
 
     kind: str
@@ -128,6 +161,11 @@ class Knowledge:
     status: str = ACTIVE
     id: str = ""
     ts: float = 0.0
+    durable: bool = True
+    hits: int = 0
+    last_used: float = 0.0
+    expires_at: float = 0.0
+    provenance: dict[str, Any] = field(default_factory=dict)
 
     @property
     def scope(self) -> str:
@@ -137,6 +175,12 @@ class Knowledge:
         if not self.scope_project:
             return self.scope_tenant
         return f"{self.scope_tenant}/{self.scope_project}"
+
+    @property
+    def is_cache(self) -> bool:
+        """True for a reconstructible cache row (non-durable) — the tier the
+        DKB's cleanup is allowed to delete to stay bounded."""
+        return not self.durable
 
 
 # --- Design artifacts: Layer 2's output ----------------------------------
@@ -436,3 +480,73 @@ class Action:
         ``<scope>_action_p<pn>.act<seq>`` (e.g.
         ``rayxi_saddle_layer1_action_p12.act5``). Empty until ``aid`` is stamped."""
         return ids.qualify(self.scope_prefix, ids.KIND_ACTION, self.aid) if self.aid else ""
+
+
+# === Bubble: saddle's client-agnostic outbound voice =====================
+#
+# saddle's supervisory voice (the itemized ask, a drift caught, a design-review
+# verdict) must reach a HUMAN even when no human is at a terminal. A hook's
+# stderr is shown only in an interactive TTY; under an SDK / service host
+# (``CLAUDE_CODE_ENTRYPOINT=sdk-py``) it is swallowed, so an AFK user never sees
+# what saddle bubbled. A :class:`BubbleEvent` is that voice made DURABLE and
+# CLIENT-AGNOSTIC: every message saddle wants seen is persisted to a canonical
+# table any client can query AND mirrored to a per-session JSONL any client can
+# ``tail`` — independent of whichever agent or host happens to be in front of it.
+# It is presentation/transport, not a verdict: the drift engines (Layer 2/3,
+# dialog) still own *what* is wrong; a bubble only carries it to a surface.
+
+# --- Bubble levels: how prominently a client should render the message ----
+BUBBLE_INFO = "info"       # background FYI — no action expected
+BUBBLE_NOTICE = "notice"   # saddle wants this read (a stage result, a commitment)
+BUBBLE_ALERT = "alert"     # saddle needs a correction / decision — surface loudly
+BUBBLE_LEVELS: frozenset[str] = frozenset({BUBBLE_INFO, BUBBLE_NOTICE, BUBBLE_ALERT})
+
+# --- Supervisory stages: the five live drift-entry checkpoints + the two
+#     non-stage channels a bubble can also carry. Drift enters a turn at five
+#     distinct points, so supervision is STAGED across the whole turn (one check
+#     per entry point) rather than concentrated in a single pre-code gate; these
+#     are the labels :attr:`BubbleEvent.stage` carries, named once here so the
+#     runner, the hooks, and any client filter on the SAME set instead of
+#     re-spelling string literals (an identity that fans out — see the DKB).
+STAGE_INTAKE = "intake"    # 1 — the prompt is broken down properly (fail LOUD)
+STAGE_INTENT = "intent"    # 2 — this prompt vs project / design / history
+STAGE_DESIGN = "design"    # 3 — the anti-band-aid pre-code design review
+STAGE_CODE = "code"        # 4 — the code conforms to the agreed design
+STAGE_LESSON = "lesson"    # 5 — the lesson from this turn is captured
+STAGE_GUARD = "guard"      # the deterministic doctrine pre-action gate (Layer 0)
+STAGE_DIALOG = "dialog"    # the back-and-forth correction channel the stages use
+# The five live supervisory stages, in turn order — what the staged runner owns.
+SUPERVISION_STAGES: tuple[str, ...] = (
+    STAGE_INTAKE, STAGE_INTENT, STAGE_DESIGN, STAGE_CODE, STAGE_LESSON,
+)
+# Every label a bubble's ``stage`` may carry: the five stages + guard + dialog.
+BUBBLE_STAGES: frozenset[str] = frozenset(SUPERVISION_STAGES) | {
+    STAGE_GUARD, STAGE_DIALOG,
+}
+
+
+@dataclass
+class BubbleEvent:
+    """One message saddle wants a human (or any client) to see.
+
+    ``text`` is the rendered, human-readable body; ``level`` drives render
+    prominence (:data:`BUBBLE_LEVELS`); ``stage`` is a descriptive label for the
+    supervisory stage that emitted it (``intake`` / ``intent`` / ``design`` /
+    ``code`` / ``lesson`` / ``guard`` / ``dialog`` — does NOT change isolation,
+    like an :class:`Action`'s ``area``); ``title`` is an optional short headline
+    for a compact render; ``meta`` carries any structured payload a richer client
+    wants. ``session`` is a finer, optional filter WITHIN a project (which agent
+    conversation) — never a substitute for the ``(tenant, project)`` fence.
+    ``id``/``tenant``/``project``/``ts`` are stamped by the store on save.
+    """
+
+    text: str
+    level: str = BUBBLE_NOTICE
+    stage: str = ""
+    title: str = ""
+    session: str = ""
+    meta: dict[str, Any] = field(default_factory=dict)
+    id: str = ""
+    tenant: str = ""
+    project: str = ""
+    ts: float = 0.0

@@ -343,3 +343,45 @@ def promote_directive(
             added = True
     reset_policy_cache()
     return added
+
+
+def demote_directive(
+    ctx: Context | None = None, text: str = "", scope: str = "project"
+) -> bool:
+    """Remove a standing directive at ``scope`` — the symmetric counterpart to
+    :func:`promote_directive`.
+
+    Promotion had no inverse, so a rule captured by mistake (e.g. a task-specific
+    instruction auto-promoted as if it were a standing rule) could only be undone
+    by hand-editing the policy file. This is the curation path: it removes through
+    the SAME locked, cache-busting read-modify-write, matching by normalized text
+    (whitespace-collapsed, case-insensitive) so the rule is found however it was
+    spaced/capitalized when added. It touches ONLY the named scope's own overlay
+    file — a project demote can never reach up and silently strip a tenant- or
+    global-wide rule. Returns True if a directive was removed.
+    """
+    c = ctx or _default_ctx()
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("cannot demote an empty directive")
+    if scope not in _PROMOTE_SCOPES:
+        raise ValueError(f"unknown directive scope {scope!r}")
+    path = _overlay_path(c, scope)
+    if not path.exists():
+        return False
+    target = _norm_directive(text)
+    removed = False
+    with _file_lock(path):
+        data = _read_json(path) if path.exists() else {}
+        existing = data.get("directives")
+        if isinstance(existing, list):
+            kept = [x for x in existing if _norm_directive(str(x)) != target]
+            if len(kept) != len(existing):
+                data["directives"] = kept
+                path.write_text(
+                    json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                removed = True
+    reset_policy_cache()
+    return removed

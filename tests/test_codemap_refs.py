@@ -65,6 +65,50 @@ def test_gdref_symbols_strips_comments_and_defs():
     assert set(syms["collections"]["STATUS"]) == {"burn", "slow", "stun"}
 
 
+# A generated GDScript arch-doc that MENTIONS the field name inside string literals
+# (a "description" prose and an "auto_target.cooldown_s" attribute-PATH string) and
+# inside an inline comment — none of which is a real read. This is the false-positive
+# class the rayxiv4 runtime_architecture.gd dumps produced: a regex that scans raw
+# lines matched `.cooldown_s` inside the doc string and reported it as an attr_read,
+# burying the genuine un-resolved base reads. The real reads (a `.get`, a bare attr)
+# and the one real write must still register; the string / comment mentions must not.
+GD_FIELD_IN_STRING = '''
+const ARCH = {
+    "melee.primary": {
+        "description": "Flat bonus added on top of melee_attack.primary_swing.cooldown_s when swinging.",
+        "path": "auto_target.cooldown_s",
+    },
+}
+
+func resolve_cd(def):
+    return def.get("cooldown_s") * 0.9   # def.cooldown_s base via resolve_cd
+
+func show_tooltip(def):
+    var bare = def.cooldown_s
+    var got := float(def.get("cooldown_s", 0.0))
+    return bare + got
+
+func apply(state):
+    state.cooldown_s = 3
+    var doc = "set foo.cooldown_s = 5"
+    return doc
+'''
+
+
+def test_gdref_field_reads_ignore_strings_and_comments():
+    mod = gdref.parse_modules([("arch.gd", GD_FIELD_IN_STRING)])[0]
+    reads = gdref.field_reads(mod, "cooldown_s")
+    # only the THREE real reads — the doc-string (l4), attr-path string (l5), inline
+    # comment (l10) and the in-string write (l19) mentions are all rejected.
+    assert sorted(r.lineno for r in reads) == [10, 13, 14]
+    assert {r.lineno: r.kind for r in reads} == {
+        10: "get_read", 13: "attr_read", 14: "get_read",
+    }
+    writes = gdref.field_writes(mod, "cooldown_s")
+    # only the real `state.cooldown_s = 3` — the `"set foo.cooldown_s = 5"` string is text
+    assert [(w.lineno, w.kind) for w in writes] == [(18, "attr_write")]
+
+
 def test_refs_symbols_merge_and_determinism():
     mods = (pyref.parse_modules([("abil.py", PY_SRC)])
             + gdref.parse_modules([("abil.gd", GD_SRC)]))

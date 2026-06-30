@@ -34,6 +34,7 @@ from saddle.models import (
     BIND_METHODS,
     FORK_OPEN,
     FORK_STATUSES,
+    FORK_SUPERSEDED,
     Binding,
     Fork,
     ForkOption,
@@ -181,7 +182,8 @@ class ForkStore(Protocol):
     def set_fork_status(self, ctx: Context, fork_id: str, status: str) -> bool: ...
     def add_binding(self, ctx: Context, binding: Binding) -> Binding: ...
     def latest_binding(
-        self, ctx: Context, *, session: str | None = None, resolved_only: bool = True
+        self, ctx: Context, *, session: str | None = None,
+        resolved_only: bool = True, live_fork_only: bool = False,
     ) -> Binding | None: ...
     def close(self) -> None: ...
 
@@ -274,7 +276,8 @@ class InMemoryForkStore:
         return binding
 
     def latest_binding(
-        self, ctx: Context, *, session: str | None = None, resolved_only: bool = True
+        self, ctx: Context, *, session: str | None = None,
+        resolved_only: bool = True, live_fork_only: bool = False,
     ) -> Binding | None:
         out = [
             b
@@ -284,6 +287,18 @@ class InMemoryForkStore:
             and (session is None or b.session == session)
             and (not resolved_only or b.resolved)
         ]
+        if live_fork_only:
+            # A binding whose fork was explicitly RETIRED (superseded) is no longer
+            # a live commitment; a missing fork row is an anomaly (saddle never
+            # deletes forks), not a retirement, so it is kept.
+            out = [
+                b
+                for b in out
+                if (
+                    self._forks.get(b.fork_id) is None
+                    or self._forks[b.fork_id].status != FORK_SUPERSEDED
+                )
+            ]
         if not out:
             return None
         out.sort(key=lambda b: b.ts, reverse=True)
@@ -471,16 +486,30 @@ class SqliteForkStore:
         return [_row_to_fork(r) for r in rows]
 
     def latest_binding(
-        self, ctx: Context, *, session: str | None = None, resolved_only: bool = True
+        self, ctx: Context, *, session: str | None = None,
+        resolved_only: bool = True, live_fork_only: bool = False,
     ) -> Binding | None:
-        sql = ["SELECT * FROM binding WHERE tenant=? AND project=?"]
+        # SELECT b.* (not *) so the optional fork JOIN never leaks fork columns
+        # into _row_to_binding.
+        sql = ["SELECT b.* FROM binding b"]
+        if live_fork_only:
+            # A binding whose fork was explicitly RETIRED (superseded) is no longer
+            # a live commitment. LEFT JOIN (not INNER) so a binding whose fork row
+            # is missing still returns — saddle never deletes forks, so an absent
+            # row is an anomaly, not a retirement, and must not silently drop a
+            # real commitment.
+            sql.append("LEFT JOIN fork f ON b.fork_id = f.id")
+        sql.append("WHERE b.tenant=? AND b.project=?")
         args: list = [ctx.tenant, ctx.project]
         if session is not None:
-            sql.append("AND session=?")
+            sql.append("AND b.session=?")
             args.append(session)
         if resolved_only:
-            sql.append("AND resolved=1")
-        sql.append("ORDER BY ts DESC LIMIT 1")
+            sql.append("AND b.resolved=1")
+        if live_fork_only:
+            sql.append("AND (f.status IS NULL OR f.status != ?)")
+            args.append(FORK_SUPERSEDED)
+        sql.append("ORDER BY b.ts DESC LIMIT 1")
         with self._lock:
             row = self._conn.execute(" ".join(sql), args).fetchone()
         return _row_to_binding(row) if row is not None else None
