@@ -56,3 +56,98 @@ def focus_descriptor(ctx: Context | None = None) -> str:
     against a concrete target rather than a hardcoded vocabulary."""
     ctx = ctx or _default_ctx()
     return f'"{ctx.project}", the project whose code is rooted at {focus_root()}'
+
+
+# === The turn's ACTIVE SCOPE SET (mediator design §4) ========================
+#
+# One focus is the DEFAULT, not the LIMIT: a prompt that spans two projects
+# ("audit rayxiv4 AND check saddle") makes both active for the turn. Intake
+# records the set after per-item scope assignment; the doctrine fence and the
+# turn-end stages read it back, so all layers again agree on one boundary —
+# now a set instead of a single root. The marker is per-session and
+# atomically replaced (same discipline as the design-gate markers).
+
+import json as _json
+import os as _os
+import tempfile as _tempfile
+
+
+def _scopes_path(session: str) -> Path:
+    from saddle.store import default_db_path
+
+    safe = "".join(
+        c if (c.isalnum() or c in "-_") else "_" for c in session
+    ) or "default"
+    return default_db_path().parent / "scopes" / f"{safe}.json"
+
+
+def record_active_scopes(
+    session: str,
+    tenant: str,
+    projects: list[str],
+    asks: dict[str, list[str]] | None = None,
+) -> None:
+    """Persist the turn's active project slugs for ``session`` (optionally with
+    the asks routed to each sibling — the material the per-project drift check
+    weighs). Best-effort by contract: an IO failure is logged by the caller's
+    stderr, never raised — at worst the fence falls back to single-focus
+    behavior (stricter, never looser)."""
+    p = _scopes_path(session)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = _tempfile.mkstemp(dir=str(p.parent), suffix=".tmp")
+    with _os.fdopen(fd, "w", encoding="utf-8") as fh:
+        _json.dump({
+            "tenant": tenant,
+            "projects": sorted(set(projects)),
+            "asks": {k: list(v) for k, v in (asks or {}).items()},
+        }, fh)
+    _os.replace(tmp, p)
+
+
+def _read_scopes_doc(session: str, tenant: str) -> dict:
+    try:
+        doc = _json.loads(_scopes_path(session).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(doc, dict) or doc.get("tenant") != tenant:
+        return {}  # tenant mismatch = absent — the hard fence between owners
+    return doc
+
+
+def active_scopes(session: str, tenant: str) -> list[str]:
+    """The project slugs active for ``session`` (empty when never recorded or
+    recorded for a different tenant)."""
+    doc = _read_scopes_doc(session, tenant)
+    return [str(s) for s in doc.get("projects", []) if str(s).strip()]
+
+
+def active_scope_asks(session: str, tenant: str) -> dict[str, list[str]]:
+    """Per-sibling asks recorded with the turn's scope set: slug -> the asks
+    the intake routed to that project. Empty when none were recorded."""
+    doc = _read_scopes_doc(session, tenant)
+    asks = doc.get("asks")
+    if not isinstance(asks, dict):
+        return {}
+    return {
+        str(k): [str(a) for a in v]
+        for k, v in asks.items()
+        if isinstance(v, list) and v
+    }
+
+
+def active_roots(session: str, ctx: Context | None = None) -> list[str]:
+    """Every code root inside the turn's scope set: the focus root FIRST (the
+    ambient project is always in scope), then the registry root of every other
+    active project. The doctrine fence's "inside" is containment in ANY of
+    these."""
+    from saddle import registry
+
+    ctx = ctx or _default_ctx()
+    roots = [str(focus_root())]
+    if session:
+        known = registry.known_projects(ctx.tenant)
+        for slug in active_scopes(session, ctx.tenant):
+            root = known.get(slug)
+            if root and root not in roots:
+                roots.append(root)
+    return roots

@@ -93,6 +93,7 @@ def _row_to_item(row: sqlite3.Row) -> Item:
         intake_id=row["intake_id"],
         seq=row["seq"],
         ts=row["ts"],
+        project=row["project"],
     )
 
 
@@ -169,13 +170,15 @@ class SqliteStore:
             item.id = item.id or ids.record_id(ids.KIND_ITEM)
             item.intake_id = intake.id
             item.tenant = ctx.tenant
-            item.project = ctx.project
+            # An item ROUTED to a sibling project (mediator design §4) keeps
+            # its routing; an unrouted item belongs to the ambient project.
+            item.project = item.project or ctx.project
             item.seq = i
             item.ts = item.ts or now
             if item.status not in ITEM_STATUSES:
                 item.status = OPEN
             rows.append(
-                (item.id, item.intake_id, ctx.tenant, ctx.project, item.seq,
+                (item.id, item.intake_id, ctx.tenant, item.project, item.seq,
                  item.kind, item.ask, item.source_text, item.detail,
                  item.status, item.ts)
             )

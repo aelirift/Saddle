@@ -277,11 +277,18 @@ def _design_outcome(ctx: "Context", goal: str, approach: str) -> "StageOutcome |
     )
 
 
-def _run_design_stage(tool_name: str, transcript_path: str, session: str) -> None:
+def _run_design_stage(
+    tool_name: str, transcript_path: str, session: str, tool_input=None
+) -> None:
     """Run Stage 3 on the FIRST code-mutating edit of a turn (after the guard
     allowed it). Reads the agent's pre-edit reasoning from the transcript and
     audits it, bubbling a LOUD ALERT for a band-aid / misread cause / no-design and
     injecting the finding into the agent's context so it can self-correct.
+
+    The stage's (tenant, project) is resolved PER EVENT (mediator design §4):
+    when the edited file lives in a KNOWN sibling project, the review runs —
+    and its findings, bubbles, and harvested lessons land — under THAT
+    project's ledger, not the ambient one. Evidence beats environment.
 
     Infra (no transcript, anchor IO, ctx resolution) fails OPEN — observation must
     never wedge an edit — but the AUDIT itself fails LOUD via :func:`run_stage`."""
@@ -299,6 +306,19 @@ def _run_design_stage(tool_name: str, transcript_path: str, session: str) -> Non
         print(f"doctrine_hook: design-stage setup error ({exc!r}); skipping",
               file=sys.stderr)
         return
+
+    try:
+        from saddle import registry
+        from saddle.context import Context
+
+        fp = str((tool_input or {}).get("file_path")
+                 or (tool_input or {}).get("notebook_path") or "")
+        slug = registry.project_for_path(ctx.tenant, fp) if fp else None
+        if slug and slug != ctx.project:
+            ctx = Context(tenant=ctx.tenant, project=slug)
+    except Exception as exc:  # noqa: BLE001 — scope resolution must not wedge
+        print(f"doctrine_hook: per-event scope error ({exc!r}); ambient scope",
+              file=sys.stderr)
 
     if not turn.anchor or _design_already_fired(session, turn.anchor):
         return  # no turn to anchor on, or already reviewed this turn
@@ -346,9 +366,22 @@ def main(argv: list[str] | None = None) -> int:
     try:
         from saddle.context import code_root
         from saddle.doctrine import SCOPE_FENCE_RULE_IDS, gate_tool_call
+        from saddle.focus import active_roots
 
         root = str(code_root())
-        verdict = gate_tool_call(tool_name, tool_input, project_root=root)
+        # The fence's "inside" is the turn's ACTIVE SCOPE SET: the focus root
+        # plus every project this turn's intake put in scope (a two-project
+        # prompt no longer false-alarms on the second project). An unreadable
+        # scope marker degrades to the single focus root — stricter, not looser.
+        try:
+            roots = tuple(r for r in active_roots(session) if r != root)
+        except Exception as exc:  # noqa: BLE001 — scope read must not wedge the gate
+            roots = ()
+            print(f"doctrine_hook: scope-set read error ({exc!r}); "
+                  "single-focus fence", file=sys.stderr)
+        verdict = gate_tool_call(
+            tool_name, tool_input, project_root=root, extra_roots=roots
+        )
     except Exception as exc:  # noqa: BLE001 — gate failure must not wedge the agent
         print(f"doctrine_hook: gate error ({exc!r}); allowing", file=sys.stderr)
         return 0
@@ -365,7 +398,7 @@ def main(argv: list[str] | None = None) -> int:
         # (a no-op for a non-edit tool or a later edit). It surfaces (bubble + agent
         # context) and never blocks; any stdout it emits is additionalContext, not a
         # permission decision, so the normal approval flow is untouched.
-        _run_design_stage(tool_name, transcript_path, session)
+        _run_design_stage(tool_name, transcript_path, session, tool_input)
         return 0
 
     # The scope-fence rules are the ones with a legitimate cross-project override.
@@ -392,7 +425,7 @@ def main(argv: list[str] | None = None) -> int:
             # DELETE (Bash rm of a granted sibling); _run_design_stage is the same
             # first-edit audit the allow path runs and is a no-op for a non-edit
             # tool, so calling it keeps the two paths symmetric without re-auditing.
-            _run_design_stage(tool_name, transcript_path, session)
+            _run_design_stage(tool_name, transcript_path, session, tool_input)
             return 0
 
     reason = verdict.render()

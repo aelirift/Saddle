@@ -132,6 +132,10 @@ class Action:
     target_kind: str = "auto"  # auto | path | code
     evidence: Mapping[str, Any] = field(default_factory=dict)
     project_root: str = ""  # explicit focus root; "" -> resolve via context
+    # The turn's OTHER in-scope roots (mediator design §4): a prompt spanning
+    # two projects makes both active, and the fence's "inside" is containment
+    # in ANY active root — the second project no longer false-alarms.
+    extra_roots: tuple[str, ...] = ()
 
     @property
     def nverb(self) -> str:
@@ -332,6 +336,23 @@ def _within(root: str, target: str) -> bool:
         return False
 
 
+def _is_scratch(target: str, root: str) -> bool:
+    """True if ``target`` lives in the system temp tree — scratch space that
+    belongs to no project. A RELATIVE target resolves against the focus root
+    (see :func:`_within`), so only an absolute temp path can be scratch."""
+    import tempfile
+
+    try:
+        t = Path(target).expanduser()
+        if not t.is_absolute():
+            return False
+        tmp = Path(tempfile.gettempdir()).resolve()
+        t = t.resolve()
+        return t == tmp or tmp in t.parents
+    except Exception:  # noqa: BLE001 — can't prove scratch -> not scratch
+        return False
+
+
 def _focus_root() -> str:
     """The focus project's root — the single boundary shared by the doctrine
     fence, Layer 3's code-map, and Layer 1 intake. Resolved via the focus
@@ -368,14 +389,24 @@ def _apply(
         if rule.override_evidence and _truthy(action.evidence.get(rule.override_evidence)):
             return None
         root = action.project_root or _focus_root()
-        if not _within(root, action.target):
-            needs = (rule.override_evidence,) if rule.override_evidence else ()
-            return Verdict(
-                False, rule.id,
-                f"{rule.message}\n  target: {action.target}\n  focus:  {root}",
-                needs, rule.severity,
-            )
-        return None
+        # "Inside" = containment in ANY active root: the focus root plus every
+        # other project the turn's intake put in scope (mediator design §4).
+        roots = [root, *action.extra_roots]
+        if any(_within(r, action.target) for r in roots):
+            return None
+        # A WRITE/EDIT to the system temp tree belongs to NO project — scratch
+        # space is not "another project", and warning on it trains the reader
+        # to ignore the channel. Deliberately NOT extended to deletes: removal
+        # never gets quieter treatment than creation.
+        if action.nverb != "delete" and _is_scratch(action.target, root):
+            return None
+        needs = (rule.override_evidence,) if rule.override_evidence else ()
+        shown = root if len(roots) == 1 else ", ".join(roots)
+        return Verdict(
+            False, rule.id,
+            f"{rule.message}\n  target: {action.target}\n  focus:  {shown}",
+            needs, rule.severity,
+        )
 
     if rule.kind == "predicate":
         fn = predicates.get(rule.predicate)
@@ -560,7 +591,9 @@ def _segment_write_targets(seg: list[str]) -> list[str]:
     return []
 
 
-def _bash_actions(command: str, project_root: str) -> list[Action]:
+def _bash_actions(
+    command: str, project_root: str, *, extra_roots: tuple[str, ...] = ()
+) -> list[Action]:
     """Best-effort scan of a shell command for the *mutating* operations the gate
     cares about — file DELETES (``rm``/``unlink``/``shred``/``git rm``) and file
     WRITES (redirections, ``tee``, ``cp``/``mv``/``install``/``ln`` dest,
@@ -591,7 +624,8 @@ def _bash_actions(command: str, project_root: str) -> list[Action]:
         if key in seen:
             return
         seen.add(key)
-        out.append(Action(verb, t, "path", project_root=project_root))
+        out.append(Action(verb, t, "path", project_root=project_root,
+                          extra_roots=extra_roots))
 
     try:
         tokens = shlex.split(command)
@@ -649,7 +683,11 @@ def _bash_actions(command: str, project_root: str) -> list[Action]:
 
 
 def actions_from_tool(
-    tool_name: str, tool_input: Mapping[str, Any] | None, *, project_root: str = ""
+    tool_name: str,
+    tool_input: Mapping[str, Any] | None,
+    *,
+    project_root: str = "",
+    extra_roots: tuple[str, ...] = (),
 ) -> list[Action]:
     """Translate one tool invocation into the doctrine Action(s) it performs.
 
@@ -659,12 +697,22 @@ def actions_from_tool(
     ti = tool_input or {}
     if name in _WRITE_TOOLS:
         fp = ti.get("file_path") or ti.get("path") or ""
-        return [Action("write", str(fp), "path", project_root=project_root)] if fp else []
+        return (
+            [Action("write", str(fp), "path", project_root=project_root,
+                    extra_roots=extra_roots)]
+            if fp else []
+        )
     if name in _EDIT_TOOLS:
         fp = ti.get("file_path") or ti.get("notebook_path") or ti.get("path") or ""
-        return [Action("edit", str(fp), "path", project_root=project_root)] if fp else []
+        return (
+            [Action("edit", str(fp), "path", project_root=project_root,
+                    extra_roots=extra_roots)]
+            if fp else []
+        )
     if name == "Bash":
-        return _bash_actions(str(ti.get("command") or ""), project_root)
+        return _bash_actions(
+            str(ti.get("command") or ""), project_root, extra_roots=extra_roots
+        )
     return []
 
 
@@ -673,14 +721,18 @@ def gate_tool_call(
     tool_input: Mapping[str, Any] | None,
     *,
     project_root: str = "",
+    extra_roots: tuple[str, ...] = (),
     ctx: "Context | None" = None,
     rules: Sequence[CheckRule] | None = None,
 ) -> Verdict:
     """Evaluate a tool invocation against doctrine — the enforced passthrough's
     core. The first action that BLOCKS decides; otherwise the call is allowed
     (carrying a warning if any action warned). This is the single function a
-    PreToolUse hook or an SDK ``can_use_tool`` callback calls."""
-    actions = actions_from_tool(tool_name, tool_input, project_root=project_root)
+    PreToolUse hook or an SDK ``can_use_tool`` callback calls. ``extra_roots``
+    widens the scope fence's "inside" to the turn's whole active scope set."""
+    actions = actions_from_tool(
+        tool_name, tool_input, project_root=project_root, extra_roots=extra_roots
+    )
     if not actions:
         return Verdict(True, None, "tool does not mutate code")
     rs = rules if rules is not None else load_rules(ctx)

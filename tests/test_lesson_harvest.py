@@ -221,11 +221,11 @@ def test_turn_issues_gathers_design_and_code_only(monkeypatch, tmp_path):
 
     from saddle import stop_hook
     issues = stop_hook._turn_issues(_CTX, "s1", 0.0)
-    assert "band-aid: swallow-and-log" in issues
-    assert "raw base read bypasses the resolver" in issues
+    assert issues.get("game") and "band-aid: swallow-and-log" in issues["game"]
+    assert "raw base read bypasses the resolver" in issues["game"]
     assert all("itemize" not in i and "contradicts" not in i and "prior" not in i
                for i in issues)
-    assert len(issues) == 2
+    assert len(issues["game"]) == 2
 
 
 def test_clean_turn_harvests_nothing(monkeypatch, capsys, tmp_path):
@@ -259,9 +259,9 @@ def test_caught_drift_is_harvested_and_named(monkeypatch, capsys, tmp_path):
     notices = _bubbles(level="notice", stage=STAGE_LESSON)
     assert len(notices) == 1
     b = notices[0]
-    assert "LESSON HARVEST" in b.text and "Bump is not balance" in b.text
+    assert "Lessons saved for game" in b.text and "Bump is not balance" in b.text
     assert b.meta["harvested"] == 1 and b.meta["titles"] == ["Bump is not balance"]
-    assert "LESSON HARVEST" in out.err          # on-screen copy too
+    assert "Lessons saved for game" in out.err     # on-screen copy too
 
 
 def test_lesson_stage_disabled_by_env(monkeypatch, capsys, tmp_path):

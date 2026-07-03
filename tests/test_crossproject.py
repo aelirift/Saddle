@@ -172,6 +172,12 @@ def test_authorize_tool_in_focus_targets_need_no_grant(tmp_path):
 # --- the PreToolUse hook honours grants for the fence, and only the fence ----
 
 def _run_hook(payload, focus, monkeypatch, capsys):
+    import tempfile
+
+    # These tests emulate real sibling PROJECTS under pytest's tmp_path, which
+    # lives in the real temp tree — point the fence's scratch exemption at an
+    # empty dir so the siblings read as projects, not scratch space.
+    monkeypatch.setattr(tempfile, "tempdir", str(focus) + "-faketmp")
     monkeypatch.setenv("SADDLE_CODE_ROOT", str(focus))
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
     from saddle import doctrine_hook

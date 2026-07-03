@@ -283,7 +283,7 @@ def _is_trivial(prompt: str) -> bool:
     return len(prompt.split()) < min_words
 
 
-async def _itemize(ctx: "Context", prompt: str) -> str:
+async def _itemize(ctx: "Context", prompt: str, session: str = "") -> str:
     from saddle.intake import decompose, format_intake
 
     try:
@@ -291,10 +291,42 @@ async def _itemize(ctx: "Context", prompt: str) -> str:
     except ValueError:
         max_audits = 1
     intake = await decompose(prompt, ctx, max_audits=max_audits)
+    _record_turn_scopes(ctx, intake, session)
     return format_intake(intake)
 
 
-def _itemize_outcome(ctx: "Context", prompt: str) -> "StageOutcome | None":
+def _record_turn_scopes(ctx: "Context", intake, session: str) -> None:
+    """Persist the turn's ACTIVE SCOPE SET (mediator design §4): the ambient
+    project plus every sibling the scope router stamped on an item. The
+    doctrine fence and the turn-end stages read it back, so a two-project turn
+    is in scope everywhere at once. Also LEARNS the ambient root into the
+    project registry (idempotent) — the registry is how the router knows
+    sibling names next time. Best-effort: a failure narrows scope back to
+    single-focus (stricter, never looser), and is logged, never raised."""
+    try:
+        import time as _time
+
+        from saddle import registry
+        from saddle.context import code_root
+        from saddle.focus import record_active_scopes
+
+        registry.register_root(ctx.tenant, code_root(), ts=_time.time())
+        routed: dict[str, list[str]] = {}
+        for it in intake.items:
+            slug = getattr(it, "project", "")
+            if slug:
+                routed.setdefault(slug, []).append(it.ask)
+        if session:
+            record_active_scopes(
+                session, ctx.tenant, [ctx.project, *sorted(routed)],
+                asks=routed,
+            )
+    except Exception as exc:  # noqa: BLE001 — scope recording must not fail intake
+        print(f"intake_hook: scope-set record error ({exc!r}); "
+              "single-focus fence this turn", file=sys.stderr)
+
+
+def _itemize_outcome(ctx: "Context", prompt: str, session: str = "") -> "StageOutcome | None":
     """Stage 1 (intake) — the itemized know/do list, fail LOUD.
 
     Returns the rendered list as a NOTICE :class:`StageOutcome`, or ``None`` when
@@ -317,7 +349,7 @@ def _itemize_outcome(ctx: "Context", prompt: str) -> "StageOutcome | None":
         timeout = float(os.environ.get("SADDLE_HOOK_INTAKE_TIMEOUT", "150") or 150)
     except ValueError:
         timeout = 150.0
-    text = run_bounded(_itemize(ctx, prompt), seconds=timeout,
+    text = run_bounded(_itemize(ctx, prompt, session), seconds=timeout,
                        what="the prompt decomposition")
     return StageOutcome(sections=[text]) if text and text.strip() else None
 
@@ -425,9 +457,36 @@ def main(argv: list[str] | None = None) -> int:
     # the old silent degrade.
     results.append(run_stage(
         ctx, STAGE_INTAKE,
-        lambda: _itemize_outcome(ctx, prompt),
+        lambda: _itemize_outcome(ctx, prompt, session),
         session=session, what="the prompt decomposition (itemize → scope)",
     ))
+
+    # Stage 2 (intent), sibling-project axis (mediator design §4): a prompt that
+    # routes asks to ANOTHER known project gets a history check against THAT
+    # project's settled state, under THAT project's context — its bubbles, drift
+    # findings, and eventual lessons land in the sibling's ledger, never blended
+    # into the ambient project's. One extra bounded LLM call per involved
+    # sibling (usually zero). Fail-loud like every stage; a failure names the
+    # sibling it could not check.
+    try:
+        from saddle.context import Context as _Ctx
+        from saddle.focus import active_scope_asks
+
+        sibling_asks = active_scope_asks(session, ctx.tenant) if session else {}
+    except Exception as exc:  # noqa: BLE001 — routing read must not wedge the turn
+        sibling_asks = {}
+        print(f"intake_hook: sibling-scope read error ({exc!r})", file=sys.stderr)
+    for slug, asks in sorted(sibling_asks.items()):
+        if slug == ctx.project or not asks:
+            continue
+        sib_ctx = _Ctx(tenant=ctx.tenant, project=slug)
+        joined = "\n".join(f"- {a}" for a in asks)
+        results.append(run_stage(
+            sib_ctx, STAGE_INTENT,
+            lambda c=sib_ctx, j=joined: _history_outcome(c, j),
+            session=session,
+            what=f"the asks routed to {slug} against {slug}'s settled designs",
+        ))
 
     # the standing commitment the agent must honor — a dialog readout for the
     # agent channel, not a fail-classified stage (it is a reminder, not drift).

@@ -57,6 +57,11 @@ class Item:
     intake_id: str = ""
     seq: int = 0
     ts: float = 0.0
+    # The project this ask ROUTES to (mediator design §4). Empty = the ambient
+    # project the intake ran under; a slug names a KNOWN sibling project the
+    # task would act on, so every downstream stage (drift, lessons, designs)
+    # reads and writes THAT project's ledger — never a blended one.
+    project: str = ""
 
     def is_todo(self) -> bool:
         return self.kind in TODO_KINDS

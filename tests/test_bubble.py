@@ -28,6 +28,7 @@ test so the convenience/hook paths open a fresh db per test.
 from __future__ import annotations
 
 import io
+import os
 import json
 import time
 
@@ -293,6 +294,13 @@ def test_bubble_id_kind_registered():
 # --- the live emit side: the doctrine hook deposits bubbles ------------------
 
 def _run_doctrine_hook(payload, monkeypatch):
+    import tempfile
+
+    # The fake sibling projects live under pytest's tmp_path (the real temp
+    # tree); point the fence's scratch exemption elsewhere so they read as
+    # projects, not scratch space.
+    monkeypatch.setattr(tempfile, "tempdir",
+                        os.environ.get("SADDLE_CODE_ROOT", "/nonexistent") + "-faketmp")
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
     from saddle import doctrine_hook
     return doctrine_hook.main()

@@ -314,28 +314,36 @@ def _conformance_outcome(ctx: "Context") -> "StageOutcome | None":
 
 # -- Stage 5 — lesson harvest ------------------------------------------------
 
-def _turn_issues(ctx: "Context", session: str, since_ts: float) -> list[str]:
+def _turn_issues(
+    ctx: "Context", session: str, since_ts: float
+) -> dict[str, list[str]]:
     """The design/code flaws CAUGHT this turn, read back from the durable outbox
-    since the last harvest: Stage 3's ``meta['issues']`` (band-aids / misread
-    causes) and Stage 4's ``meta['drifts'][*]['findings']`` (code-conformance
-    breaks). These are the material Stage 5 learns from. An intake infra-failure
-    or an intent pull is NOT a generalizable design lesson, so those stages are
-    deliberately excluded — the harvest engine is tuned for design/code flaws."""
+    since the last harvest, GROUPED BY the project whose ledger each landed in
+    (mediator design §4 — a mixed-scope turn teaches each project its OWN
+    lessons, never a blended set): Stage 3's ``meta['issues']`` (band-aids /
+    misread causes) and Stage 4's ``meta['drifts'][*]['findings']``
+    (code-conformance breaks). An intake infra-failure or an intent pull is NOT
+    a generalizable design lesson, so those stages are deliberately excluded —
+    the harvest engine is tuned for design/code flaws."""
     from saddle.bubble import recent_bubbles
     from saddle.models import STAGE_CODE, STAGE_DESIGN
 
-    issues: list[str] = []
-    for b in recent_bubbles(ctx, session=session, since_ts=since_ts, limit=200):
+    issues: dict[str, list[str]] = {}
+    for b in recent_bubbles(ctx, session=session, since_ts=since_ts, limit=200,
+                            any_project=True):
         meta = b.meta or {}
+        found: list[str] = []
         if b.stage == STAGE_DESIGN:
-            issues.extend(
-                str(i).strip() for i in meta.get("issues", []) if str(i).strip()
-            )
+            found = [str(i).strip() for i in meta.get("issues", []) if str(i).strip()]
         elif b.stage == STAGE_CODE:
-            for d in meta.get("drifts", []):
-                issues.extend(
-                    str(f).strip() for f in d.get("findings", []) if str(f).strip()
-                )
+            found = [
+                str(f).strip()
+                for d in meta.get("drifts", [])
+                for f in d.get("findings", [])
+                if str(f).strip()
+            ]
+        if found:
+            issues.setdefault(b.project or ctx.project, []).extend(found)
     return issues
 
 
@@ -350,10 +358,11 @@ def _harvest_outcome(
     a LOUD ALERT (fail-loud), never a swallowed 'learned nothing'."""
     if os.environ.get("SADDLE_HOOK_LESSON", "1") == "0":
         return None
-    issues = _turn_issues(ctx, session, since_ts)
-    if not issues:
+    by_project = _turn_issues(ctx, session, since_ts)
+    if not by_project:
         return None  # a clean turn -> no LLM call, nothing to learn
 
+    from saddle.context import Context
     from saddle.design import harvest_turn
     from saddle.models import BUBBLE_NOTICE
     from saddle.supervisor import StageOutcome, run_bounded
@@ -364,26 +373,41 @@ def _harvest_outcome(
         timeout = float(os.environ.get("SADDLE_HOOK_LESSON_TIMEOUT", "60") or 60)
     except ValueError:
         timeout = 60.0
-    result = run_bounded(
-        harvest_turn(goal, issues, ctx),
-        seconds=timeout,
-        what="the turn-end lesson harvest",
-    )
-    if result.harvested <= 0:
+    # One harvest per project the turn's caught drift landed in — each files
+    # into ITS project's ledger, so a mixed-scope turn never blends lessons
+    # (mediator design §4). The ambient project goes first for readability.
+    ordered = sorted(by_project.items(), key=lambda kv: kv[0] != ctx.project)
+    total, sections, titles_all = 0, [], []
+    considered = 0
+    for project, issues in ordered:
+        p_ctx = ctx if project == ctx.project else Context(ctx.tenant, project)
+        result = run_bounded(
+            harvest_turn(goal, issues, p_ctx),
+            seconds=timeout,
+            what=f"the turn-end lesson harvest for {project}",
+        )
+        considered += result.considered
+        if result.harvested <= 0:
+            continue
+        total += result.harvested
+        titles_all.extend(result.titles)
+        titles = "\n".join(f"  • {t}" for t in result.titles)
+        sections.append(
+            f"\U0001f4d3 Lessons saved for {project} — {result.harvested} from "
+            f"this turn's caught problems (future checks on {project} will "
+            f"use them):\n{titles}"
+        )
+    if total <= 0:
         return None  # considered the flaws; nothing new/general enough to file
-    titles = "\n".join(f"  • {t}" for t in result.titles)
     return StageOutcome(
-        sections=[
-            f"\U0001f4d3 LESSON HARVEST — saddle filed {result.harvested} durable "
-            "lesson(s) from this turn's caught drift (the next turn's design/intent "
-            f"retrieval will stand on them):\n{titles}"
-        ],
+        sections=sections,
         level=BUBBLE_NOTICE,
         title="lessons learned this turn",
         meta={
-            "harvested": result.harvested,
-            "considered": result.considered,
-            "titles": list(result.titles),
+            "harvested": total,
+            "considered": considered,
+            "titles": titles_all,
+            "projects": [p for p, _ in ordered],
         },
     )
 

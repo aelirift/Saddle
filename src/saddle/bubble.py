@@ -198,6 +198,7 @@ class BubbleStore(Protocol):
         since_ts: float | None = None,
         level: str | None = None,
         limit: int = 50,
+        any_project: bool = False,
     ) -> list[BubbleEvent]: ...
     def close(self) -> None: ...
 
@@ -223,12 +224,13 @@ class InMemoryBubbleStore:
         since_ts: float | None = None,
         level: str | None = None,
         limit: int = 50,
+        any_project: bool = False,
     ) -> list[BubbleEvent]:
         out = [
             e
             for e in self._events
             if e.tenant == ctx.tenant
-            and e.project == ctx.project
+            and (any_project or e.project == ctx.project)
             and (session is None or e.session == session)
             and (since_ts is None or e.ts > since_ts)
             and (level is None or e.level == level)
@@ -284,9 +286,17 @@ class SqliteBubbleStore:
         since_ts: float | None = None,
         level: str | None = None,
         limit: int = 50,
+        any_project: bool = False,
     ) -> list[BubbleEvent]:
-        sql = ["SELECT * FROM bubble WHERE tenant=? AND project=?"]
-        args: list = [ctx.tenant, ctx.project]
+        # any_project widens to the whole tenant (session/level/since still
+        # bind) — the turn-end reader must see a mixed-scope turn's bubbles
+        # across every project ledger they landed in (mediator design §4).
+        if any_project:
+            sql = ["SELECT * FROM bubble WHERE tenant=?"]
+            args: list = [ctx.tenant]
+        else:
+            sql = ["SELECT * FROM bubble WHERE tenant=? AND project=?"]
+            args = [ctx.tenant, ctx.project]
         if session is not None:
             sql.append("AND session=?")
             args.append(session)
@@ -364,11 +374,15 @@ def recent_bubbles(
     since_ts: float | None = None,
     level: str | None = None,
     limit: int = 50,
+    any_project: bool = False,
 ) -> list[BubbleEvent]:
     """Most-recent-first bubbles for ``ctx`` (optionally one session / since a
-    timestamp / one level). The read path the CLI + MCP tool share."""
+    timestamp / one level). The read path the CLI + MCP tool share.
+    ``any_project`` widens to every project of the tenant — the turn-end
+    stages read a mixed-scope turn's bubbles across ledgers."""
     return get_bubble_store().recent(
-        ctx, session=session, since_ts=since_ts, level=level, limit=limit
+        ctx, session=session, since_ts=since_ts, level=level, limit=limit,
+        any_project=any_project,
     )
 
 

@@ -108,27 +108,30 @@ _SYSTEM_AUDIT = (
 )
 
 _SYSTEM_SCOPE = (
-    "You are the focus gate of an assistant DEDICATED to one project. You are "
-    "given that FOCUS project's identity and a numbered list of ACTION items — "
-    "tasks the user wants performed — pulled from a user's message. For each "
-    "item, decide whether CARRYING IT OUT would change, build, or operate on "
-    "the code, files, or state of a DIFFERENT project, codebase, or product "
-    "than the focus. Judge by what the action would TOUCH, not by wording.\n"
-    "- out_of_focus: doing it would modify another project — build, fix, edit, "
-    "create, delete, refactor, or otherwise change code, files, or state that "
-    "belong to a system that is NOT the focus project.\n"
-    "- in_focus: it operates on the focus project itself; OR on THIS assistant "
+    "You are the scope ROUTER of an assistant that supervises work across a "
+    "person's projects. You are given the FOCUS project (where the agent is "
+    "currently working), the person's OTHER KNOWN projects, and a numbered "
+    "list of ACTION items — tasks the user wants performed. For each item, "
+    "decide WHICH project carrying it out would change, build, or operate on. "
+    "Judge by what the action would TOUCH, not by wording.\n"
+    "Route each item to exactly one of:\n"
+    "- focus: it operates on the focus project itself; OR on THIS assistant "
     "or the current session/configuration (wiring, connecting, or configuring "
-    "this assistant counts as in_focus); OR it only researches, explains, "
+    "this assistant counts as focus); OR it only researches, explains, "
     "references, or plans around another project WITHOUT changing that "
     "project's code.\n"
-    "Merely naming or describing another system is NOT out_of_focus — only "
-    "acting on another project's code or files is. When a task genuinely WOULD "
-    "modify another project's code and you are unsure, mark out_of_focus so it "
-    "is surfaced rather than waved through.\n\n"
+    "- <a known project's exact name>: doing it would modify THAT project's "
+    "code, files, or state (build, fix, edit, create, delete, refactor, "
+    "audit-with-changes). Use the name exactly as listed.\n"
+    "- outside: it would modify a project or system that is NEITHER the focus "
+    "NOR any known project in the list.\n"
+    "Merely naming or describing another system is NOT a route to it — only "
+    "acting on its code or files is. When a task genuinely WOULD modify "
+    "another project and you are unsure which, mark outside so it is surfaced "
+    "rather than waved through.\n\n"
     "Respond with ONLY a JSON object: "
-    '{"verdicts": [{"index": <the item\'s number>, "scope": "in_focus" | '
-    '"out_of_focus", "reason": "<short why>"}]}. '
+    '{"verdicts": [{"index": <the item\'s number>, "scope": "focus" | '
+    '"<known project name>" | "outside", "reason": "<short why>"}]}. '
     "Include EVERY item exactly once."
 )
 
@@ -186,49 +189,64 @@ def _audit_prompt(prompt: str, items: list[Item]) -> str:
     )
 
 
-def _scope_prompt(focus_desc: str, items: list[Item]) -> str:
+def _scope_prompt(focus_desc: str, known_block: str, items: list[Item]) -> str:
     lines = [f"{i + 1}. [{it.kind}] {it.ask}" for i, it in enumerate(items)]
     listing = "\n".join(lines) if lines else "(none)"
+    known = known_block or "(none known)"
     return (
         f"FOCUS PROJECT: {focus_desc}\n\n"
+        f"OTHER KNOWN PROJECTS:\n{known}\n\n"
         f"WORK ITEMS:\n{listing}\n\n"
-        "Classify each item's scope relative to the FOCUS project above."
+        "Route each item to the project it would act on."
     )
 
 
 async def _classify_scope(
     caller: "LLMCaller", items: list[Item], ctx: Context
 ) -> dict[str, Any]:
-    """Tag each ACTION (task) item in_focus / out_of_focus against the focus.
+    """Route each ACTION (task) item to the project it would act on.
 
     Only tasks are weighed. A question, a piece of context, a decision, or a
     standing directive that *mentions* another project is discussion or
     planning — referencing another codebase is not drift; only a task that
     would MODIFY another project's code or files crosses the boundary. So
-    non-task items are never flagged, and a prompt with no tasks at all skips
-    the focus call entirely: nothing to act on, nothing to warn about.
+    non-task items are never routed, and a prompt with no tasks at all skips
+    the LLM call entirely: nothing to act on, nothing to route.
 
-    Annotates — never filters. Out-of-focus tasks stay in the intake; this only
-    records WHICH ones cross a project boundary and a human-readable warning so
-    the drift ("you pulled me onto another project") is surfaced. Refusing the
-    work stays Layer 0's job. If the model fails to classify every task, that is
-    recorded (``scope_checked=False``) and surfaced rather than silently read as
-    "all in focus" — the same never-imply-coverage stance as the audit pass.
+    Three routes per task (mediator design §4):
+
+    * the FOCUS project (or this assistant/session) — the default, no marking;
+    * a KNOWN sibling project from the registry — the item is STAMPED
+      (``item.project``) so every downstream stage reads/writes THAT project's
+      ledger; both projects are simply active this turn, not a warning;
+    * OUTSIDE every known project — surfaced as a warning exactly as before
+      (an unknown target should be seen, not silently routed).
+
+    Annotates — never filters. If the model fails to route every task, that is
+    recorded (``scope_checked=False``) and surfaced rather than silently read
+    as "all in focus" — the same never-imply-coverage stance as the audit pass.
     """
     # Only actions can cross the project boundary. Filter to tasks, keeping each
     # one's ORIGINAL position so the surfaced warning numbers line up with the
     # full item list the user sees. No tasks -> nothing to check, no LLM call.
     actionable = [(i, it) for i, it in enumerate(items) if it.kind == TASK]
     if not actionable:
-        return {"out_of_focus": [], "scope_warning": "", "scope_checked": True}
+        return {"out_of_focus": [], "scope_warning": "", "scope_checked": True,
+                "item_projects": {}}
 
+    from saddle import registry
+
+    known = registry.known_projects(ctx.tenant)
+    known_block = registry.descriptor_block(ctx.tenant, exclude=ctx.project)
     raw = await _call_json(
         caller, _SYSTEM_SCOPE,
-        _scope_prompt(focus_descriptor(ctx), [it for _, it in actionable]),
+        _scope_prompt(focus_descriptor(ctx), known_block,
+                      [it for _, it in actionable]),
         label="intake/scope",
     )
     verdicts = raw.get("verdicts")
     out_of_focus: list[dict[str, Any]] = []
+    item_projects: dict[int, str] = {}
     classified: set[int] = set()
     if isinstance(verdicts, list):
         for v in verdicts:
@@ -241,8 +259,17 @@ async def _classify_scope(
             if not (0 <= sub < len(actionable)) or sub in classified:
                 continue
             classified.add(sub)
-            if str(v.get("scope", "")).strip().lower() == "out_of_focus":
-                orig_idx, item = actionable[sub]
+            scope = str(v.get("scope", "")).strip().lower()
+            orig_idx, item = actionable[sub]
+            if scope in ("focus", "in_focus", "", ctx.project):
+                continue  # ambient — no stamp needed
+            if scope in known:
+                # Routed to a known sibling: stamp the item so drift checks and
+                # lessons land in THAT project's ledger. Not a warning.
+                item.project = scope
+                item_projects[orig_idx + 1] = scope
+            else:
+                # "outside" or an unrecognized name — surfaced, never guessed.
                 out_of_focus.append({
                     "n": orig_idx + 1,
                     "ask": item.ask,
@@ -254,19 +281,20 @@ async def _classify_scope(
         proj = focus_project(ctx)
         warning = (
             f"{len(out_of_focus)} of {len(actionable)} action(s) target work "
-            f"OUTSIDE the focus project ({proj}). saddle is focused on {proj}; "
-            f"that work changes another project and should not be acted on here "
-            f"without an explicit cross-project decision."
+            f"outside {proj} and outside every project saddle knows. That work "
+            f"changes something unrecognized and should not be acted on here "
+            f"without an explicit decision."
         )
     elif not scope_checked:
         warning = (
-            "focus check did not classify every action — review scope manually "
-            "before acting."
+            "the scope router did not classify every action — review scope "
+            "manually before acting."
         )
     return {
         "out_of_focus": out_of_focus,
         "scope_warning": warning,
         "scope_checked": scope_checked,
+        "item_projects": item_projects,
     }
 
 
@@ -420,9 +448,10 @@ async def decompose(
 
     audits_run = 0
     audit_complete = False
-    # Focus gate result — populated below unless check_focus is off / no items.
+    # Scope-router result — populated below unless check_focus is off / no items.
     scope_info: dict[str, Any] = {
         "out_of_focus": [], "scope_warning": "", "scope_checked": False,
+        "item_projects": {},
     }
     async with tenant_gate(ctx):
         first = await _call_json(
@@ -474,6 +503,11 @@ async def decompose(
             "out_of_focus": scope_info["out_of_focus"],
             "scope_warning": scope_info["scope_warning"],
             "scope_checked": scope_info["scope_checked"],
+            # item number -> sibling project slug, for renders and the turn's
+            # active-scope set. The stamp itself rides on each Item.project.
+            "item_projects": {
+                str(k): v for k, v in scope_info.get("item_projects", {}).items()
+            },
         },
     )
 
@@ -499,10 +533,22 @@ def format_intake(intake: Intake) -> str:
         for o in intake.meta.get("out_of_focus", []):
             reason = f" — {o['reason']}" if o.get("reason") else ""
             lines.append(f"    • item {o['n']} is out of focus: {o['ask']}{reason}")
+    routed = intake.meta.get("item_projects", {})
+    if routed:
+        names = sorted(set(routed.values()))
+        ambient = intake.project or "the current project"
+        lines.append(
+            f"this message spans more than one project: items marked with a "
+            f"→ act on {', '.join(names)}; the rest act on {ambient}."
+        )
     todo = intake.meta.get("todo_items", sum(1 for i in intake.items if i.is_todo()))
     lines.append(f"{len(intake.items)} items ({todo} todo):")
     for i, it in enumerate(intake.items, 1):
-        lines.append(f"  {i:>2}. [{it.kind:<9}] {it.ask}")
+        # Tag only items routed AWAY from the ambient project (after persist,
+        # ambient items carry the intake's own project — not a route).
+        proj = getattr(it, "project", "")
+        route = f" → {proj}" if proj and proj != intake.project else ""
+        lines.append(f"  {i:>2}. [{it.kind:<9}]{route} {it.ask}")
         if it.detail:
             lines.append(f"        ↳ {it.detail}")
     # Default False, not True: an intake whose meta carries no convergence verdict

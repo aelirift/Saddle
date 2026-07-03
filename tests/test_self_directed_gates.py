@@ -56,4 +56,4 @@ def test_self_directed_recognition_mirrors_the_scope_gate_precedent():
     # the two new clauses extend that same recognition to the other two gates, so
     # the precedent must still hold (else they no longer mirror a live contract).
     s = _norm(_SYSTEM_SCOPE)
-    assert "configuring this assistant counts as in_focus" in s
+    assert "configuring this assistant counts as focus" in s

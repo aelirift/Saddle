@@ -90,8 +90,8 @@ def test_only_tasks_are_sent_and_indices_map_back():
          "reason": "another repo's code"}
     ]
     assert res["scope_checked"] is True
-    assert "1 of 2 action(s) target work OUTSIDE" in res["scope_warning"]
-    assert "(game)" in res["scope_warning"]
+    assert "1 of 2 action(s) target work outside" in res["scope_warning"]
+    assert "outside game" in res["scope_warning"]
 
 
 def test_in_focus_only_tasks_produce_no_warning():
