@@ -32,10 +32,33 @@ wedged stream catches the specific subclass.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import time
 from typing import AsyncIterator, Awaitable, TypeVar
 
 T = TypeVar("T")
+
+# Ambient budget — the absolute monotonic deadline of the innermost ``bounded()``
+# currently driving this task's await chain. A consumer that fans work across
+# ALTERNATIVES (e.g. the provider fail-over chain) reads the REMAINING budget to
+# apportion per-alternative deadlines from the time the stage actually has,
+# instead of guessing with a flat constant sized for the small-call happy path
+# (the flat 20s cut every provider on long-prompt hook stages -> "All callers
+# failed"). Innermost bounded() wins; reset restores the enclosing budget.
+_BUDGET_ENDS_AT: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "saddle_budget_ends_at", default=None
+)
+
+
+def budget_remaining() -> float | None:
+    """Seconds left in the innermost active :func:`bounded` budget, or ``None``
+    when no bounded deadline is ambient. Never negative — an exhausted budget
+    reads ``0.0`` (callers treat it as "fail fast"; the outer bound is about to
+    fire anyway)."""
+    ends = _BUDGET_ENDS_AT.get()
+    if ends is None:
+        return None
+    return max(0.0, ends - time.monotonic())
 
 
 class DeadlineExceeded(TimeoutError):
@@ -60,12 +83,19 @@ async def bounded(awaitable: Awaitable[T], *, seconds: float, what: str) -> T:
     """
     if seconds <= 0:
         return await awaitable
+    # Publish the budget BEFORE wait_for wraps the awaitable in a Task: the task
+    # snapshots the current context at creation, so consumers down the await
+    # chain (budget_remaining) see this deadline. Reset restores any enclosing
+    # bounded()'s budget on the way out.
+    token = _BUDGET_ENDS_AT.set(time.monotonic() + seconds)
     try:
         return await asyncio.wait_for(awaitable, timeout=seconds)
     except asyncio.TimeoutError as exc:
         raise DeadlineExceeded(
             f"{what}: no completion within {seconds:.0f}s — treating as wedged"
         ) from exc
+    finally:
+        _BUDGET_ENDS_AT.reset(token)
 
 
 async def heartbeat(

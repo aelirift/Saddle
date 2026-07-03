@@ -195,6 +195,32 @@ def _provider_gate(caller: LLMCaller):
     return entry[1]
 
 
+def _effective_provider_deadline(untried: int) -> float:
+    """Per-attempt deadline for one provider in a fail-over/race chain.
+
+    Resolution order:
+
+    * ``RAYXI_LLM_PROVIDER_DEADLINE_SECONDS`` set (non-empty) — the explicit
+      override wins verbatim, including ``0`` = unbounded. Explicit config is
+      never second-guessed.
+    * An ambient :func:`saddle.supervise.bounded` budget is active — each of the
+      ``untried`` remaining alternatives gets an equal share of the REMAINING
+      budget. A long legitimate call may use the time its stage actually has
+      (the flat default cut every provider on long-prompt hook stages), while a
+      silent hang still can't eat the alternatives' turn.
+    * Neither — the measured-happy-path default (:func:`_provider_deadline_seconds`).
+    """
+    raw = os.environ.get("RAYXI_LLM_PROVIDER_DEADLINE_SECONDS")
+    if raw is not None and str(raw).strip() != "":
+        return _provider_deadline_seconds()
+    from saddle import supervise
+
+    remaining = supervise.budget_remaining()
+    if remaining is None:
+        return _provider_deadline_seconds()
+    return remaining / max(1, untried)
+
+
 async def _call_under_deadline(
     caller: LLMCaller,
     system: str,
@@ -202,11 +228,12 @@ async def _call_under_deadline(
     *,
     json_mode: bool,
     label: str,
+    deadline_s: float | None = None,
 ) -> str:
     """Run one provider call under the per-provider wall-clock DEADLINE — the
     cure that turns a silent HANG into ``asyncio.TimeoutError`` -> fail-over
-    (see :func:`_provider_deadline_seconds`)."""
-    deadline = _provider_deadline_seconds()
+    (see :func:`_provider_deadline_seconds` / :func:`_effective_provider_deadline`)."""
+    deadline = _provider_deadline_seconds() if deadline_s is None else deadline_s
     coro = caller(system, prompt, json_mode=json_mode, label=label)
     if deadline <= 0:
         return await coro
@@ -220,6 +247,7 @@ async def _call_with_provider_deadline(
     *,
     json_mode: bool,
     label: str,
+    deadline_s: float | None = None,
 ) -> str:
     """Gate a single provider call by per-provider CONCURRENCY, then run it under
     the per-provider DEADLINE.
@@ -237,10 +265,12 @@ async def _call_with_provider_deadline(
     if gate is None:
         return await _call_under_deadline(
             caller, system, prompt, json_mode=json_mode, label=label,
+            deadline_s=deadline_s,
         )
     async with gate:
         return await _call_under_deadline(
             caller, system, prompt, json_mode=json_mode, label=label,
+            deadline_s=deadline_s,
         )
 
 
@@ -1264,6 +1294,7 @@ class FallbackCaller:
         # open provider and nothing has yet succeeded — it tries the still-open
         # ones as a last resort so a tripped breaker never yields zero attempts.
         skipped_open = False
+        attempted: set[int] = set()
         for pass_no in (1, 2):
             if pass_no == 2 and not skipped_open:
                 break
@@ -1279,6 +1310,12 @@ class FallbackCaller:
                     continue
                 if pass_no == 2 and not is_open:
                     continue  # already attempted in pass 1
+                # Fair share of the stage's remaining ambient budget across every
+                # provider not yet attempted this __call__ (skipped-open ones
+                # count — they may still run as pass-2 last resorts, so their
+                # reserve is kept). Shares grow as earlier providers fail fast.
+                untried = len(self._callers) - len(attempted)
+                attempted.add(i)
                 try:
                     result = await _call_with_provider_deadline(
                         caller,
@@ -1286,6 +1323,7 @@ class FallbackCaller:
                         prompt,
                         json_mode=json_mode,
                         label=label,
+                        deadline_s=_effective_provider_deadline(untried),
                     )
                     self._record_success(i)
                     return result
@@ -1293,13 +1331,14 @@ class FallbackCaller:
                     if _failover_routes_past(exc):
                         self._record_failure(i, time.monotonic())
                         _log.warning(
-                            "FallbackCaller: %s failed (%s), trying next…",
-                            type(caller).__name__, str(exc)[:120],
+                            "FallbackCaller: %s failed (%s: %s), trying next…",
+                            type(caller).__name__, type(exc).__name__,
+                            str(exc)[:120],
                         )
                         last_exc = exc
                     else:
                         raise
-        raise RuntimeError(f"All callers failed. Last error: {last_exc}")
+        raise RuntimeError(f"All callers failed. Last error: {last_exc!r}")
 
 
 class RaceCaller:
@@ -1323,6 +1362,10 @@ class RaceCaller:
         self._racers = list(racers)
 
     async def __call__(self, system: str, prompt: str, *, json_mode: bool = False, label: str = "") -> str:
+        # Racers run CONCURRENTLY, so each gets the full remaining ambient
+        # budget (untried=1) — dividing it would starve every racer for no
+        # sequencing benefit. Falls back to the flat default with no budget.
+        race_deadline = _effective_provider_deadline(1)
         tasks: list[asyncio.Task] = [
             asyncio.create_task(_call_with_provider_deadline(
                 racer,
@@ -1330,6 +1373,7 @@ class RaceCaller:
                 prompt,
                 json_mode=json_mode,
                 label=label,
+                deadline_s=race_deadline,
             ))
             for racer in self._racers
         ]
