@@ -177,20 +177,49 @@ def _design_already_fired(session: str, anchor: str) -> bool:
         return False
 
 
-def _mark_design_fired(session: str, anchor: str) -> None:
-    """Record that the design gate fired for ``anchor`` (atomic temp + replace,
-    like the intake cursor) so the rest of the turn's edits skip it. Best-effort:
-    an IO failure is logged, never raised — at worst it re-audits, never wedges."""
+def _design_marker_status(session: str, anchor: str) -> str:
+    """The recorded outcome of this turn's design review: ``"settled"`` (audited
+    clean, recorded as an agreed design), ``"issues"`` (review found problems),
+    ``"reviewed"`` (ran; outcome untyped — e.g. written by the turn-end path),
+    or ``""`` when the gate has not fired for this anchor."""
+    if not anchor:
+        return ""
+    try:
+        doc = json.loads(_design_marker_path(session).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if doc.get("anchor") != anchor:
+        return ""
+    return str(doc.get("status") or "reviewed")
+
+
+def _mark_design_fired(session: str, anchor: str, status: str = "reviewed") -> None:
+    """Record that the design gate fired for ``anchor`` with its outcome
+    (atomic temp + replace, like the intake cursor) so the rest of the turn's
+    edits skip it — except the strict gate, which re-reviews on ``"issues"``.
+    Best-effort: an IO failure is logged, never raised — at worst it re-audits,
+    never wedges."""
     if not anchor:
         return
     p = _design_marker_path(session)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({"anchor": anchor}), encoding="utf-8")
+        tmp.write_text(
+            json.dumps({"anchor": anchor, "status": status}), encoding="utf-8"
+        )
         os.replace(tmp, p)
     except OSError as exc:
         print(f"doctrine_hook: design marker write failed ({exc!r})", file=sys.stderr)
+
+
+def _gate_mode() -> str:
+    """The design gate's enforcement mode: ``"warn"`` (default — findings are
+    injected, edits never held) or ``"deny"`` (strict — a plan with unresolved
+    problems HOLDS code edits until it reviews clean or is settled through the
+    design_propose round). Rolled out warn-first by design (mediator §8)."""
+    mode = (os.environ.get("SADDLE_GATE_MODE") or "warn").strip().lower()
+    return mode if mode in ("warn", "deny") else "warn"
 
 
 def _emit_pretool_context(
@@ -248,6 +277,9 @@ def _design_outcome(ctx: "Context", goal: str, approach: str) -> "StageOutcome |
         return StageOutcome(
             sections=[no_recorded_design()],
             level=BUBBLE_ALERT,
+            # Rides as an issue so the strict gate holds the floor on a
+            # no-plan edit too — writing the plan IS the way through.
+            meta={"issues": [no_recorded_design()]},
         )
 
     from saddle.design import audit_proposal
@@ -263,7 +295,26 @@ def _design_outcome(ctx: "Context", goal: str, approach: str) -> "StageOutcome |
         what="the design review (root-cause / band-aid / coverage)",
     )
     if not verdict.has_issues:
-        return None  # the approach audited clean -> silent
+        # Audited clean at the moment code starts -> the plan IS the agreement.
+        # SETTLE it (mediator loop step 4): recorded as a final design with a
+        # completeness surface, so Stage 4 re-gates the code against it every
+        # turn from here on and the topic goes quiet. A settlement failure
+        # PROPAGATES to run_stage (classified, loud) — never a silent skip.
+        from saddle.design import settle_approach
+        from saddle.models import BUBBLE_NOTICE
+        from saddle.voice import design_settled
+
+        design = run_bounded(
+            settle_approach(goal, approach, ctx),
+            seconds=timeout,
+            what="recording the agreed design (settlement)",
+        )
+        return StageOutcome(
+            sections=[design_settled(design.summary or goal)],
+            level=BUBBLE_NOTICE,
+            title="plan agreed and recorded",
+            meta={"settled": True, "design_id": design.id},
+        )
     from saddle.voice import design_issues_pre_edit
 
     body = "\n".join(f"  • {i}" for i in verdict.issues)
@@ -320,8 +371,16 @@ def _run_design_stage(
         print(f"doctrine_hook: per-event scope error ({exc!r}); ambient scope",
               file=sys.stderr)
 
-    if not turn.anchor or _design_already_fired(session, turn.anchor):
-        return  # no turn to anchor on, or already reviewed this turn
+    if not turn.anchor:
+        return  # no turn to anchor on
+    mode = _gate_mode()
+    status = _design_marker_status(session, turn.anchor)
+    if status and not (mode == "deny" and status == "issues"):
+        # Already reviewed this turn. The ONE exception: strict mode with an
+        # unresolved-issues verdict RE-REVIEWS on each edit attempt — the agent
+        # may have revised its approach in prose since the deny, and the gate
+        # must read the revision rather than hold the floor forever.
+        return
 
     from saddle.models import STAGE_DESIGN
     from saddle.supervisor import run_stage, system_message
@@ -334,8 +393,32 @@ def _run_design_stage(
     )
     # Once per turn regardless of outcome: a clean run, a found drift, AND a
     # classified failure each count as "reviewed" — re-auditing every later edit of
-    # the same turn would spam. The failure already bubbled its own loud ALERT.
-    _mark_design_fired(session, turn.anchor)
+    # the same turn would spam (strict mode re-reviews ONLY the issues state).
+    # The failure already bubbled its own loud ALERT.
+    meta = (result.bubble.meta if result.bubble else {}) or {}
+    if meta.get("settled"):
+        outcome_status = "settled"
+    elif meta.get("issues"):
+        outcome_status = "issues"
+    else:
+        outcome_status = "reviewed"
+    _mark_design_fired(session, turn.anchor, outcome_status)
+
+    if mode == "deny" and outcome_status == "issues":
+        # Strict gate: the discussion holds the floor. Deny THIS edit with the
+        # findings and the way forward; the next edit attempt re-reviews the
+        # (possibly revised) approach above.
+        from saddle.voice import design_gate_deny
+
+        body = "\n".join(f"  • {i}" for i in meta.get("issues", []))
+        reason = design_gate_deny(body)
+        print(json.dumps(_deny_doc(
+            reason, system_msg="⛔ saddle is holding code edits until this "
+            "turn's plan reviews clean (strict design gate)."
+        )))
+        print(f"[design-gate] DENY {tool_name}: unresolved plan issues",
+              file=sys.stderr)
+        return
     if result.sections:
         # The agent reads additionalContext; the human reads systemMessage — a
         # caught band-aid / no-design (or a could-not-run ALERT) is heralded on

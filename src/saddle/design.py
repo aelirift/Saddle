@@ -824,6 +824,79 @@ async def audit_proposal(
     )
 
 
+async def settle_approach(
+    goal: str,
+    approach: str,
+    ctx: Context | None = None,
+    *,
+    approved_by: str = "converged",
+    caller: "LLMCaller | None" = None,
+    dkb: DKB | None = None,
+    code_root: str | Path | None = None,
+    persist: bool = True,
+) -> Design:
+    """Persist an audited-clean approach as a SETTLED design (mediator loop
+    step 4) — the write that brings Stage 4 alive from live sessions.
+
+    :func:`design_for` settles designs saddle AUTHORS; this settles a design the
+    AGENT authored (in its transcript or via the ``design_propose`` MCP round)
+    once it has audited clean. The approach is indexed into the small structured
+    fields (summary / satisfies / avoids / heeds) and grounded with a
+    completeness surface extracted against the REAL target tree, so the
+    turn-end conformance scan (:func:`conformance_scan`) can re-gate the code
+    against it every turn from now on. ``approved_by`` records the approval
+    source: ``"user"`` (the user picked/confirmed on the front plane) or
+    ``"converged"`` (saddle and the agent reached agreement through the audit).
+
+    Callers settle ONLY an approach that audited clean — settlement records
+    agreement, it never launders an unreviewed plan into authority."""
+    goal = (goal or "").strip()
+    approach = (approach or "").strip()
+    if not goal or not approach:
+        raise ValueError("cannot settle an empty goal/approach")
+    ctx = ctx or _default_ctx()
+    dkb = dkb or get_dkb()
+    if caller is None:
+        from saddle.llm.callers import build_callers
+        caller = build_callers(ctx)["default"]
+
+    code_root_path = _resolve_code_root(code_root)
+    async with tenant_gate(ctx):
+        code_task = asyncio.create_task(_parse_code(code_root_path))
+        index = _index_fields(
+            await call_json(
+                caller, _SYS_INDEX, _index_prompt(goal, approach),
+                label="design/settle-index",
+            )
+        )
+        mods = await code_task
+        diag = {"problem": "", "approach": approach}
+        manifest, _fanout = await _surface(caller, goal, diag, mods, code_root_path)
+
+    design = Design(
+        ask=goal,
+        summary=index["summary"],
+        approach=approach,
+        body=approach,
+        satisfies=index["satisfies"],
+        avoids=index["avoids"],
+        heeds=index["heeds"],
+        status=DESIGN_FINAL,
+        meta={
+            "approved_by": approved_by,
+            "settled_from": "live-session",
+            "surface": manifest.to_dict(),
+        },
+    )
+    if persist:
+        await asyncio.to_thread(dkb.add_design, ctx, design)
+        _log.info(
+            "settled design %s for %s (approved_by=%s)",
+            design.id, ctx.key, approved_by,
+        )
+    return design
+
+
 @dataclass
 class HarvestResult:
     """What a turn-end lesson harvest filed (Stage 5). ``titles`` names the durable

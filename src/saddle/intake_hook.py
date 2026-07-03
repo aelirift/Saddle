@@ -283,6 +283,78 @@ def _is_trivial(prompt: str) -> bool:
     return len(prompt.split()) < min_words
 
 
+# -- the turn-end DRAIN (mediator design: no more dead letters) ---------------
+#
+# Stop-hook findings (a prose-proposal review, code-vs-design drift, the lesson
+# harvest, the voice check) are produced AFTER the agent's reply — the agent
+# never saw them, and under a non-TTY host neither did the human. This drain
+# reads them back at the START of the next turn and injects them into the
+# agent's context, converting the turn-end channel's dead letters into
+# delivered feedback. Cursor per session (atomic replace, like the replay
+# cursor); origin-tagged bubbles only, so mid-turn injections the agent already
+# read are never duplicated.
+
+def _drain_cursor_path(session: str) -> Path:
+    from saddle.store import default_db_path
+
+    safe = "".join(
+        c if (c.isalnum() or c in "-_") else "_" for c in session
+    ) or "default"
+    return default_db_path().parent / "drain" / f"{safe}.json"
+
+
+def _drain_since(session: str) -> float:
+    try:
+        raw = _drain_cursor_path(session).read_text(encoding="utf-8")
+        return float(json.loads(raw).get("ts", 0.0))
+    except (OSError, ValueError, TypeError):
+        return 0.0
+
+
+def _set_drain_cursor(session: str, ts: float) -> None:
+    p = _drain_cursor_path(session)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"ts": float(ts)}), encoding="utf-8")
+        os.replace(tmp, p)
+    except OSError as exc:
+        print(f"intake_hook: drain cursor write failed ({exc!r})", file=sys.stderr)
+
+
+def _drained_findings(ctx: "Context", session: str) -> str:
+    """The rendered drain section, or ``""`` when nothing unseen accumulated.
+    Reads across project ledgers (a mixed-scope turn's findings live in each
+    project's own ledger) but only THIS session's bubbles, only those tagged
+    ``origin: turn-end``. Advances the cursor after reading — always, so a
+    quiet turn still bounds the next scan."""
+    import time as _time
+
+    from saddle.bubble import recent_bubbles
+    from saddle.voice import turn_end_findings_head
+
+    since = _drain_since(session)
+    now = _time.time()
+    events = recent_bubbles(
+        ctx, session=session, since_ts=since or None, limit=50, any_project=True
+    )
+    _set_drain_cursor(session, now)
+    unseen = [
+        e for e in reversed(events)  # oldest first for reading order
+        if (e.meta or {}).get("origin") == "turn-end" and e.text.strip()
+    ]
+    if not unseen:
+        return ""
+    blocks = []
+    for e in unseen[-_MAX_SURFACED:]:
+        text = e.text.strip()
+        if text.startswith("━━") and "\n" in text:
+            text = text.split("\n", 1)[1].strip()  # drop the banner — we re-frame
+        tag = f"[{e.project}] " if e.project != ctx.project else ""
+        blocks.append(f"• {tag}{text}")
+    return turn_end_findings_head() + "\n" + "\n".join(blocks)
+
+
 async def _itemize(ctx: "Context", prompt: str, session: str = "") -> str:
     from saddle.intake import decompose, format_intake
 
@@ -420,6 +492,15 @@ def main(argv: list[str] | None = None) -> int:
 
     results = []
 
+    # The turn-end DRAIN — deliver what the Stop-hook checks found after the
+    # agent's last reply (the agent has not seen those). A read, not a check:
+    # best-effort like the commitment readout, never a classified stage.
+    drained = ""
+    try:
+        drained = _drained_findings(ctx, session) if session else ""
+    except Exception as exc:  # noqa: BLE001 — the drain must not wedge the turn
+        print(f"intake_hook: drain error ({exc!r}); continuing", file=sys.stderr)
+
     # Stage 2 (intent), pick-drift axis — fast, deterministic: surface any
     # "committed a) then acted on b)" drift the agent made since the last prompt.
     # Through run_stage it gets its OWN bubble (an ALERT when drift surfaces) and
@@ -506,6 +587,8 @@ def main(argv: list[str] | None = None) -> int:
     #    screen but saddle is never invisible when it has something to say. The
     #    commitment is an agent reminder, not a screen herald, so it is NOT passed.
     sections = [s for r in results for s in r.sections]
+    if drained:
+        sections.insert(0, drained)  # last turn's unseen findings lead
     if commitment:
         sections.append(commitment)
     sm = system_message(ctx, results)

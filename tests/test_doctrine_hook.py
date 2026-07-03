@@ -408,11 +408,30 @@ def test_design_bandaid_heralds_on_screen(monkeypatch, capsys, tmp_path):
     assert "permissionDecision" not in doc["hookSpecificOutput"]
 
 
-def test_design_gate_clean_approach_is_silent(monkeypatch, capsys, tmp_path):
+def _patch_settle(monkeypatch, *, design_id="design_test1", summary="the plan"):
+    from saddle.models import DESIGN_FINAL, Design
+
+    settled = {"n": 0, "approved_by": None}
+
+    async def _settle(goal, approach, ctx=None, *, approved_by="converged", **kw):
+        settled["n"] += 1
+        settled["approved_by"] = approved_by
+        return Design(ask=goal, summary=summary, approach=approach,
+                      body=approach, status=DESIGN_FINAL, id=design_id)
+
+    monkeypatch.setattr("saddle.design.settle_approach", _settle)
+    return settled
+
+
+def test_design_gate_clean_approach_settles_the_design(monkeypatch, capsys, tmp_path):
+    """Mediator loop step 4: an approach that audits clean at the first code edit
+    IS the agreement — it is recorded as a settled design (Stage 4's substrate)
+    and said once, briefly."""
     from saddle.bubble import recent_bubbles
     from saddle.design import AuditVerdict
 
     _patch_audit(monkeypatch, _canned_audit(AuditVerdict(ok=True, issues=[])))
+    settled = _patch_settle(monkeypatch)
     tp = _transcript(tmp_path, [
         _t_user("bound the cache", "u1"),
         _t_asst("Root cause: unbounded map. I'll add an LRU with eviction.", "u2"),
@@ -420,8 +439,46 @@ def test_design_gate_clean_approach_is_silent(monkeypatch, capsys, tmp_path):
     rc, out = _run_design_hook(_edit_payload(tp), monkeypatch, capsys, tmp_path)
 
     assert rc == 0
-    assert out.out.strip() == ""                   # clean run -> nothing emitted
-    assert recent_bubbles(_DCTX) == []             # and no bubble
+    assert settled["n"] == 1
+    assert "Plan agreed and recorded" in out.out    # agent + human both hear it once
+    notices = [b for b in recent_bubbles(_DCTX, level="notice") if b.stage == "design"]
+    assert len(notices) == 1 and notices[0].meta.get("settled") is True
+
+
+def test_design_gate_strict_mode_denies_until_clean(monkeypatch, capsys, tmp_path):
+    """SADDLE_GATE_MODE=deny: unresolved plan issues HOLD the edit (deny doc on
+    stdout), and a revised approach on the next attempt re-reviews, settles, and
+    opens the gate — the discussion holds the floor, then lets go."""
+    from saddle.design import AuditVerdict
+
+    calls = {"n": 0}
+
+    async def _flip_audit(goal, approach, ctx=None, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return AuditVerdict(ok=False, issues=["band-aid: swallow-and-log"])
+        return AuditVerdict(ok=True, issues=[])
+
+    _patch_audit(monkeypatch, _flip_audit)
+    settled = _patch_settle(monkeypatch)
+    monkeypatch.setenv("SADDLE_GATE_MODE", "deny")
+    tp = _transcript(tmp_path, [
+        _t_user("fix the timeout", "u1"),
+        _t_asst("I'll wrap it in try/except and log.", "u2"),
+    ])
+    rc, out = _run_design_hook(_edit_payload(tp), monkeypatch, capsys, tmp_path)
+    assert rc == 0
+    doc = json.loads(out.out.strip().splitlines()[0])
+    assert doc["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "holding this code change" in doc["hookSpecificOutput"]["permissionDecisionReason"]
+    assert settled["n"] == 0
+
+    # second attempt: the (revised) approach audits clean -> settle -> allow
+    rc2, out2 = _run_design_hook(_edit_payload(tp), monkeypatch, capsys, tmp_path)
+    assert rc2 == 0
+    assert calls["n"] == 2                          # re-reviewed, not blind-denied
+    assert settled["n"] == 1
+    assert "permissionDecision" not in out2.out     # no deny -> the edit proceeds
 
 
 def test_design_gate_no_recorded_design_is_an_alert(monkeypatch, capsys, tmp_path):

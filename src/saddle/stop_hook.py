@@ -262,7 +262,7 @@ def _proposal_outcome(
     return StageOutcome(
         sections=[design_issues_turn_end(body)],
         level=BUBBLE_ALERT,
-        meta={"issues": list(verdict.issues)},
+        meta={"issues": list(verdict.issues), "origin": "turn-end"},
     )
 
 
@@ -298,6 +298,7 @@ def _conformance_outcome(ctx: "Context") -> "StageOutcome | None":
         level=level,
         title="code drifted from a settled design",
         meta={
+            "origin": "turn-end",
             "designs_checked": result.designs_checked,
             "drifts": [
                 {
@@ -404,6 +405,7 @@ def _harvest_outcome(
         level=BUBBLE_NOTICE,
         title="lessons learned this turn",
         meta={
+            "origin": "turn-end",
             "harvested": total,
             "considered": considered,
             "titles": titles_all,
@@ -461,7 +463,7 @@ def _voice_outcome(
         ],
         level=BUBBLE_ALERT,
         title="saddle's wording needs simplifying",
-        meta={"issues": list(issues)},
+        meta={"issues": list(issues), "origin": "turn-end"},
     )
 
 

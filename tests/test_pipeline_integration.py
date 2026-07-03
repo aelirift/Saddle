@@ -102,6 +102,11 @@ class _IntegDKB:
         rows = [d for d in self._designs if status is None or d.status == status]
         return rows[: int(limit)]
 
+    # -- Stage 3 settlement (a clean pre-edit approach is recorded) --
+    def add_design(self, ctx, design):
+        self._designs.append(design)
+        return design
+
     # -- Stage 5 (harvest) --
     def list_knowledge(self, ctx=None, *, limit=200, **kw):
         return list(self.added)

@@ -144,6 +144,38 @@ def no_recorded_design() -> str:
     )
 
 
+def design_gate_deny(body: str) -> str:
+    """Strict-mode deny: the plan has unresolved problems, so the code edit is
+    held until the plan is fixed — the discussion holds the floor."""
+    return (
+        "Saddle is holding this code change: the plan for this turn has "
+        "problems that need resolving before code is written (strict design "
+        f"gate is on):\n{body}\n"
+        "To proceed: state your revised approach in your reply (saddle "
+        "re-reviews it on your next edit attempt), or work it out with saddle "
+        "directly via its design_propose tool. Once the plan reviews clean it "
+        "is recorded as agreed and the gate opens."
+    )
+
+
+def design_settled(summary: str) -> str:
+    """A clean plan was recorded as an agreed design — said once, briefly."""
+    return (
+        "Plan agreed and recorded. Saddle will check future code against it "
+        f"and will not re-open this discussion unless the code drifts: {summary}"
+    )
+
+
+def turn_end_findings_head() -> str:
+    """Header for the drain: findings saddle's end-of-turn checks produced
+    AFTER the agent's last reply — the agent has not seen them yet."""
+    return (
+        "After your last reply, saddle's end-of-turn checks found the "
+        "following. You have not seen these yet — address what still applies "
+        "before continuing:"
+    )
+
+
 def settled_conflict_head() -> str:
     """Stage-2 header: the request conflicts with earlier decisions."""
     return (

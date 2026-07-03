@@ -492,6 +492,50 @@ def bubble_recent(
     return render_bubbles(events)
 
 
+# -- the design round-trip (mediator loop step 3) -----------------------------
+
+@mcp.tool(name="design_propose")
+async def design_propose(goal: str, approach: str) -> str:
+    """Propose your implementation approach for saddle's design review BEFORE
+    writing code — the round-trip half of the design discussion.
+
+    saddle audits the approach against the project's recorded lessons,
+    anti-patterns, and binding directives (the same review the pre-edit gate
+    runs). Two outcomes:
+
+    * problems found — you get them back as critique; revise the approach and
+      propose again (the round continues, code stays gated in strict mode);
+    * audits clean — the approach is SETTLED: recorded as an agreed design
+      with a completeness surface, the strict gate opens, and saddle's
+      turn-end conformance check will guard the code against this design from
+      now on.
+
+    Call it with the goal you are serving (the user's ask, in one line) and
+    your concrete approach (root cause, what changes where, what stays
+    consistent).
+    """
+    from saddle.design import audit_proposal, settle_approach
+
+    g = (goal or "").strip()
+    a = (approach or "").strip()
+    if not g or not a:
+        return "design_propose: both goal and approach are required"
+    ctx = _ctx()
+    verdict = await audit_proposal(g, a, ctx)
+    if verdict.has_issues:
+        body = "\n".join(f"- {i}" for i in verdict.issues)
+        return (
+            "NOT SETTLED — the review found problems to resolve before code "
+            f"is written. Revise the approach and propose again:\n{body}"
+        )
+    design = await settle_approach(g, a, ctx, approved_by="converged")
+    return (
+        f"SETTLED — recorded as agreed design {design.id} for {ctx.key}. "
+        "The gate is open; saddle will check future code against this design "
+        "and re-open the discussion only if the code drifts from it."
+    )
+
+
 # -- saddle's own LLM voice --------------------------------------------------
 
 @mcp.tool(name="discuss")
