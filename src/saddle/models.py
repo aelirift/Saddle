@@ -521,13 +521,14 @@ STAGE_LESSON = "lesson"    # 5 — the lesson from this turn is captured
 STAGE_GUARD = "guard"      # the deterministic doctrine pre-action gate (Layer 0)
 STAGE_DIALOG = "dialog"    # the back-and-forth correction channel the stages use
 STAGE_VOICE = "voice"      # the plain-language check on saddle's OWN messages
+STAGE_COMPLETION = "completion"  # the did-the-ACTUAL-goal-get-done gate
 # The five live supervisory stages, in turn order — what the staged runner owns.
 SUPERVISION_STAGES: tuple[str, ...] = (
     STAGE_INTAKE, STAGE_INTENT, STAGE_DESIGN, STAGE_CODE, STAGE_LESSON,
 )
 # Every label a bubble's ``stage`` may carry: the five stages + guard/dialog/voice.
 BUBBLE_STAGES: frozenset[str] = frozenset(SUPERVISION_STAGES) | {
-    STAGE_GUARD, STAGE_DIALOG, STAGE_VOICE,
+    STAGE_GUARD, STAGE_DIALOG, STAGE_VOICE, STAGE_COMPLETION,
 }
 
 

@@ -147,6 +147,7 @@ def _prep(monkeypatch, tmp_path, **extra):
     monkeypatch.setenv("SADDLE_CODE_ROOT", str(tmp_path))
     monkeypatch.setenv("SADDLE_HOOK_CODE", "0")   # isolate Stage 5 from Stage 4
     monkeypatch.setenv("SADDLE_HOOK_VOICE", "0")  # and from the voice check
+    monkeypatch.setenv("SADDLE_HOOK_COMPLETION", "0")  # and the completion gate
     for k, v in extra.items():
         monkeypatch.setenv(k, v)
 

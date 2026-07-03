@@ -58,10 +58,11 @@ def _run_stop(payload, monkeypatch, capsys, tmp_path, *, env=None):
     monkeypatch.setenv("SADDLE_PROJECT", "game")
     monkeypatch.setenv("SADDLE_HOME", str(tmp_path))
     monkeypatch.setenv("SADDLE_CODE_ROOT", str(tmp_path))
-    # The voice stage needs a live LLM; default it OFF here so every scripted
-    # test stays hermetic. The dedicated voice tests re-enable it via ``env``
-    # with the audit stubbed.
+    # The voice + completion stages need a live LLM; default them OFF here so
+    # every scripted test stays hermetic. Their dedicated tests re-enable via
+    # ``env`` with the audit stubbed.
     monkeypatch.setenv("SADDLE_HOOK_VOICE", "0")
+    monkeypatch.setenv("SADDLE_HOOK_COMPLETION", "0")
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))

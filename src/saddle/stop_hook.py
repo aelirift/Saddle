@@ -467,6 +467,52 @@ def _voice_outcome(
     )
 
 
+# -- Completion — did the USER'S ACTUAL GOAL get finished? --------------------
+
+def _completion_outcome(
+    ctx: "Context", session: str, transcript_path: str
+) -> "StageOutcome | None":
+    """Judge this turn's completion claim against the goal AS THE USER MEANT
+    IT (saddle.completion): a reply that reads as "finished" while the goal's
+    broader clauses (a quality bar, an "everything"/"all" scope, still-open
+    recorded asks) remain is an OVERCLAIM — alerted to the human now and
+    delivered to the agent on its next turn via the drain, so a premature
+    "done" is corrected instead of compounding into a cleared goal. A reply
+    that makes no completion claim is silent. Fails LOUD via run_stage."""
+    if os.environ.get("SADDLE_HOOK_COMPLETION", "1") == "0" or not transcript_path:
+        return None
+    from saddle.completion import audit_completion
+    from saddle.models import BUBBLE_ALERT
+    from saddle.supervisor import StageOutcome, run_bounded
+    from saddle.transcript import latest_turn
+
+    turn = latest_turn(transcript_path)
+    if not turn.approach.strip():
+        return None  # nothing was said this turn — nothing to judge
+    try:
+        timeout = float(os.environ.get("SADDLE_HOOK_COMPLETION_TIMEOUT", "60") or 60)
+    except ValueError:
+        timeout = 60.0
+    verdict = run_bounded(
+        audit_completion(turn.goal, turn.approach, ctx),
+        seconds=timeout,
+        what="whether the goal was truly finished before the reply said so",
+    )
+    if not verdict.overclaim:
+        return None
+    body = "\n".join(f"  • {m}" for m in verdict.missing) or "  • (unspecified)"
+    return StageOutcome(
+        sections=[
+            "The reply reads as \"finished\", but the goal as the user meant "
+            "it is NOT complete. Read the goal at its full breadth — these "
+            f"parts are still open:\n{body}"
+        ],
+        level=BUBBLE_ALERT,
+        title="finished was claimed too early",
+        meta={"missing": list(verdict.missing), "origin": "turn-end"},
+    )
+
+
 # -- entry point -------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
@@ -549,6 +595,20 @@ def main(argv: list[str] | None = None) -> int:
         lambda: _voice_outcome(ctx, session, since),
         session=session,
         what="whether saddle's own messages this turn read plainly",
+    ))
+
+    # Completion gate — a reply that says "finished" is audited against the
+    # goal AS THE USER MEANT IT (broad clauses + still-open ledger asks),
+    # never against the sub-list the reply enumerates. The founding incident:
+    # a goal auto-cleared on a confident summary while its "everything"/"AAA"
+    # clauses were open (2026-07-03).
+    from saddle.models import STAGE_COMPLETION
+
+    results.append(run_stage(
+        ctx, STAGE_COMPLETION,
+        lambda: _completion_outcome(ctx, session, transcript_path),
+        session=session,
+        what="whether the goal was truly finished before the reply said so",
     ))
     _set_harvest_watermark(session, mark)
 
