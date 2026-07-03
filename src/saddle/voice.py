@@ -103,7 +103,7 @@ def stage_failed(stage: str, category: str, subject: str, remedy: str,
     return (
         f"⚠ Saddle's {stage_plain(stage)} did not run this turn — "
         f"{failure_plain(category)}. That means {subject} went unchecked. "
-        f"{remedy} [{error}]"
+        f"{remedy} (technical detail for the developer: {error})"
     )
 
 

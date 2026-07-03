@@ -422,7 +422,7 @@ def _itemize_outcome(ctx: "Context", prompt: str, session: str = "") -> "StageOu
     except ValueError:
         timeout = 150.0
     text = run_bounded(_itemize(ctx, prompt, session), seconds=timeout,
-                       what="the prompt decomposition")
+                       what="the breakdown of your message into its requests")
     return StageOutcome(sections=[text]) if text and text.strip() else None
 
 
@@ -539,7 +539,7 @@ def main(argv: list[str] | None = None) -> int:
     results.append(run_stage(
         ctx, STAGE_INTAKE,
         lambda: _itemize_outcome(ctx, prompt, session),
-        session=session, what="the prompt decomposition (itemize → scope)",
+        session=session, what="the breakdown of your message into its requests",
     ))
 
     # Stage 2 (intent), sibling-project axis (mediator design §4): a prompt that

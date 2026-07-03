@@ -401,7 +401,7 @@ def describe_category(category: str) -> str:
             "for categorization completeness."
         ),
         "other": (
-            "uncategorized retry; add a category if this appears "
+            "an error type saddle has no name for yet; worth a look if it repeats "
             "repeatedly."
         ),
     }

@@ -508,7 +508,7 @@ def main(argv: list[str] | None = None) -> int:
         ctx, STAGE_DESIGN,
         lambda: _proposal_outcome(ctx, session, transcript_path),
         session=session,
-        what="the turn's prose-only design proposal",
+        what="the plan the agent wrote this turn (it changed no code yet)",
     ))
 
     # Stage 4 (code) — turn-end code-vs-design conformance. Its OWN STAGE_CODE
