@@ -256,12 +256,11 @@ def _proposal_outcome(
     _mark_design_fired(session, turn.anchor)
     if not verdict.has_issues:
         return None  # the prose approach audited clean -> silent
+    from saddle.voice import design_issues_turn_end
+
     body = "\n".join(f"  • {i}" for i in verdict.issues)
     return StageOutcome(
-        sections=[
-            "this turn proposed an approach in prose but wrote no code; reviewed at "
-            "turn-end it has design issues to resolve before implementing:\n" + body
-        ],
+        sections=[design_issues_turn_end(body)],
         level=BUBBLE_ALERT,
         meta={"issues": list(verdict.issues)},
     )
@@ -389,6 +388,59 @@ def _harvest_outcome(
     )
 
 
+# -- Voice — the plain-language check on saddle's OWN messages ----------------
+
+def _voice_outcome(
+    ctx: "Context", session: str, since_ts: float
+) -> "StageOutcome | None":
+    """Judge the prose saddle itself emitted this turn against the voice
+    contract (:mod:`saddle.voice`) — enforcement, not aspiration: a render a
+    non-technical reader can't follow is a finding, bubbled as an ALERT and
+    harvestable like any other caught drift. Skips saddle's OWN voice-stage
+    bubbles (they quote the offending jargon, so re-auditing them would
+    re-flag the quote every turn — a feedback loop, not a finding). Silent
+    when saddle said nothing this turn (no LLM call). Runs at turn-end where
+    latency is off the critical path."""
+    if os.environ.get("SADDLE_HOOK_VOICE", "1") == "0":
+        return None
+    from saddle.bubble import recent_bubbles
+    from saddle.models import STAGE_VOICE
+
+    texts = [
+        b.text.strip()
+        for b in recent_bubbles(ctx, session=session, since_ts=since_ts, limit=200)
+        if b.stage != STAGE_VOICE and b.text.strip()
+    ]
+    if not texts:
+        return None
+
+    from saddle.models import BUBBLE_ALERT
+    from saddle.supervisor import StageOutcome, run_bounded
+    from saddle.voice import audit_plainness
+
+    try:
+        timeout = float(os.environ.get("SADDLE_HOOK_VOICE_TIMEOUT", "45") or 45)
+    except ValueError:
+        timeout = 45.0
+    issues = run_bounded(
+        audit_plainness("\n\n---\n\n".join(texts), ctx),
+        seconds=timeout,
+        what="the plain-language check of saddle's own messages this turn",
+    )
+    if not issues:
+        return None
+    body = "\n".join(f"  • {i}" for i in issues)
+    return StageOutcome(
+        sections=[
+            "Saddle's own messages this turn were not plain enough for a "
+            f"non-technical reader — each needs simpler wording:\n{body}"
+        ],
+        level=BUBBLE_ALERT,
+        title="saddle's wording needs simplifying",
+        meta={"issues": list(issues)},
+    )
+
+
 # -- entry point -------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
@@ -457,6 +509,20 @@ def main(argv: list[str] | None = None) -> int:
         lambda: _harvest_outcome(ctx, session, transcript_path, since),
         session=session,
         what="this turn's caught drift into durable lessons",
+    ))
+
+    # Voice — did saddle itself speak plainly this turn? Reads every bubble in
+    # the same window Stage 5 used PLUS the ones the stages above just emitted
+    # (they precede this line), so a jargon-heavy alert is caught the very turn
+    # it went out. Runs before the watermark advances; its own bubble is
+    # excluded from future windows by stage, not by timestamp.
+    from saddle.models import STAGE_VOICE
+
+    results.append(run_stage(
+        ctx, STAGE_VOICE,
+        lambda: _voice_outcome(ctx, session, since),
+        session=session,
+        what="whether saddle's own messages this turn read plainly",
     ))
     _set_harvest_watermark(session, mark)
 

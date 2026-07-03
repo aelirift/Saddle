@@ -117,15 +117,15 @@ def test_itemize_failure_fails_loud_not_open(monkeypatch, capsys, tmp_path):
     )
     assert rc == 0                                  # observation never blocks
     c = _context(out)
-    assert "could not run" in c                     # loud, not swallowed
-    assert "did NOT verify" in c                    # names the unverified subject
+    assert "did not run" in c                     # loud, not swallowed
+    assert "went unchecked" in c                    # names the unverified subject
     assert "RuntimeError" in c                      # the root cause is surfaced
     assert "itemization unavailable" not in c       # the old fail-open string is gone
     # the durable ALERT bubble landed under the intake stage (the AFK channel).
     from saddle.bubble import recent_bubbles
     from saddle.context import Context
     alerts = recent_bubbles(Context(tenant="acme", project="game"), level="alert")
-    assert any(b.stage == "intake" and "could not run" in b.text for b in alerts)
+    assert any(b.stage == "intake" and "did not run" in b.text for b in alerts)
 
 
 # --- the slow path: itemized know/do list + scope warning ------------------
@@ -208,12 +208,12 @@ def test_history_axis_surfaces_design_drift(monkeypatch, capsys, tmp_path):
     )
     ctx = _context(out)
     assert rc == 0
-    assert "CONTRADICTS A SETTLED DESIGN" in ctx               # the history finding rendered
+    assert "Conflicts with an earlier design" in ctx        # the history finding rendered
     assert "switches the cache to redis" in ctx
     from saddle.bubble import recent_bubbles
     from saddle.context import Context
     alerts = recent_bubbles(Context(tenant="acme", project="game"), level="alert")
-    assert any(b.stage == "intent" and "CONTRADICTS" in b.text for b in alerts)
+    assert any(b.stage == "intent" and "Conflicts with an earlier design" in b.text for b in alerts)
 
 
 def test_history_axis_failure_fails_loud(monkeypatch, capsys, tmp_path):
@@ -229,11 +229,11 @@ def test_history_axis_failure_fails_loud(monkeypatch, capsys, tmp_path):
     )
     assert rc == 0
     c = _context(out)
-    assert "could not run" in c and "did NOT verify" in c and "RuntimeError" in c
+    assert "did not run" in c and "went unchecked" in c and "RuntimeError" in c
     from saddle.bubble import recent_bubbles
     from saddle.context import Context
     alerts = recent_bubbles(Context(tenant="acme", project="game"), level="alert")
-    assert any(b.stage == "intent" and "could not run" in b.text for b in alerts)
+    assert any(b.stage == "intent" and "did not run" in b.text for b in alerts)
 
 
 # --- the user-screen channel (ask #3: saddle visible on screen) -------------
@@ -269,7 +269,7 @@ def test_itemize_failure_heralds_on_screen(monkeypatch, capsys, tmp_path):
     )
     assert rc == 0
     sm = _system_msg(out)
-    assert "could not run" in sm and "did NOT verify" in sm
+    assert "did not run" in sm and "went unchecked" in sm
 
 
 def test_replay_drift_heralds_on_screen(monkeypatch, capsys, tmp_path):

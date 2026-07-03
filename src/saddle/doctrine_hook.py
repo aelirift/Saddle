@@ -136,11 +136,12 @@ def _surface_allow_warn(
         return
     reason = verdict.render()
     print(f"[doctrine] WARN out-of-focus {tool_name}: {reason}", file=sys.stderr)
-    _bubble(
-        "alert", "guard",
-        f"OUT-OF-FOCUS — allowed with WARNING (not blocked): {tool_name}\n{reason}",
-        session,
-    )
+    from pathlib import PurePath
+
+    from saddle.voice import out_of_focus
+
+    project = PurePath(root).name or root
+    _bubble("alert", "guard", out_of_focus(tool_name, project, reason), session)
 
 
 # -- Stage 3 (design) — the anti-band-aid pre-code review --------------------
@@ -242,12 +243,10 @@ def _design_outcome(ctx: "Context", goal: str, approach: str) -> "StageOutcome |
 
     approach = (approach or "").strip()
     if not approach:
+        from saddle.voice import no_recorded_design
+
         return StageOutcome(
-            sections=[
-                "⚠ NO RECORDED DESIGN — the agent went straight to a code edit "
-                "without first discussing the problem or its approach. Discuss the "
-                "approach before coding so it can be reviewed for drift."
-            ],
+            sections=[no_recorded_design()],
             level=BUBBLE_ALERT,
         )
 
@@ -265,12 +264,11 @@ def _design_outcome(ctx: "Context", goal: str, approach: str) -> "StageOutcome |
     )
     if not verdict.has_issues:
         return None  # the approach audited clean -> silent
+    from saddle.voice import design_issues_pre_edit
+
     body = "\n".join(f"  • {i}" for i in verdict.issues)
     return StageOutcome(
-        sections=[
-            "this turn's approach has design issues that should be resolved "
-            f"before code is written:\n{body}"
-        ],
+        sections=[design_issues_pre_edit(body)],
         level=BUBBLE_ALERT,
         # The caught flaws ride on the bubble (like Stage 4's code drift) so the
         # turn-end lesson harvest (Stage 5) can learn from them without re-parsing

@@ -145,7 +145,8 @@ def _prep(monkeypatch, tmp_path, **extra):
     monkeypatch.setenv("SADDLE_PROJECT", "game")
     monkeypatch.setenv("SADDLE_HOME", str(tmp_path))
     monkeypatch.setenv("SADDLE_CODE_ROOT", str(tmp_path))
-    monkeypatch.setenv("SADDLE_HOOK_CODE", "0")  # isolate Stage 5 from Stage 4
+    monkeypatch.setenv("SADDLE_HOOK_CODE", "0")   # isolate Stage 5 from Stage 4
+    monkeypatch.setenv("SADDLE_HOOK_VOICE", "0")  # and from the voice check
     for k, v in extra.items():
         monkeypatch.setenv(k, v)
 

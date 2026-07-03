@@ -258,10 +258,10 @@ def _failed(
     and the remediation hint, so the gap is impossible to mistake for a pass."""
     category, remedy = classify_failure(exc)
     subject = what or f"stage {stage}"
-    text = (
-        f"⚠ {stage}: could not run ({category}). "
-        f"saddle did NOT verify {subject} this turn — {remedy} "
-        f"[{type(exc).__name__}: {exc}]"
+    from saddle.voice import stage_failed
+
+    text = stage_failed(
+        stage, category, subject, remedy, f"{type(exc).__name__}: {exc}"
     )
     _log.warning("supervisory stage %s failed (%s): %r", stage, category, exc)
     bubble = emit_bubble(

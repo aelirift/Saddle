@@ -55,6 +55,8 @@ from saddle.context import Context, default as _default_ctx
 from saddle.llm.json_tools import call_json
 from saddle.llm.pool import tenant_gate
 from saddle.models import BUBBLE_ALERT, BUBBLE_NOTICE
+from saddle.voice import kind_plain as _kind_plain
+from saddle.voice import settled_conflict_head as _settled_conflict_head
 
 if TYPE_CHECKING:  # pragma: no cover
     from saddle.dkb import DKB
@@ -78,12 +80,8 @@ DIVERGENCE_KINDS: frozenset[str] = frozenset(
 # breach). The split is what makes ``IntentReport.level`` per-finding, not flat.
 _HARD_KINDS: frozenset[str] = frozenset({CONTRADICTS_DESIGN, REOPENS_DECISION})
 
-# Compact, human-readable headline per kind for the rendered section.
-_KIND_LABEL: dict[str, str] = {
-    CONTRADICTS_DESIGN: "CONTRADICTS A SETTLED DESIGN",
-    REOPENS_DECISION: "RE-OPENS A CLOSED DECISION",
-    SCOPE_CREEP: "CREEPS PAST THE PROJECT'S FOCUS",
-}
+# Headlines per kind live in the voice chokepoint (saddle.voice.KIND_PLAIN)
+# so every user-facing surface speaks the same plain language.
 
 
 # -- what a single divergence is ---------------------------------------------
@@ -109,13 +107,14 @@ class IntentDivergence:
         return self.kind in _HARD_KINDS
 
     def render(self) -> str:
-        """One readable block: a tagged headline, the pull, and the evidence."""
-        head = f"• {_KIND_LABEL.get(self.kind, self.kind.upper())}"
-        if self.ref:
-            head += f" [{self.ref}]"
-        lines = [f"{head}: {self.what}"]
+        """One readable block: a plain headline, the pull, the evidence, and
+        the record locator LAST (an id belongs after the explanation, never
+        inside the headline where it reads as jargon)."""
+        lines = [f"• {_kind_plain(self.kind)}: {self.what}"]
         if self.why:
             lines.append(f"    ↳ {self.why}")
+        if self.ref:
+            lines.append(f"    (recorded as: {self.ref})")
         return "\n".join(lines)
 
 
@@ -151,9 +150,8 @@ class IntentReport:
         when nothing drifted, so the stage stays silent on a clean compare."""
         if not self.divergences:
             return []
-        head = "this prompt pulls against what the project has already settled:"
         body = "\n".join(d.render() for d in self.divergences)
-        return [f"{head}\n{body}"]
+        return [f"{_settled_conflict_head()}\n{body}"]
 
 
 # -- the classify prompt + its context blocks --------------------------------
@@ -189,7 +187,11 @@ _SYS_HISTORY = (
     "For each genuine pull give: kind (one of the three above), what (the pull in "
     "one clear line), why (which settled design/decision it collides with and "
     "how), ref (a short locator — the design's id or the decision's title — or "
-    '"").\n\n'
+    '"").\n'
+    "The 'what' and 'why' are read by the project's HUMAN OWNER, not only by "
+    "engineers: write them in plain everyday words, spell out what any "
+    "technical name refers to, and lead with what the conflict means for the "
+    "project.\n\n"
     "Respond with ONLY a JSON object: "
     '{"divergences": [{"kind": "...", "what": "...", "why": "...", '
     '"ref": "..."}]}. '

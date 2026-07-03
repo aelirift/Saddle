@@ -441,9 +441,9 @@ def test_design_gate_no_recorded_design_is_an_alert(monkeypatch, capsys, tmp_pat
     assert rc == 0
     assert called["audit"] is False                # no approach -> no LLM call
     dec = json.loads(out.out)["hookSpecificOutput"]
-    assert "NO RECORDED DESIGN" in dec["additionalContext"]
+    assert "without first laying out its plan" in dec["additionalContext"]
     alerts = recent_bubbles(_DCTX, level="alert")
-    assert any(b.stage == "design" and "NO RECORDED DESIGN" in b.text for b in alerts)
+    assert any(b.stage == "design" and "without first laying out its plan" in b.text for b in alerts)
 
 
 def test_design_gate_fires_once_per_turn(monkeypatch, capsys, tmp_path):
@@ -481,8 +481,8 @@ def test_design_gate_audit_failure_fails_loud(monkeypatch, capsys, tmp_path):
     assert rc == 0                                  # observation never blocks
     # a classified ALERT bubble naming what saddle did NOT verify this turn.
     alerts = recent_bubbles(_DCTX, level="alert")
-    assert any(b.stage == "design" and "could not run" in b.text for b in alerts)
-    assert "could not run" in out.out               # the agent learns it too
+    assert any(b.stage == "design" and "did not run" in b.text for b in alerts)
+    assert "did not run" in out.out                 # the agent learns it too
 
 
 def test_design_gate_skips_non_edit_tools(monkeypatch, capsys, tmp_path):

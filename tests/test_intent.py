@@ -144,9 +144,9 @@ def test_contradiction_of_a_settled_design_is_an_alert():
     assert rep.has_drift is True
     assert rep.level == BUBBLE_ALERT                     # a hard pull -> loud
     (section,) = rep.sections()
-    assert "CONTRADICTS A SETTLED DESIGN" in section
+    assert "Conflicts with an earlier design" in section
     assert "switches the cache to redis" in section
-    assert "[design_1]" in section
+    assert "(recorded as: design_1)" in section
 
 
 # --- a re-opened decision is also hard -> ALERT -------------------------------
@@ -158,7 +158,7 @@ def test_reopened_decision_is_an_alert():
     rep = _run("should we use redis for the cache?",
                caller=FakeCaller(_verdict([div])), dkb=FakeDKB(hits=decisions))
     assert rep.level == BUBBLE_ALERT
-    assert "RE-OPENS A CLOSED DECISION" in rep.sections()[0]
+    assert "Goes against an earlier decision" in rep.sections()[0]
 
 
 # --- scope-creep alone is a NOTICE; any hard pull escalates a mix -------------
@@ -171,7 +171,7 @@ def test_scope_creep_alone_is_a_notice():
                caller=FakeCaller(_verdict([div])), dkb=FakeDKB(designs))
     assert rep.has_drift is True
     assert rep.level == BUBBLE_NOTICE                    # a soft pull -> notice
-    assert "CREEPS PAST THE PROJECT'S FOCUS" in rep.sections()[0]
+    assert "Outside this project's current focus" in rep.sections()[0]
 
 
 def test_mixed_findings_escalate_to_alert():
@@ -216,7 +216,7 @@ def test_intent_divergence_hardness_and_render():
     soft = intent.IntentDivergence(kind=intent.SCOPE_CREEP, what="y")
     assert hard.hard is True and soft.hard is False
     rendered = hard.render()
-    assert "RE-OPENS A CLOSED DECISION" in rendered and "[r]" in rendered
+    assert "Goes against an earlier decision" in rendered and "(recorded as: r)" in rendered
 
 
 def test_project_scoped_keeps_tenant_drops_global_and_other_tenants():

@@ -54,6 +54,7 @@ from saddle.dkb import DKB, get_dkb
 from saddle.llm import policy
 from saddle.llm.json_tools import call_json, strip_think
 from saddle.llm.pool import tenant_gate
+from saddle.voice import VOICE_CONTRACT as _VOICE_CONTRACT
 from saddle.models import (
     ANTI_PATTERN,
     AUDIT,
@@ -241,6 +242,8 @@ _SYS_AUDIT = (
     "issue per line, naming what is wrong and where. Every non-blank line after "
     "the verdict is read as exactly one issue.\n"
     "Emit nothing else: no preamble, no JSON, no code fence, no closing remark."
+    "\nYour issues are read by the project's HUMAN OWNER, not only by "
+    "engineers." + _VOICE_CONTRACT
 )
 
 
@@ -336,6 +339,9 @@ _SYS_HARVEST = (
     "that bar, return an empty list.\n"
     "For each: kind ('lesson' or 'anti_pattern'), title (a short phrase), body "
     "(1-2 sentences of durable insight), tags (a few keywords).\n"
+    "Titles and bodies are later shown to the project's HUMAN OWNER inside "
+    "warnings, so write them in plain everyday words — no insider shorthand "
+    "that only makes sense to whoever wrote it.\n"
     "Respond with ONLY JSON: "
     '{"entries": [{"kind": "...", "title": "...", "body": "...", "tags": ["..."]}]}'
 )

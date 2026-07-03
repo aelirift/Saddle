@@ -58,6 +58,10 @@ def _run_stop(payload, monkeypatch, capsys, tmp_path, *, env=None):
     monkeypatch.setenv("SADDLE_PROJECT", "game")
     monkeypatch.setenv("SADDLE_HOME", str(tmp_path))
     monkeypatch.setenv("SADDLE_CODE_ROOT", str(tmp_path))
+    # The voice stage needs a live LLM; default it OFF here so every scripted
+    # test stays hermetic. The dedicated voice tests re-enable it via ``env``
+    # with the audit stubbed.
+    monkeypatch.setenv("SADDLE_HOOK_VOICE", "0")
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
@@ -161,9 +165,9 @@ def test_scan_failure_fails_loud(monkeypatch, capsys, tmp_path):
     alerts = _bubbles(level="alert")
     code_alert = next((b for b in alerts if b.stage == "code"), None)
     assert code_alert is not None
-    assert "could not run" in code_alert.text and "did NOT verify" in code_alert.text
+    assert "did not run" in code_alert.text and "went unchecked" in code_alert.text
     assert "RuntimeError" in code_alert.text
-    assert "could not run" in out.err
+    assert "did not run" in out.err
 
 
 # --- the user-screen channel (ask #3: saddle visible on screen) -------------
@@ -197,8 +201,8 @@ def test_scan_failure_heralds_could_not_run_on_screen(monkeypatch, capsys, tmp_p
     rc, out = _run_stop({"session_id": "s1"}, monkeypatch, capsys, tmp_path)
     assert rc == 0
     payload = json.loads(out.out)
-    assert "could not run" in payload["systemMessage"]
-    assert "did NOT verify" in payload["systemMessage"]
+    assert "did not run" in payload["systemMessage"]
+    assert "went unchecked" in payload["systemMessage"]
 
 
 def test_clean_turn_emits_no_stdout(monkeypatch, capsys, tmp_path):
@@ -444,6 +448,81 @@ def test_proposal_review_audit_failure_fails_loud(monkeypatch, capsys, tmp_path)
     rc, out = _run_stop(_stop_payload(tp), monkeypatch, capsys, tmp_path)
 
     assert rc == 0
-    assert any(b.stage == "design" and "could not run" in b.text
+    assert any(b.stage == "design" and "did not run" in b.text
                for b in _bubbles(level="alert"))
-    assert "could not run" in json.loads(out.out)["systemMessage"]
+    assert "did not run" in json.loads(out.out)["systemMessage"]
+
+
+# --- the voice stage — saddle's own plain-language check ---------------------
+
+def test_voice_flags_jargon_in_saddles_own_messages(monkeypatch, capsys, tmp_path):
+    """When saddle spoke this turn and the plainness audit finds jargon, a
+    STAGE_VOICE ALERT bubbles naming each offending phrase — enforcement of the
+    voice contract, not aspiration."""
+    from saddle.bubble import emit_bubble
+
+    monkeypatch.setenv("SADDLE_TENANT", "acme")
+    monkeypatch.setenv("SADDLE_PROJECT", "game")
+    monkeypatch.setenv("SADDLE_HOME", str(tmp_path))
+    emit_bubble(_CTX, "the MP layer burped a hootie", stage="design",
+                session="s1")
+
+    async def _fake_audit(text, ctx=None):
+        assert "hootie" in text
+        return ["jargon: 'the MP layer burped a hootie' explains nothing"]
+
+    monkeypatch.setattr("saddle.voice.audit_plainness", _fake_audit)
+    tp = _transcript(tmp_path, [_t_user("do it", "u1")])
+    rc, out = _run_stop(_stop_payload(tp), monkeypatch, capsys, tmp_path,
+                        env={"SADDLE_HOOK_VOICE": "1"})
+
+    assert rc == 0
+    voice_alerts = [b for b in _bubbles(level="alert") if b.stage == "voice"]
+    assert len(voice_alerts) == 1
+    assert "hootie" in voice_alerts[0].text
+    assert "simpler wording" in voice_alerts[0].text
+
+
+def test_voice_silent_when_saddle_said_nothing(monkeypatch, capsys, tmp_path):
+    """No bubbles this turn -> no LLM call, no voice bubble (a quiet saddle has
+    nothing to be judged on)."""
+    called = {"n": 0}
+
+    async def _counting(text, ctx=None):
+        called["n"] += 1
+        return []
+
+    monkeypatch.setattr("saddle.voice.audit_plainness", _counting)
+    tp = _transcript(tmp_path, [_t_user("do it", "u1")])
+    rc, out = _run_stop(_stop_payload(tp), monkeypatch, capsys, tmp_path,
+                        env={"SADDLE_HOOK_VOICE": "1"})
+
+    assert rc == 0
+    assert called["n"] == 0
+    assert not any(b.stage == "voice" for b in _bubbles())
+
+
+def test_voice_skips_its_own_prior_bubbles(monkeypatch, capsys, tmp_path):
+    """A voice ALERT quotes the jargon it caught; re-auditing it next turn would
+    re-flag the quote forever. Voice-stage bubbles are excluded from the window."""
+    from saddle.bubble import emit_bubble
+
+    monkeypatch.setenv("SADDLE_TENANT", "acme")
+    monkeypatch.setenv("SADDLE_PROJECT", "game")
+    monkeypatch.setenv("SADDLE_HOME", str(tmp_path))
+    emit_bubble(_CTX, "wording alert quoting 'burped a hootie'", stage="voice",
+                session="s1")
+
+    called = {"n": 0}
+
+    async def _counting(text, ctx=None):
+        called["n"] += 1
+        return []
+
+    monkeypatch.setattr("saddle.voice.audit_plainness", _counting)
+    tp = _transcript(tmp_path, [_t_user("go", "u1")])
+    rc, _ = _run_stop(_stop_payload(tp), monkeypatch, capsys, tmp_path,
+                      env={"SADDLE_HOOK_VOICE": "1"})
+
+    assert rc == 0
+    assert called["n"] == 0  # only a voice bubble existed -> nothing to judge

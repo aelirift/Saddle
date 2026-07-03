@@ -505,6 +505,7 @@ async def discuss(topic: str) -> str:
     the deterministic tools above, which are saddle's red/green verdicts.
     """
     from saddle.llm.callers import build_callers
+    from saddle.voice import VOICE_CONTRACT
 
     msg = (topic or "").strip()
     if not msg:
@@ -516,7 +517,10 @@ async def discuss(topic: str) -> str:
         "coding agent. You hold the high-level intent and design of a project, "
         "independent of the agent's context window. Answer concisely and "
         "concretely. If you see drift from the stated or recorded intent, say so "
-        "plainly. Do not pad, do not hedge, do not estimate effort."
+        "plainly. Do not pad, do not hedge, do not estimate effort. When the "
+        "topic is engineer-to-engineer (the agent asking about design), match "
+        "its technical depth; when your words will reach the project's human "
+        "owner, follow the style contract below." + VOICE_CONTRACT
     )
     return await caller(system, msg, label="mcp/discuss")
 

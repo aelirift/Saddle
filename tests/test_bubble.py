@@ -342,7 +342,7 @@ def test_doctrine_hook_out_of_focus_edit_emits_alert_bubble(tmp_path, monkeypatc
     assert rc == 0
     got = recent_bubbles(resolve(), session="HS3")
     assert any(
-        e.level == "alert" and e.stage == "guard" and "OUT-OF-FOCUS" in e.text
+        e.level == "alert" and e.stage == "guard" and "OUTSIDE" in e.text
         for e in got
     )
 

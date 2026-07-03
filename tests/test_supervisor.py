@@ -178,9 +178,9 @@ def test_raising_stage_is_caught_classified_and_alerted(store):
     (b,) = store.recent(_ctx())
     assert b.level == BUBBLE_ALERT
     assert b.stage == "intake"
-    assert "could not run" in b.text
-    assert "did NOT verify the prompt decomposition" in b.text
-    assert "timeout" in b.text
+    assert "did not run" in b.text
+    assert "the prompt decomposition went unchecked" in b.text
+    assert "ran out of time" in b.text
     assert b.meta.get("failure") == "timeout"
     assert b.meta.get("what") == "the prompt decomposition"
 
@@ -195,7 +195,7 @@ def test_failure_subject_defaults_to_stage_name(store):
     assert res.ok is False
     assert res.failure == "other"
     (b,) = store.recent(_ctx())
-    assert "did NOT verify stage lesson" in b.text
+    assert "stage lesson went unchecked" in b.text
 
 
 def test_control_flow_exceptions_propagate(store):
@@ -335,8 +335,8 @@ def test_system_message_includes_a_could_not_run_failure(store):
 
     failed = run_stage(_ctx(), "intake", boom, what="the prompt decomposition")
     sm = system_message(_ctx(), [failed])
-    assert "could not run" in sm
-    assert "did NOT verify the prompt decomposition" in sm
+    assert "did not run" in sm
+    assert "the prompt decomposition went unchecked" in sm
 
 
 def test_system_message_caps_a_flooding_section(store):
