@@ -178,3 +178,30 @@ Pinned by `tests/test_directive_durability.py` (split / unclassified-defaults-to
 > instructions no longer repollute policy. The two mitigations remain as defense in
 > depth: the applicability clause stops a mis-applied directive at the gate even if
 > one slips through, and `demote_directive` curates out anything already there.
+
+## Gap 5 — Stage 3 (pre-code design review) contradicts the completion stage's own verdict [status: OPEN — design needed]
+
+**Observed (2026-07-03, aeli/rayxiv4):** the Stop-hook completion gate blocked a
+turn-end because the active goal ("complete all items, fix all bugs, close all
+gaps and reverify") still had unmet items — it NAMED the un-executed deletion
+and the unverified feature rows as the gap. The very next turn, the agent
+resumed exactly that work, and Stage 3's pre-edit review flagged the resumed
+work as intent drift / "goal-keeper bypassed", arguing the agent should instead
+return to a closing message. Both organs read the same goal; one demanded the
+work, the other condemned it.
+
+**Root cause:** stages audit independently. Stage 3 builds its judgment from
+the intake ledger + directives but never reads the LATEST completion verdict
+(`_LAST_COMPLETION_VERDICT` / the goal-keeper's block reason), so after a
+forced continuation it evaluates the resumed work with no knowledge that
+saddle itself ordered it.
+
+**Design direction (for the next saddle session):** thread the most recent
+completion verdict (goal_active, missing[]) into Stage 3's audit context as a
+binding input — "work that closes an item the completion gate listed as
+missing is IN-goal by definition, never drift." The verdict is already
+persisted per session for the keeper cap; Stage 3 just needs to load it.
+
+**Class:** any pair of stages judging the same turn from different state
+snapshots — the fix pattern (share the newest verdict, declare precedence)
+generalizes to voice/completion and guard/design as well.
