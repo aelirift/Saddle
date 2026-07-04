@@ -166,6 +166,19 @@ def design_settled(summary: str) -> str:
     )
 
 
+def goal_keeper_reason(missing: list) -> str:
+    """The stop-block reason: the goal is not finished, so keep working.
+    Read by the AGENT (it resumes with this text) and shown to the human."""
+    body = "\n".join(f"  • {m}" for m in missing) or "  • (the goal's remaining work)"
+    return (
+        "Saddle's goal-keeper: the goal you are driving is not finished, and "
+        "you are not blocked on the user — so keep working instead of "
+        f"stopping. Still open:\n{body}\n"
+        "Pick the next open item and continue. If you are genuinely blocked "
+        "on a decision only the user can make, ask that question directly."
+    )
+
+
 def turn_end_findings_head() -> str:
     """Header for the drain: findings saddle's end-of-turn checks produced
     AFTER the agent's last reply — the agent has not seen them yet."""

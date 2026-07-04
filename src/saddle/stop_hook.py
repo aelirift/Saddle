@@ -55,7 +55,10 @@ Knobs (env, all optional):
 * ``SADDLE_HOOK_LESSON``        "0" disables the Stage-5 lesson harvest; default on.
 * ``SADDLE_HOOK_LESSON_TIMEOUT`` deadline (s) for the harvest LLM call; default 60.
 
-Protocol: **observe-only, exit 0 always.** The five stages observe and surface —
+Protocol: exit 0 always. Observe-only EXCEPT the goal-keeper (user-granted
+2026-07-03): an active, unmet goal with an agent not blocked on the user
+emits a Stop ``decision: block`` that drives the agent back to work — see
+the goal-keeper section + the recorded policy directive. Everything else: The five stages observe and surface —
 they do NOT block the turn (blocking is the doctrine guard's job), and a ``Stop``
 hook that "blocked" would force the agent to keep going, which is enforcement, not
 observation. So this hook emits NO stop decision: the durable per-stage bubble
@@ -469,6 +472,13 @@ def _voice_outcome(
 
 # -- Completion — did the USER'S ACTUAL GOAL get finished? --------------------
 
+# The last completion verdict of THIS hook invocation — written by the
+# completion stage, read by the goal-keeper decision below. A holder (not a
+# return) because run_stage's contract returns a StageOutcome, and the keeper
+# needs the verdict even when the stage says nothing (no overclaim).
+_LAST_COMPLETION_VERDICT: list = []
+
+
 def _completion_outcome(
     ctx: "Context", session: str, transcript_path: str
 ) -> "StageOutcome | None":
@@ -498,6 +508,8 @@ def _completion_outcome(
         seconds=timeout,
         what="whether the goal was truly finished before the reply said so",
     )
+    _LAST_COMPLETION_VERDICT.clear()
+    _LAST_COMPLETION_VERDICT.append(verdict)
     if not verdict.overclaim:
         return None
     body = "\n".join(f"  • {m}" for m in verdict.missing) or "  • (unspecified)"
@@ -511,6 +523,81 @@ def _completion_outcome(
         title="finished was claimed too early",
         meta={"missing": list(verdict.missing), "origin": "turn-end"},
     )
+
+
+# -- The GOAL-KEEPER — an unmet goal drives the agent back to work -------------
+#
+# User directive (2026-07-03): "if saddle catches it, it should drive you back
+# into working." This supersedes the original observe-only decision for the
+# Stop hook: when the completion audit says a driving goal is ACTIVE, NOT
+# complete, and the agent is NOT genuinely blocked on the user, the stop is
+# BLOCKED and the agent resumes with the missing list as its marching orders.
+# Runaway guard: at most _KEEPER_MAX_CONSECUTIVE blocks in a row per session —
+# past that, the keeper alerts loudly instead of blocking, so a truly stuck
+# agent surfaces to the human rather than spinning.
+
+_KEEPER_MAX_CONSECUTIVE = 3
+
+
+def _keeper_marker_path(session: str):
+    from saddle.store import default_db_path
+
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in session) or "default"
+    return default_db_path().parent / "keeper" / f"{safe}.json"
+
+
+def _keeper_count(session: str) -> int:
+    try:
+        return int(json.loads(_keeper_marker_path(session).read_text(
+            encoding="utf-8")).get("consecutive", 0))
+    except (OSError, ValueError, TypeError):
+        return 0
+
+
+def _set_keeper_count(session: str, n: int) -> None:
+    p = _keeper_marker_path(session)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"consecutive": int(n)}), encoding="utf-8")
+        os.replace(tmp, p)
+    except OSError as exc:
+        print(f"stop_hook: keeper marker write failed ({exc!r})", file=sys.stderr)
+
+
+def _keeper_decision(ctx: "Context", session: str) -> str:
+    """The goal-keeper's verdict for this turn: a non-empty BLOCK REASON when
+    the stop must be refused, else "". Reads the completion verdict the
+    completion stage just computed; no verdict (stage off / failed / silent
+    turn) means no block — enforcement never guesses."""
+    if os.environ.get("SADDLE_GOAL_KEEPER", "1") == "0":
+        return ""
+    if not _LAST_COMPLETION_VERDICT:
+        return ""
+    verdict = _LAST_COMPLETION_VERDICT[0]
+    if not verdict.should_keep_working:
+        _set_keeper_count(session, 0)  # progress or a legit stop — reset
+        return ""
+    blocks = _keeper_count(session)
+    if blocks >= _KEEPER_MAX_CONSECUTIVE:
+        # The cap: alert the human instead of a fourth forced lap.
+        from saddle.bubble import emit_bubble
+        from saddle.models import BUBBLE_ALERT, STAGE_COMPLETION
+
+        emit_bubble(
+            ctx,
+            "Saddle's goal-keeper stopped pushing after "
+            f"{blocks} forced continuations in a row — the agent may be "
+            "stuck. The goal is still not finished; it needs a human look.",
+            level=BUBBLE_ALERT, stage=STAGE_COMPLETION, session=session,
+            meta={"origin": "turn-end", "keeper_capped": True},
+        )
+        _set_keeper_count(session, 0)
+        return ""
+    _set_keeper_count(session, blocks + 1)
+    from saddle.voice import goal_keeper_reason
+
+    return goal_keeper_reason(list(verdict.missing))
 
 
 # -- entry point -------------------------------------------------------------
@@ -617,6 +704,26 @@ def main(argv: list[str] | None = None) -> int:
     # a TTY. The durable per-stage bubbles already went out via run_stage.
     sections = [s for r in results for s in r.sections]
     sm = system_message(ctx, results)
+
+    # The goal-keeper (enforcement, user-directed 2026-07-03): an active,
+    # unmet goal with an agent that is not blocked on the user REFUSES the
+    # stop — the agent resumes with the missing list. Emitted as the Stop
+    # decision JSON; everything above stays observation.
+    reason = ""
+    try:
+        reason = _keeper_decision(ctx, session)
+    except Exception as exc:  # noqa: BLE001 — keeper failure must not wedge the turn
+        print(f"stop_hook: goal-keeper error ({exc!r}); not blocking", file=sys.stderr)
+    if reason:
+        print(json.dumps({
+            "decision": "block",
+            "reason": reason,
+            "systemMessage": "🔁 saddle's goal-keeper: the goal is not "
+                             "finished — sending the agent back to work.",
+        }))
+        print("[goal-keeper] BLOCKED the stop — goal still open", file=sys.stderr)
+        return 0
+
     _emit(ctx, sections, system_msg=sm)
     return 0
 

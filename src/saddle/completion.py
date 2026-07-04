@@ -61,9 +61,20 @@ _SYS_COMPLETION = (
     "opening_declares_finished on the opening ALONE: an automated goal "
     "checker reads the opening, so a finished-sounding opening counts even "
     "when later paragraphs list further work.\n\n"
+    "Also judge two more things:\n"
+    "- goal_active: is there an unfinished multi-step goal the agent is "
+    "responsible for DRIVING (an explicit goal, a fix-everything directive, "
+    "recorded open asks)? A one-off question or a purely conversational "
+    "exchange is NOT an active goal.\n"
+    "- awaiting_user: does the reply end genuinely blocked on the USER — a "
+    "direct question, a decision only the user can make, or an explicit "
+    "hand-back? Merely listing remaining work, waiting on background jobs, "
+    "or narrating status is NOT awaiting the user.\n\n"
     "Respond with ONLY JSON: {\"claims_done\": true|false, "
     '"opening_declares_finished": true|false, '
-    '"complete": true|false, "missing": ["<each thing the goal still needs, '
+    '"complete": true|false, "goal_active": true|false, '
+    '"awaiting_user": true|false, '
+    '"missing": ["<each thing the goal still needs, '
     "one line each, plain words>\"]}. missing lists what the FULL goal still "
     "needs whenever it is not complete, even for an honest status report."
     + VOICE_CONTRACT
@@ -77,7 +88,21 @@ class CompletionVerdict:
     claims_done: bool = False
     opening_declares_finished: bool = False
     complete: bool = True
+    goal_active: bool = False
+    awaiting_user: bool = False
     missing: list[str] = field(default_factory=list)
+
+    @property
+    def should_keep_working(self) -> bool:
+        """True when the goal-keeper should push the agent back to work: a
+        driving goal is active, it is not complete, and the agent is not
+        genuinely blocked on the user (user directive 2026-07-03: 'if saddle
+        catches it, it should drive you back into working')."""
+        return (
+            self.goal_active
+            and (not self.complete or bool(self.missing))
+            and not self.awaiting_user
+        )
 
     @property
     def overclaim(self) -> bool:
@@ -155,5 +180,7 @@ async def audit_completion(
         claims_done=bool(doc.get("claims_done")),
         opening_declares_finished=bool(doc.get("opening_declares_finished")),
         complete=bool(doc.get("complete", True)),
+        goal_active=bool(doc.get("goal_active")),
+        awaiting_user=bool(doc.get("awaiting_user")),
         missing=[str(m).strip() for m in doc.get("missing") or [] if str(m).strip()],
     )
