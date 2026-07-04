@@ -184,3 +184,52 @@ async def audit_completion(
         awaiting_user=bool(doc.get("awaiting_user")),
         missing=[str(m).strip() for m in doc.get("missing") or [] if str(m).strip()],
     )
+
+
+# -- Verdict persistence (Gap 5: stages must judge from the SAME state) --------
+#
+# The Stop hook's completion gate and the pre-code design review (Stage 3)
+# both judge the same goal, but Stage 3 used to see only the intake ledger —
+# after a goal-keeper forced continuation it condemned the very work the
+# gate had just ordered (observed live 2026-07-03 on aeli/rayxiv4). The
+# newest verdict is therefore PERSISTED per session; Stage 3 loads it and
+# treats closing a listed-missing item as in-goal by definition.
+
+def _verdict_path(session: str):
+    from saddle.store import default_db_path
+
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in session) or "default"
+    return default_db_path().parent / "verdicts" / f"{safe}.json"
+
+
+def persist_verdict(session: str, verdict: CompletionVerdict) -> None:
+    """Record the session's newest completion verdict. IO failure is
+    non-fatal (the verdict still drove this invocation's keeper); the
+    next invocation simply sees the previous state."""
+    p = _verdict_path(session)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({
+            "goal_active": verdict.goal_active,
+            "complete": verdict.complete,
+            "awaiting_user": verdict.awaiting_user,
+            "missing": list(verdict.missing),
+        }), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def latest_verdict(session: str) -> CompletionVerdict | None:
+    """The most recent persisted verdict for `session`, or None."""
+    try:
+        doc = json.loads(_verdict_path(session).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    return CompletionVerdict(
+        complete=bool(doc.get("complete", True)),
+        goal_active=bool(doc.get("goal_active")),
+        awaiting_user=bool(doc.get("awaiting_user")),
+        missing=[str(m) for m in doc.get("missing") or []],
+    )

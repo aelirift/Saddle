@@ -179,7 +179,7 @@ Pinned by `tests/test_directive_durability.py` (split / unclassified-defaults-to
 > depth: the applicability clause stops a mis-applied directive at the gate even if
 > one slips through, and `demote_directive` curates out anything already there.
 
-## Gap 5 — Stage 3 (pre-code design review) contradicts the completion stage's own verdict [status: OPEN — design needed]
+## Gap 5 — Stage 3 (pre-code design review) contradicts the completion stage's own verdict [status: SHIPPED — verdict is shared state]
 
 **Observed (2026-07-03, aeli/rayxiv4):** the Stop-hook completion gate blocked a
 turn-end because the active goal ("complete all items, fix all bugs, close all

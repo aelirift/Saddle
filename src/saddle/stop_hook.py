@@ -510,6 +510,13 @@ def _completion_outcome(
     )
     _LAST_COMPLETION_VERDICT.clear()
     _LAST_COMPLETION_VERDICT.append(verdict)
+    # Gap 5: the newest verdict is shared state — Stage 3's design review
+    # loads it so work that closes a listed-missing item is judged
+    # in-goal, never "drift" (the two stages contradicted each other
+    # live on 2026-07-03).
+    from saddle.completion import persist_verdict
+
+    persist_verdict(session, verdict)
     if not verdict.overclaim:
         return None
     body = "\n".join(f"  • {m}" for m in verdict.missing) or "  • (unspecified)"

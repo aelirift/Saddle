@@ -258,7 +258,9 @@ def _emit_pretool_context(
         print(body, file=sys.stderr)
 
 
-def _design_outcome(ctx: "Context", goal: str, approach: str) -> "StageOutcome | None":
+def _design_outcome(
+    ctx: "Context", goal: str, approach: str, session: str = "",
+) -> "StageOutcome | None":
     """Stage 3 body — audit the agent's pre-edit approach, fail LOUD.
 
     No recorded approach ⇒ the agent jumped straight to code, which is itself the
@@ -284,6 +286,28 @@ def _design_outcome(ctx: "Context", goal: str, approach: str) -> "StageOutcome |
 
     from saddle.design import audit_proposal
     from saddle.supervisor import run_bounded
+
+    # Gap 5 — judge from the SAME state as the completion gate: after a
+    # goal-keeper forced continuation, the gate's missing-items list IS
+    # the agent's marching orders, so closing one of them is in-goal by
+    # definition. Without this, Stage 3 condemned the exact work the
+    # keeper had just ordered (observed live 2026-07-03).
+    if session:
+        try:
+            from saddle.completion import latest_verdict
+
+            v = latest_verdict(session)
+        except Exception:  # noqa: BLE001 — shared-state load must not wedge
+            v = None
+        if v is not None and v.goal_active and not v.complete and v.missing:
+            goal = (
+                goal
+                + "\n\n[Binding — completion gate] The goal-keeper's latest "
+                  "verdict lists these goal items as STILL MISSING. Work that "
+                  "closes any of them is in-goal by definition — never judge "
+                  "it as drift or scope expansion:\n"
+                + "\n".join(f"- {m}" for m in v.missing)
+            )
 
     try:
         timeout = float(os.environ.get("SADDLE_HOOK_DESIGN_TIMEOUT", "60") or 60)
@@ -387,7 +411,7 @@ def _run_design_stage(
 
     result = run_stage(
         ctx, STAGE_DESIGN,
-        lambda: _design_outcome(ctx, turn.goal, turn.approach),
+        lambda: _design_outcome(ctx, turn.goal, turn.approach, session),
         session=session,
         what="the agent's approach before its first code edit",
     )
