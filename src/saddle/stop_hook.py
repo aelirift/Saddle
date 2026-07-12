@@ -553,55 +553,146 @@ def _keeper_marker_path(session: str):
     return default_db_path().parent / "keeper" / f"{safe}.json"
 
 
-def _keeper_count(session: str) -> int:
+def _keeper_state(session: str) -> dict:
+    """The keeper's per-session marker: which user turn we are driving
+    (``anchor`` = that user message's uuid), how many times in a row we have
+    refused the stop for it (``consecutive``), and whether we have already hit
+    the cap for it (``capped``). A missing / unreadable marker is a clean zero
+    state."""
     try:
-        return int(json.loads(_keeper_marker_path(session).read_text(
-            encoding="utf-8")).get("consecutive", 0))
+        d = json.loads(_keeper_marker_path(session).read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
     except (OSError, ValueError, TypeError):
-        return 0
+        return {}
 
 
-def _set_keeper_count(session: str, n: int) -> None:
+def _set_keeper_state(session: str, anchor: str, consecutive: int,
+                      capped: bool) -> None:
     p = _keeper_marker_path(session)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({"consecutive": int(n)}), encoding="utf-8")
+        tmp.write_text(json.dumps({
+            "anchor": anchor, "consecutive": int(consecutive),
+            "capped": bool(capped),
+        }), encoding="utf-8")
         os.replace(tmp, p)
     except OSError as exc:
         print(f"stop_hook: keeper marker write failed ({exc!r})", file=sys.stderr)
 
 
-def _keeper_decision(ctx: "Context", session: str) -> str:
+def _keeper_count(session: str) -> int:
+    """Consecutive forced continuations recorded for this session (compat read
+    for callers/tests that only care about the streak length)."""
+    try:
+        return int(_keeper_state(session).get("consecutive", 0))
+    except (ValueError, TypeError):
+        return 0
+
+
+# A user message whose SUBSTANCE is "stop / hold the current work". When the
+# latest user turn is one of these, the agent stopping is COMPLIANCE, not a
+# premature self-wrap-up — so the keeper stands down instead of steamrolling
+# the instruction (user-directed 2026-07-12: "stop goal keeper from overriding
+# me ... the saddle should see the full chat history and realize I asked for a
+# stop"). Conservative by design: an explicit GO signal anywhere cancels it, so
+# a mixed "stop X and keep going with Y" reads as GO, never as a halt.
+_KEEPER_GO_SIGNALS = (
+    "keep going", "keep building", "carry on", "continue", "proceed", "resume",
+    "go ahead", "rebuild", "regen", "regenerate", "next item", "move on",
+)
+_KEEPER_HALT_WHOLE = {
+    "stop", "stop it", "stop now", "stop please", "please stop", "halt", "abort",
+    "pause", "wait", "hold", "hold on", "stand down", "cancel", "stop the build",
+}
+_KEEPER_HALT_PHRASES = (
+    "stop the build", "stop the run", "stop the regen", "stop the game",
+    "stop the class", "stop building", "stop working", "stop the pipeline",
+    "don't continue", "do not continue", "hold off",
+)
+_KEEPER_HALT_LEADS = ("stop", "halt", "abort", "pause", "cancel", "wait")
+
+
+def _user_directed_halt(text: str) -> bool:
+    """True when the user's latest message is, in substance, a directive to
+    STOP / hold the current work."""
+    t = " ".join((text or "").lower().split())
+    if not t:
+        return False
+    if any(g in t for g in _KEEPER_GO_SIGNALS):
+        return False  # a GO directive is present — not a pure halt
+    if t.strip(" .!?,") in _KEEPER_HALT_WHOLE:
+        return True
+    if any(p in t for p in _KEEPER_HALT_PHRASES):
+        return True
+    # A short imperative that opens with a halt word ("stop the current run").
+    if len(t) <= 60 and t.split()[0] in _KEEPER_HALT_LEADS:
+        return True
+    return False
+
+
+def _keeper_decision(ctx: "Context", session: str, transcript_path: str) -> str:
     """The goal-keeper's verdict for this turn: a non-empty BLOCK REASON when
-    the stop must be refused, else "". Reads the completion verdict the
-    completion stage just computed; no verdict (stage off / failed / silent
-    turn) means no block — enforcement never guesses."""
+    the stop must be refused, else "". Refuses ONLY when a driving goal is
+    active and unfinished, the user has NOT just asked to stop, and the per-turn
+    cap is not yet exhausted. Reads the completion verdict the completion stage
+    computed; no verdict (stage off / failed / silent turn) means no block —
+    enforcement never guesses."""
     if os.environ.get("SADDLE_GOAL_KEEPER", "1") == "0":
         return ""
     if not _LAST_COMPLETION_VERDICT:
         return ""
     verdict = _LAST_COMPLETION_VERDICT[0]
-    if not verdict.should_keep_working:
-        _set_keeper_count(session, 0)  # progress or a legit stop — reset
+
+    # The latest user message names the turn we are driving (its uuid is the
+    # anchor) and may itself be a stop. Reading it is what lets the keeper HONOR
+    # a 'stop' rather than override it, and what keys the cap to a single turn.
+    from saddle.transcript import latest_turn
+
+    turn = latest_turn(transcript_path) if transcript_path else None
+    goal_text = turn.goal if turn else ""
+    anchor = turn.anchor if turn else ""
+
+    # (1) The user just told us to stop / hold — comply, and clear the streak.
+    if _user_directed_halt(goal_text):
+        _set_keeper_state(session, anchor, 0, capped=True)
         return ""
-    blocks = _keeper_count(session)
-    if blocks >= _KEEPER_MAX_CONSECUTIVE:
-        # The cap: alert the human instead of a fourth forced lap.
+
+    # (2) Real progress or a legitimate stop verdict — reset and allow.
+    if not verdict.should_keep_working:
+        _set_keeper_state(session, anchor, 0, capped=False)
+        return ""
+
+    state = _keeper_state(session)
+    same_turn = bool(anchor) and state.get("anchor") == anchor
+    consecutive = int(state.get("consecutive", 0)) if same_turn else 0
+    capped = bool(state.get("capped")) if same_turn else False
+
+    # (3) Already capped for THIS user turn — stay silent until the human sends a
+    # NEW instruction (a new anchor re-arms). No reset-to-zero here, so the old
+    # 3-on / 1-off perpetual loop is gone.
+    if capped:
+        return ""
+
+    if consecutive >= _KEEPER_MAX_CONSECUTIVE:
+        # The cap: alert the human ONCE, latch capped, and go quiet — never a
+        # fourth forced lap, and never a re-armed loop on the same turn.
         from saddle.bubble import emit_bubble
         from saddle.models import BUBBLE_ALERT, STAGE_COMPLETION
 
         emit_bubble(
             ctx,
             "Saddle's goal-keeper stopped pushing after "
-            f"{blocks} forced continuations in a row — the agent may be "
-            "stuck. The goal is still not finished; it needs a human look.",
+            f"{consecutive} forced continuations in a row — the agent may be "
+            "stuck. It will stay quiet now until you send a new instruction; "
+            "the goal is still not finished and needs a human look.",
             level=BUBBLE_ALERT, stage=STAGE_COMPLETION, session=session,
             meta={"origin": "turn-end", "keeper_capped": True},
         )
-        _set_keeper_count(session, 0)
+        _set_keeper_state(session, anchor, consecutive, capped=True)
         return ""
-    _set_keeper_count(session, blocks + 1)
+
+    _set_keeper_state(session, anchor, consecutive + 1, capped=False)
     from saddle.voice import goal_keeper_reason
 
     return goal_keeper_reason(list(verdict.missing))
@@ -718,7 +809,7 @@ def main(argv: list[str] | None = None) -> int:
     # decision JSON; everything above stays observation.
     reason = ""
     try:
-        reason = _keeper_decision(ctx, session)
+        reason = _keeper_decision(ctx, session, transcript_path)
     except Exception as exc:  # noqa: BLE001 — keeper failure must not wedge the turn
         print(f"stop_hook: goal-keeper error ({exc!r}); not blocking", file=sys.stderr)
     if reason:
