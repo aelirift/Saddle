@@ -63,6 +63,21 @@ _DEFAULT_POOL: dict[str, float] = {
     "mem_ceiling_pct": 80.0,
     "mem_resume_pct": 70.0,
 }
+# The design council (saddle.council): saddle chairs + exactly two critic LLMs
+# of DISTINCT model families. ``members`` are the preferred critic caller names
+# (deduped by family at build time); ``synthesis`` is the strongest model,
+# reserved for the chair's reconciliation + the longevity lens. ``min_quorum``
+# is how many critics must return for a verdict (drop-and-quorum);
+# ``critic_deadline_s`` is the per-critic wall-clock ceiling; ``surface_min_sites``
+# is the blast-radius floor below which the council is SKIPPED (a tiny surface
+# keeps the single audit_proposal). Absent -> derive from the active priority.
+_DEFAULT_COUNCIL: dict[str, Any] = {
+    "members": [],           # empty -> derive two distinct families from priority
+    "synthesis": "",         # empty -> the strongest available (priority-lead)
+    "min_quorum": 1,
+    "critic_deadline_s": 90.0,
+    "surface_min_sites": 2,
+}
 
 
 def _repo_root() -> Path:
@@ -199,6 +214,18 @@ def pool_settings(ctx: Context | None = None) -> dict:
     """Process-pool sizing + memory ceilings. Policy overlays the defaults."""
     settings = dict(_DEFAULT_POOL)
     overlay = resolve_policy(ctx).get("pool")
+    if isinstance(overlay, dict):
+        settings.update(overlay)
+    return settings
+
+
+def council_settings(ctx: Context | None = None) -> dict:
+    """The design-council configuration for ``ctx``: critic membership, the
+    synthesis (strongest) model, the quorum, the per-critic deadline, and the
+    blast-radius floor. Policy's ``council`` block overlays the defaults; an
+    empty ``members`` / ``synthesis`` means 'derive from the active priority'."""
+    settings = dict(_DEFAULT_COUNCIL)
+    overlay = resolve_policy(ctx).get("council")
     if isinstance(overlay, dict):
         settings.update(overlay)
     return settings

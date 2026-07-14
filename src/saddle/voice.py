@@ -59,6 +59,7 @@ STAGE_PLAIN: dict[str, str] = {
     "intake": "request breakdown (splitting your message into the things it asks for)",
     "intent": "conflict check (comparing the request against earlier decisions)",
     "design": "plan review (checking the approach before code is written)",
+    "review": "approval posture (whether you asked to approve the plan before code)",
     "code": "code-matches-design check",
     "lesson": "lesson capture (recording what this turn taught)",
     "guard": "action gate (the check that runs before file changes)",
@@ -163,6 +164,77 @@ def design_settled(summary: str) -> str:
     return (
         "Plan agreed and recorded. Saddle will check future code against it "
         f"and will not re-open this discussion unless the code drifts: {summary}"
+    )
+
+
+def design_hold_redirect(goal: str) -> str:
+    """Design-Hold deny: the USER asked to see and approve the plan before any
+    code is written, so this code change is held. The message REDIRECTS the
+    agent — present the plan and wait for the user, do not keep retrying."""
+    topic = f" for: {goal.strip()}" if (goal or "").strip() else ""
+    return (
+        "Saddle is holding this code change because you asked to review the "
+        f"plan before any code is written{topic}. Present your plan to the "
+        "user now and wait for their approval. Retrying the edit will not "
+        "help — the change stays held until the user approves, then the gate "
+        "opens on its own."
+    )
+
+
+def design_held_awaiting_approval(goal: str) -> str:
+    """Design-Hold notice: the plan reviewed clean, but the user asked to be
+    the one who approves it, so saddle records it as held (not auto-agreed) and
+    waits for the user's word."""
+    topic = f" for: {goal.strip()}" if (goal or "").strip() else ""
+    return (
+        "The plan looks sound, but you asked to approve it yourself before "
+        f"code is written{topic}. Saddle is holding it for your approval "
+        "instead of agreeing to it automatically. Tell the user the plan is "
+        "ready, and it will proceed once they approve."
+    )
+
+
+def autonomy_engaged(condition: str = "") -> str:
+    """Design-Hold notice: the user handed the assistant the wheel — proceed
+    without stopping to get each plan approved. Names how to take it back."""
+    extra = f" ({condition.strip()})" if (condition or "").strip() else ""
+    return (
+        "You are now in autonomous mode: the user asked you to proceed with "
+        f"your own recommendations without stopping for plan approval{extra}. "
+        "Keep working through the goal on your own judgment. This stays on "
+        "until the user asks to review a plan or tells you to stop — either "
+        "one takes the wheel back."
+    )
+
+
+def autonomy_reminder() -> str:
+    """The per-turn on-screen reminder while autonomous mode is active, so the
+    user always sees that the assistant is proceeding on its own judgment and
+    knows how to end it."""
+    return (
+        "Autonomous mode is on: the assistant is proceeding on its own "
+        "judgment without stopping for plan approval. To take the wheel back, "
+        "ask to review a plan or tell it to stop."
+    )
+
+
+def approval_recorded(design_id: str = "") -> str:
+    """Design-Hold notice: the user approved the plan, so saddle recorded it as
+    an agreed design and opened the gate for code."""
+    tail = f" (recorded as design {design_id})" if (design_id or "").strip() else ""
+    return (
+        "Approval recorded: the user approved the plan, so saddle has agreed "
+        f"it and opened the gate{tail}. You can write the code now; saddle "
+        "will check it against this plan from here on."
+    )
+
+
+def hold_released() -> str:
+    """Design-Hold notice: an earlier hold or autonomous mode was cleared, so
+    saddle is back to its normal behavior for this session."""
+    return (
+        "Saddle is back to its normal behavior for this session — the earlier "
+        "request to hold or to proceed on your own has been cleared."
     )
 
 

@@ -17,6 +17,13 @@
     "mem_ceiling_pct": 80,
     "mem_resume_pct": 70
   },
+  "council": {
+    "members": ["claude_agent", "minimax"],
+    "synthesis": "claude_agent",
+    "min_quorum": 1,
+    "critic_deadline_s": 90,
+    "surface_min_sites": 2
+  },
   "directives": [
     "Operating posture (user-ratified 2026-06): saddle is the safety layer, not a permission prompt. It must NOT block routine work. It hard-BLOCKS exactly two classes: (1) deleting files \u2014 a code delete without a coherent disposition, or ANY cross-project delete; and (2) intent-drift that the design review judges to be a real divergence. A cross-project EDIT/WRITE is ALLOWED and surfaced as a loud WARN (notice if a user grant covers it, alert if it is a genuine wander) \u2014 never hard-blocked. The supervisor runs with tool permissions bypassed; saddle is the backstop, so its blocks are reserved for deletes and intent-drift only.",
     "AFK long-goal protocol (user-ratified 2026-06): when the user is away and the active goal is long, do NOT stop and wait at an intent-drift flag or a design fork. Proceed to OTHER items within the same goal, and DOCUMENT each as you go: (a) work completed on other goal items, (b) every design fork that needs the user to decide, (c) any other item awaiting user input. On the user next prompt, surface all of (a)/(b)/(c) as the first thing, so nothing pending is lost. Intent drift must be DISCUSSED with the user (confirm/correct via the dialog channel), and that discussion must name the specific SURFACES (SurfaceManifest sites \u2014 values/identities/boundaries/references/persistence/lifecycle/authority) the change drifts on, not just say drift in the abstract.",

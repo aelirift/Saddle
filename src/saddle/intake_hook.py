@@ -63,6 +63,8 @@ Knobs (env, all optional):
 * ``SADDLE_HOOK_MAX_AUDITS``     coverage-audit passes in the hook path; default 1.
 * ``SADDLE_HOOK_INTENT``         "0" disables the LLM project/design/history check; default on.
 * ``SADDLE_HOOK_INTENT_TIMEOUT`` seconds ceiling on the history check; default 60.
+* ``SADDLE_HOOK_REVIEW``         "0" disables the design-hold posture check; default on.
+* ``SADDLE_HOOK_REVIEW_TIMEOUT`` seconds ceiling on the review-intent classify; default 60.
 * ``SADDLE_HOOK_MIN_WORDS``      below this word count a prompt is a trivial
                                  continuation (skip the LLM checks); default 4.
 
@@ -457,6 +459,57 @@ def _history_outcome(ctx: "Context", prompt: str) -> "StageOutcome | None":
     return StageOutcome(sections=sections, level=report.level) if sections else None
 
 
+def _review_outcome(
+    ctx: "Context", prompt: str, session: str, transcript_path: str
+) -> "StageOutcome | None":
+    """Stage REVIEW — the design-hold posture axis: did THIS message ask to
+    review/approve the plan before code, approve a held plan, hand over the
+    wheel, or take it back? Moves the per-session posture the pre-code design
+    gate reads (:mod:`saddle.hold`).
+
+    Unlike the other LLM stages it does NOT skip on a short prompt when a posture
+    is active: a bare 'go' is exactly the approval / exit signal while a plan is
+    HELD or autonomous mode is on. It skips the model ONLY on the fast, common
+    case — a trivial continuation while the posture is already DEFAULT (nothing
+    held, no wheel handed over) — so the iteration loop stays instant.
+
+    Heralds a posture FLIP the user should see (approval recorded, autonomy
+    engaged, back-to-normal), and re-emits the autonomous-mode reminder every
+    turn while it is active. Fail-loud like every stage: a failed classify
+    PROPAGATES to :func:`run_stage`, and because no posture is written on
+    failure the prior posture carries forward unchanged (sticky)."""
+    if os.environ.get("SADDLE_HOOK_REVIEW", "1") == "0":
+        return None
+    from saddle.hold import HOLD_AUTONOMOUS, HOLD_DEFAULT, read_posture, review_turn
+    from saddle.supervisor import StageOutcome, run_bounded
+
+    posture = read_posture(session)
+    if posture.state == HOLD_DEFAULT and _is_trivial(prompt):
+        return None  # nothing to approve / exit, and no substantive directive
+    try:
+        timeout = float(os.environ.get("SADDLE_HOOK_REVIEW_TIMEOUT", "60") or 60)
+    except ValueError:
+        timeout = 60.0
+    trans = run_bounded(
+        review_turn(prompt, session, ctx=ctx, transcript_path=transcript_path,
+                    posture=posture),
+        seconds=timeout, what="whether you asked to approve the plan before code",
+    )
+    if trans.herald:
+        return StageOutcome(sections=[trans.herald], level=trans.level,
+                            meta={"posture": trans.posture.state})
+    # No flip to herald, but if the session is (still) autonomous, re-post the
+    # on-screen reminder so the user always sees the assistant is proceeding on
+    # its own judgment and knows how to end it.
+    if trans.posture.state == HOLD_AUTONOMOUS:
+        from saddle.models import BUBBLE_NOTICE
+        from saddle.voice import autonomy_reminder
+
+        return StageOutcome(sections=[autonomy_reminder()], level=BUBBLE_NOTICE,
+                            meta={"posture": HOLD_AUTONOMOUS})
+    return None
+
+
 # -- entry point -------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
@@ -487,7 +540,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"intake_hook: import/ctx error ({exc!r}); allowing", file=sys.stderr)
         return 0
 
-    from saddle.models import STAGE_INTAKE, STAGE_INTENT
+    from saddle.models import STAGE_INTAKE, STAGE_INTENT, STAGE_REVIEW
     from saddle.supervisor import run_stage, system_message
 
     results = []
@@ -531,6 +584,19 @@ def main(argv: list[str] | None = None) -> int:
         tracker.observe_user_message(ctx, prompt, session=session)
     except Exception as exc:  # noqa: BLE001
         print(f"intake_hook: observe error ({exc!r}); continuing", file=sys.stderr)
+
+    # Stage REVIEW — the design-hold posture axis: did THIS message ask to
+    # approve the plan before code, approve a held plan, hand over the wheel, or
+    # take it back? It moves the per-session posture the pre-code design gate
+    # reads (saddle.hold), and heralds a flip (approval / autonomy / release) —
+    # or re-posts the autonomous-mode reminder — on screen via system_message.
+    # Fail-loud like every stage; a failed classify leaves the prior posture
+    # unchanged (sticky carry-forward).
+    results.append(run_stage(
+        ctx, STAGE_REVIEW,
+        lambda: _review_outcome(ctx, prompt, session, transcript_path),
+        session=session, what="whether you asked to approve the plan before code",
+    ))
 
     # Stage 1 (intake) — the itemized know/do list (+ scope warning), fail LOUD.
     # run_stage owns the discipline: a clean itemize is a NOTICE bubble; a slow /

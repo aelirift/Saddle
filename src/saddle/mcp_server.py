@@ -25,6 +25,7 @@ no parallel implementation:
   observe_agent/user      feed the agent<->user loop to the drift tracker
   check_action    dialog  verdict an action against the commitment (never silent)
   bubble_recent   outbox  saddle's durable outbound voice (what it bubbled to a human)
+  council                 saddle chairs a two-critic design panel for a design
   discuss                 saddle's own LLM voice — ask saddle to weigh in / audit
   whoami                  saddle introduces itself: who it speaks for, what it holds
 
@@ -513,6 +514,11 @@ async def design_propose(goal: str, approach: str) -> str:
     Call it with the goal you are serving (the user's ask, in one line) and
     your concrete approach (root cause, what changes where, what stays
     consistent).
+
+    Blast-radius triage: a change with a wide surface (many code sites, a
+    settled design, a new subsystem) is routed to saddle's design COUNCIL — a
+    two-critic panel saddle chairs — instead of the single audit; a small change
+    keeps the single audit. Either way, a clean review is SETTLED as agreed.
     """
     from saddle.design import audit_proposal, settle_approach
 
@@ -521,6 +527,22 @@ async def design_propose(goal: str, approach: str) -> str:
     if not g or not a:
         return "design_propose: both goal and approach are required"
     ctx = _ctx()
+
+    # Triage by blast radius. The council convenes only for a non-trivial
+    # surface; a tiny surface (or an unformable / failed panel) returns
+    # fell_back and we run the single audit floor below — never wedging.
+    from saddle.council import convene, render_result
+
+    result = await convene(g, a, ctx)
+    if result.convened and not result.fell_back:
+        return render_result(result, ctx.key)
+    if result.fell_back:
+        # The council could not deliver (panel/quorum) — say so, then fall back.
+        import sys
+
+        print(f"design_propose: council fell back ({result.dissent}); "
+              "using the single design audit", file=sys.stderr)
+
     verdict = await audit_proposal(g, a, ctx)
     if verdict.has_issues:
         body = "\n".join(f"- {i}" for i in verdict.issues)
@@ -534,6 +556,39 @@ async def design_propose(goal: str, approach: str) -> str:
         "The gate is open; saddle will check future code against this design "
         "and re-open the discussion only if the code drifts from it."
     )
+
+
+@mcp.tool(name="council")
+async def council(goal: str, draft: str) -> str:
+    """Convene saddle's design council on demand — a two-critic panel saddle
+    chairs — for a design worth more than one reviewer's read.
+
+    Distinct from ``design_propose`` (which triages by blast radius and only
+    escalates a wide-surface change), this ALWAYS convenes: saddle seats two
+    critic language models of DISTINCT model families with separate mandates —
+    one weighs long-term architecture, the other root-cause and completeness —
+    then reconciles their critiques into one design. A genuine tradeoff the
+    critics cannot resolve is handed back to YOU as a fork, not decided by fiat;
+    the anti-pattern audit floor still runs, so consensus can't launder a
+    band-aid. A clean synthesis is settled as an agreed design.
+
+    Call it with the goal (the user's ask, one line) and your draft approach.
+    """
+    g = (goal or "").strip()
+    d = (draft or "").strip()
+    if not g or not d:
+        return "council: both goal and draft are required"
+    ctx = _ctx()
+    from saddle.council import convene, render_result
+
+    result = await convene(g, d, ctx, force=True)
+    if result.fell_back:
+        return (
+            "The council could not convene a full panel here "
+            f"({result.dissent}). Run design_propose for the single design "
+            "audit instead."
+        )
+    return render_result(result, ctx.key)
 
 
 # -- saddle's own LLM voice --------------------------------------------------

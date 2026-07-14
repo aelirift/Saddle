@@ -222,6 +222,37 @@ def _gate_mode() -> str:
     return mode if mode in ("warn", "deny") else "warn"
 
 
+def _hold_denies_edit(tool_name: str, session: str, turn) -> bool:
+    """The deterministic Design-Hold decision: should THIS code edit be denied
+    because the user asked to approve the plan first and has not yet?
+
+    True only when the session posture is an active HOLD, a design is in play
+    (fail-CLOSED — always true under a hold, so a no-plan edit can't dodge it),
+    and no approval is on record. DEFAULT / AUTONOMOUS -> False (the existing
+    path is unchanged). Only code-edit tools are gated. NO language model is
+    consulted. Any read failure fails OPEN (returns False) with a loud log — a
+    hook must never wedge — but the posture read itself already fails open to
+    DEFAULT, so a crash here is unexpected."""
+    if tool_name not in _CODE_EDIT_TOOLS:
+        return False
+    try:
+        from saddle.hold import (
+            HOLD_HELD_STATE,
+            design_in_play,
+            read_posture,
+            user_approved_current,
+        )
+
+        posture = read_posture(session)
+        if posture.state != HOLD_HELD_STATE:
+            return False
+        return design_in_play(turn, posture) and not user_approved_current(posture, turn)
+    except Exception as exc:  # noqa: BLE001 — a hold-read crash must not wedge the edit
+        print(f"doctrine_hook: hold-gate read error ({exc!r}); not holding",
+              file=sys.stderr)
+        return False
+
+
 def _emit_pretool_context(
     ctx: "Context", sections: list[str], *, system_msg: str = ""
 ) -> None:
@@ -319,6 +350,32 @@ def _design_outcome(
         what="the design review (root-cause / band-aid / coverage)",
     )
     if not verdict.has_issues:
+        # Design-Hold (Part 1): a clean audit auto-settles as "converged" ONLY
+        # when the USER did not ask to be in the loop. Under an active HOLD the
+        # agreement is the USER's to give, so a clean plan is HELD (not settled)
+        # and awaits their approval — the surgical gate on the auto-settle bug.
+        # DEFAULT / AUTONOMOUS keep today's behaviour. (Belt-and-suspenders: the
+        # deterministic hold gate in _run_design_stage already DENIED the edit
+        # under HOLD before this stage ran, so this is the second line — it also
+        # covers any path that reaches _design_outcome without that gate.)
+        if session:
+            try:
+                from saddle.hold import HOLD_HELD_STATE, read_posture
+
+                if read_posture(session).state == HOLD_HELD_STATE:
+                    from saddle.models import BUBBLE_NOTICE
+                    from saddle.voice import design_held_awaiting_approval
+
+                    return StageOutcome(
+                        sections=[design_held_awaiting_approval(goal)],
+                        level=BUBBLE_NOTICE,
+                        title="plan held — awaiting your approval",
+                        meta={"held": True},
+                    )
+            except Exception as exc:  # noqa: BLE001 — a posture read must not wedge the review
+                print(f"doctrine_hook: hold-gate read error ({exc!r}); "
+                      "settling as before", file=sys.stderr)
+
         # Audited clean at the moment code starts -> the plan IS the agreement.
         # SETTLE it (mediator loop step 4): recorded as a final design with a
         # completeness surface, so Stage 4 re-gates the code against it every
@@ -367,6 +424,39 @@ def _run_design_stage(
 
     Infra (no transcript, anchor IO, ctx resolution) fails OPEN — observation must
     never wedge an edit — but the AUDIT itself fails LOUD via :func:`run_stage`."""
+    # -- Design-Hold gate (Part 1) — USER-CONSENT, deterministic, checked FIRST and
+    # INDEPENDENT of the LLM design-review toggle AND of transcript availability.
+    # The posture is durable per-session state; when the user asked to approve the
+    # plan before code (state=hold), an unapproved code edit is DENIED regardless of
+    # whether SADDLE_HOOK_DESIGN is off or a transcript exists (those govern only the
+    # observational LLM review below). The transcript is read best-effort just to
+    # name the plan in the redirect; the gate itself needs only the posture. Posture
+    # read fails OPEN to DEFAULT (never wedges); the deny is fail-CLOSED under a hold
+    # and safe because it REDIRECTS the agent to present its plan for approval.
+    if tool_name in _CODE_EDIT_TOOLS:
+        _hold_turn = None
+        if transcript_path:
+            try:
+                from saddle.transcript import latest_turn
+
+                _hold_turn = latest_turn(transcript_path)
+            except Exception:  # noqa: BLE001 — best-effort; the hold gate works without it
+                _hold_turn = None
+        if _hold_denies_edit(tool_name, session, _hold_turn):
+            from saddle.voice import design_hold_redirect
+
+            goal = _hold_turn.goal if _hold_turn else ""
+            print(json.dumps(_deny_doc(
+                design_hold_redirect(goal),
+                system_msg="⏸ saddle is holding code edits until you approve the "
+                "plan (you asked to review it before code).")))
+            print(f"[design-hold] DENY {tool_name}: awaiting user approval of the plan",
+                  file=sys.stderr)
+            _bubble("alert", "review",
+                    "held a code edit — awaiting your approval of the plan", session)
+            return
+
+    # -- The observational LLM design REVIEW below is gated by its own toggle. --
     if os.environ.get("SADDLE_HOOK_DESIGN", "1") == "0":
         return
     if tool_name not in _CODE_EDIT_TOOLS or not transcript_path:
@@ -395,6 +485,9 @@ def _run_design_stage(
         print(f"doctrine_hook: per-event scope error ({exc!r}); ambient scope",
               file=sys.stderr)
 
+    # (The Design-Hold gate ran at the TOP of this function, before the LLM-review
+    # toggle — user consent outranks the observational review and must not depend on
+    # it. What follows is only the observational design review.)
     if not turn.anchor:
         return  # no turn to anchor on
     mode = _gate_mode()

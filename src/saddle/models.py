@@ -522,13 +522,20 @@ STAGE_GUARD = "guard"      # the deterministic doctrine pre-action gate (Layer 0
 STAGE_DIALOG = "dialog"    # the back-and-forth correction channel the stages use
 STAGE_VOICE = "voice"      # the plain-language check on saddle's OWN messages
 STAGE_COMPLETION = "completion"  # the did-the-ACTUAL-goal-get-done gate
+STAGE_REVIEW = "review"    # the design-hold posture axis — did the USER ask to
+#                            approve the plan before code? An orthogonal per-session
+#                            posture (default / hold / autonomous) that gates the
+#                            design gate's auto-settle. Distinct from STAGE_DESIGN,
+#                            which judges the plan's QUALITY; this judges whether the
+#                            USER wants to be in the loop at all.
 # The five live supervisory stages, in turn order — what the staged runner owns.
 SUPERVISION_STAGES: tuple[str, ...] = (
     STAGE_INTAKE, STAGE_INTENT, STAGE_DESIGN, STAGE_CODE, STAGE_LESSON,
 )
-# Every label a bubble's ``stage`` may carry: the five stages + guard/dialog/voice.
+# Every label a bubble's ``stage`` may carry: the five stages + the auxiliary
+# channels (guard/dialog/voice/completion/review).
 BUBBLE_STAGES: frozenset[str] = frozenset(SUPERVISION_STAGES) | {
-    STAGE_GUARD, STAGE_DIALOG, STAGE_VOICE, STAGE_COMPLETION,
+    STAGE_GUARD, STAGE_DIALOG, STAGE_VOICE, STAGE_COMPLETION, STAGE_REVIEW,
 }
 
 

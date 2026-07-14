@@ -615,7 +615,16 @@ _KEEPER_HALT_LEADS = ("stop", "halt", "abort", "pause", "cancel", "wait")
 
 def _user_directed_halt(text: str) -> bool:
     """True when the user's latest message is, in substance, a directive to
-    STOP / hold the current work."""
+    STOP / hold the current work.
+
+    NOTE (2026-07): this brittle keyword matcher is SUPERSEDED by the semantic
+    review-intent classifier in :mod:`saddle.hold` (``classify_review_intent`` —
+    an INTERVENE intent is the same "stop / take the wheel back" signal, judged
+    by intent and effect rather than a hardcoded word list, with negation and
+    double-negation resolved). It is left in place for now because the
+    goal-keeper's stop path still calls it here; migrating that path to read the
+    hold posture is the follow-up. Do not extend this word list — extend the
+    classifier instead."""
     t = " ".join((text or "").lower().split())
     if not t:
         return False
