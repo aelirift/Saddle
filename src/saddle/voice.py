@@ -270,6 +270,32 @@ def livegoal_kept(committed_gist: str) -> str:
     )
 
 
+def ledger_items_closed(closed: list) -> str:
+    """Raised-item ledger notice (#77): saddle moved todo items out of the open
+    backlog at the USER's word. Names each change and how, and offers the reopen
+    escape hatch in case a direct-close matched the wrong item. ``closed`` is a list
+    of objects with ``.item`` (has ``.ask``), ``.disposition``, and ``.replacement``."""
+    verb = {
+        "done": "done", "dropped": "dropped",
+        "superseded": "changed", "reopen": "reopened",
+    }
+    lines = []
+    for c in closed:
+        ask = " ".join((getattr(c.item, "ask", "") or "").split())
+        if len(ask) > 100:
+            ask = ask[:99] + "…"
+        how = verb.get(c.disposition, c.disposition)
+        tail = f" → {c.replacement}" if (c.disposition == "superseded" and c.replacement) else ""
+        lines.append(f"  • {ask} — {how}{tail}")
+    body = "\n".join(lines)
+    return (
+        "Saddle updated its todo ledger at your word — these tracked items "
+        f"changed:\n{body}\n"
+        "Only your word moves an item; nothing here was closed by the assistant. "
+        "If one is wrong, say so and saddle will reopen it."
+    )
+
+
 def goal_keeper_reason(missing: list) -> str:
     """The stop-block reason: the goal is not finished, so keep working.
     Read by the AGENT (it resumes with this text) and shown to the human."""

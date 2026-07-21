@@ -547,6 +547,42 @@ def _livegoal_outcome(
     return None
 
 
+def _ledger_outcome(
+    ctx: "Context", prompt: str, session: str
+) -> "StageOutcome | None":
+    """Stage INTAKE — the raised-item LEDGER axis (#77): did THIS message close or
+    reopen a tracked todo? Only the USER closes (done / dropped / superseded / reopen)
+    — an agent never self-closes. On a clear closure it moves the item and heralds
+    the change.
+
+    NOT trivial-skipped: a real closure signal is often short ('that's done', 'drop
+    it'), so word-count is the wrong gate. The cheap gate is instead an empty
+    backlog — :func:`ledger_turn` returns without an LLM call when there is nothing
+    to close. Fail-loud: a failed classify PROPAGATES to :func:`run_stage`; nothing
+    is written on failure."""
+    if os.environ.get("SADDLE_HOOK_LEDGER", "1") == "0":
+        return None
+    from saddle.item_ledger import ledger_turn
+    from saddle.models import BUBBLE_NOTICE
+    from saddle.supervisor import StageOutcome, run_bounded
+
+    try:
+        timeout = float(os.environ.get("SADDLE_HOOK_LEDGER_TIMEOUT", "60") or 60)
+    except ValueError:
+        timeout = 60.0
+    outcome = run_bounded(
+        ledger_turn(prompt, ctx=ctx),
+        seconds=timeout,
+        what="whether your message closed or reopened any tracked todo item",
+    )
+    if outcome.herald:
+        return StageOutcome(
+            sections=[outcome.herald], level=BUBBLE_NOTICE,
+            meta={"ledger_closed": [c.item.id for c in outcome.closed]},
+        )
+    return None
+
+
 # -- entry point -------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
@@ -645,6 +681,16 @@ def main(argv: list[str] | None = None) -> int:
         ctx, STAGE_INTENT,
         lambda: _livegoal_outcome(ctx, prompt, session, tracker),
         session=session, what="whether your work moved off the tracked goal",
+    ))
+
+    # Stage INTAKE — the raised-item LEDGER axis (#77): does THIS message close or
+    # reopen a tracked todo? Runs BEFORE itemize so the closure classifier weighs the
+    # PRE-EXISTING backlog, not the new items this same turn is about to create. Only
+    # the USER closes; the herald names each change. Its own bubble; fail-loud.
+    results.append(run_stage(
+        ctx, STAGE_INTAKE,
+        lambda: _ledger_outcome(ctx, prompt, session),
+        session=session, what="whether your message closed any tracked todo item",
     ))
 
     # Stage 1 (intake) — the itemized know/do list (+ scope warning), fail LOUD.

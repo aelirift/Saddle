@@ -35,9 +35,16 @@ TODO_KINDS: frozenset[str] = frozenset({TASK, DIRECTIVE})
 # --- Item statuses -------------------------------------------------------
 OPEN = "open"              # not yet handled
 ANSWERED = "answered"      # a question that's been answered
-DONE = "done"             # a task that's been completed
+DONE = "done"             # a task the USER is happy with ("happy with it")
 NOTED = "noted"            # context/directive acknowledged, no further action
-ITEM_STATUSES: frozenset[str] = frozenset({OPEN, ANSWERED, DONE, NOTED})
+DROPPED = "dropped"        # the USER no longer wants it ("don't want it")
+SUPERSEDED = "superseded"  # the USER changed it to something else ("changed to X")
+# The three USER-driven closures of a raised todo (#77) — an agent may NEVER
+# self-close; only the user's word moves a task/directive out of OPEN.
+ITEM_CLOSED_STATUSES: frozenset[str] = frozenset({DONE, DROPPED, SUPERSEDED})
+ITEM_STATUSES: frozenset[str] = frozenset(
+    {OPEN, ANSWERED, DONE, NOTED, DROPPED, SUPERSEDED}
+)
 
 
 @dataclass
