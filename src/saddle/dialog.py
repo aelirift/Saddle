@@ -39,6 +39,7 @@ from saddle.models import (
     DRIFT_DRIFT,
     DRIFT_UNKNOWN,
     FORK_RESOLVED,
+    FORK_SUPERSEDED,
     Action,
     Binding,
     DriftVerdict,
@@ -471,6 +472,13 @@ class IntentTracker:
         if b is None:
             return None, None
         return b, self._store.get_fork(ctx, b.fork_id)
+
+    def supersede(self, ctx: Context, fork_id: str, *, session: str = "") -> bool:
+        """Retire a committed fork (``FORK_SUPERSEDED``) so it stops surfacing as
+        the live commitment — the #76 live-goal layer's USER-CONFIRMED retirement.
+        Retirement is explicit and never automatic (``models.FORK_SUPERSEDED``); the
+        caller holds the user's word. Returns whether a fork row was flipped."""
+        return self._store.set_fork_status(ctx, fork_id, FORK_SUPERSEDED)
 
     # -- the drift verdict (fork-identity, never silent) ------------------
 

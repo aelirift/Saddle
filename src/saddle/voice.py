@@ -238,6 +238,38 @@ def hold_released() -> str:
     )
 
 
+def livegoal_move_suspected(committed_gist: str, moved_to: str = "") -> str:
+    """Live-goal notice: the user's work appears to have moved off the committed
+    goal. Saddle proposes retiring the old commitment but does NOT act — it stays
+    live until the user says so (bubble-to-confirm). Shown to the human."""
+    now = f" to: {moved_to}" if (moved_to or "").strip() else " to a different task"
+    return (
+        "Saddle noticed your work may have moved off the goal it was still "
+        f"tracking:\n  • was: {committed_gist}\n  • now seems{now}\n"
+        "That earlier goal is STILL live — nothing has changed. Want saddle to "
+        "retire it so it stops steering toward it? Say yes to retire, or no to "
+        "keep it."
+    )
+
+
+def livegoal_retired(committed_gist: str) -> str:
+    """Live-goal notice: the user confirmed the move, so saddle retired the old
+    commitment; it will no longer steer toward it."""
+    return (
+        "Retired the earlier goal at your word — saddle will stop treating it as "
+        f"the standing commitment:\n  • {committed_gist}\n"
+        "The next decision you make becomes the live one."
+    )
+
+
+def livegoal_kept(committed_gist: str) -> str:
+    """Live-goal notice: the user declined the move, so the commitment stands."""
+    return (
+        "Keeping the earlier goal as the standing commitment — saddle will keep "
+        f"steering toward it:\n  • {committed_gist}"
+    )
+
+
 def goal_keeper_reason(missing: list) -> str:
     """The stop-block reason: the goal is not finished, so keep working.
     Read by the AGENT (it resumes with this text) and shown to the human."""

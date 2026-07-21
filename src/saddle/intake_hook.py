@@ -510,6 +510,43 @@ def _review_outcome(
     return None
 
 
+def _livegoal_outcome(
+    ctx: "Context", prompt: str, session: str, tracker: "IntentTracker"
+) -> "StageOutcome | None":
+    """Stage INTENT — the LIVE-GOAL axis (#76): is the commitment still what the
+    user is working on? With a live commitment present, an LLM judges whether THIS
+    message moved off it; on a clear move saddle BUBBLES a supersede proposal (never
+    auto-retiring), and on the user's later yes/no it retires or keeps the fork —
+    keeping the deterministic pick-ledger honest about whether it is still live.
+
+    Skips the model on the cheap common case (a trivial continuation with no
+    proposal pending); a pending proposal ALWAYS runs (a bare 'yes' is the confirm).
+    Fail-loud: a failed classify PROPAGATES to :func:`run_stage`; no marker is
+    written on failure, so the prior state carries forward unchanged."""
+    if os.environ.get("SADDLE_HOOK_LIVEGOAL", "1") == "0":
+        return None
+    from saddle.livegoal import livegoal_turn, read_proposal
+    from saddle.supervisor import StageOutcome, run_bounded
+
+    if not read_proposal(session).pending and _is_trivial(prompt):
+        return None  # a trivial continuation with nothing pending is never a move
+    try:
+        timeout = float(os.environ.get("SADDLE_HOOK_LIVEGOAL_TIMEOUT", "60") or 60)
+    except ValueError:
+        timeout = 60.0
+    outcome = run_bounded(
+        livegoal_turn(prompt, session, ctx=ctx, tracker=tracker),
+        seconds=timeout,
+        what="whether your work has moved off the goal saddle is tracking",
+    )
+    if outcome.herald:
+        return StageOutcome(
+            sections=[outcome.herald], level=outcome.level,
+            meta={"livegoal": outcome.action, "fork_id": outcome.fork_id},
+        )
+    return None
+
+
 # -- entry point -------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
@@ -596,6 +633,18 @@ def main(argv: list[str] | None = None) -> int:
         ctx, STAGE_REVIEW,
         lambda: _review_outcome(ctx, prompt, session, transcript_path),
         session=session, what="whether you asked to approve the plan before code",
+    ))
+
+    # Stage INTENT — the LIVE-GOAL axis (#76): has the user's work moved off the
+    # standing commitment? Runs AFTER observe_user_message so the commitment already
+    # reflects any pick made THIS turn (a fresh pick auto-advances it; this axis is
+    # for a pivot with NO pick, the frozen-commitment case). On a clear move it
+    # BUBBLES a supersede proposal (never auto-retiring); the user's later yes/no
+    # retires or keeps the fork. Fail-loud; a failed classify leaves state unchanged.
+    results.append(run_stage(
+        ctx, STAGE_INTENT,
+        lambda: _livegoal_outcome(ctx, prompt, session, tracker),
+        session=session, what="whether your work moved off the tracked goal",
     ))
 
     # Stage 1 (intake) — the itemized know/do list (+ scope warning), fail LOUD.
