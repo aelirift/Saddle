@@ -9,7 +9,17 @@ from __future__ import annotations
 import pytest
 
 from saddle.context import Context
-from saddle.models import Binding, Design, Fork, ForkOption, Knowledge
+from saddle.models import (
+    Binding,
+    Design,
+    Fork,
+    ForkOption,
+    Knowledge,
+    TN_TOPIC,
+    TN_WORK,
+    TS_BUILT_UNTESTED,
+    TopicNode,
+)
 from saddle.project_rep import (
     DEFAULT_TOKEN_BUDGET,
     ProjectRep,
@@ -17,6 +27,7 @@ from saddle.project_rep import (
     render,
     rep_block,
 )
+from saddle.topic_store import reset_topic_store, set_topic_store
 
 _CTX = Context(tenant="acme", project="game")
 
@@ -29,6 +40,28 @@ class _StubTracker:
 
     def committed_fork(self, ctx, *, session=""):
         return self._b, self._f
+
+
+class _StubTopicStore:
+    def __init__(self, nodes=None):
+        self._nodes = nodes or []
+
+    def list_nodes(self, ctx, *, status=None, type=None, topic_key=None, limit=200):
+        out = [n for n in self._nodes if status is None or n.status == status]
+        return out[:limit]
+
+    def close(self):
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _empty_topic_store():
+    """Default every rep test to an EMPTY topic store, so no test touches the real
+    ~/.saddle db when assemble lazily resolves the singleton. A test that wants
+    threads passes its own ``topic_store=`` explicitly."""
+    set_topic_store(_StubTopicStore([]))
+    yield
+    reset_topic_store()
 
 
 class _StubDKB:
@@ -134,3 +167,35 @@ def test_rep_block_assembles_and_renders():
     b, f = _committed()
     block = rep_block(_CTX, dkb=_dkb(), tracker=_StubTracker(b, f))
     assert "PROJECT REP — acme/game" in block and "build the live brain" in block
+
+
+# -- OPEN THREADS (the topic mind-map, Slice #3) -----------------------------
+
+def test_open_threads_surface_with_work_state():
+    nodes = [
+        TopicNode(title="B1b instance server", type=TN_WORK,
+                  testing_state=TS_BUILT_UNTESTED, status="open"),
+        TopicNode(title="dungeon quality", type=TN_TOPIC, status="open"),
+    ]
+    b, f = _committed()
+    rep = assemble(_CTX, dkb=_dkb(), tracker=_StubTracker(b, f),
+                   topic_store=_StubTopicStore(nodes))
+    assert rep.topics == ["B1b instance server [work: built_untested]",
+                          "dungeon quality [topic]"]
+    block = render(rep)
+    assert "OPEN THREADS" in block and "[work: built_untested]" in block
+    # threads surface right after the intent, before the settled designs.
+    assert (block.index("CURRENT INTENT") < block.index("OPEN THREADS")
+            < block.index("SETTLED DESIGNS"))
+
+
+def test_topics_source_is_fail_soft():
+    class _BoomStore:
+        def list_nodes(self, *a, **k):
+            raise RuntimeError("topics boom")
+        def close(self):
+            pass
+    b, f = _committed()
+    rep = assemble(_CTX, dkb=_dkb(), tracker=_StubTracker(b, f), topic_store=_BoomStore())
+    assert rep.topics == []                 # a failing source empties its field…
+    assert "build the live brain" in rep.intent   # …and never sinks the rep

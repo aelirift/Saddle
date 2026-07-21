@@ -571,3 +571,107 @@ class BubbleEvent:
     tenant: str = ""
     project: str = ""
     ts: float = 0.0
+
+
+# === Live-brain — the topic mind-map (Slice #3) =========================
+#
+# The third tracking grain of the live brain, and the parent structure that
+# unifies the other two: the item ledger (discrete asks) and settled designs
+# hang off topic nodes, and the commitment is the ONE active node. The map is a
+# DAG — in practice a tree (project -> stages -> substeps) — with the occasional
+# CONDITIONAL back-edge (a closed topic reopens *iff* a design/intent it depended
+# on changes). See docs/design/topic_mind_map.md.
+
+# --- node types: each type carries its own closure semantics -------------
+TN_ROOT = "root"          # top-level ask; closes when all children closed + user confirms
+TN_TOPIC = "topic"        # a work-area; closes when children closed + user confirms
+TN_DECISION = "decision"  # a fork the user rules on -> collapses into parent context
+TN_WORK = "work"          # built + tested + user signs off WITH evidence (state machine)
+TN_QUESTION = "question"  # closes when the user answers it
+TN_FINDING = "finding"    # informational; attaches to a topic, never "open"
+TOPIC_NODE_TYPES: frozenset[str] = frozenset(
+    {TN_ROOT, TN_TOPIC, TN_DECISION, TN_WORK, TN_QUESTION, TN_FINDING}
+)
+
+# --- node status ---------------------------------------------------------
+# OPEN is shared with the item ledger; CLOSED is the map's own terminal. A
+# dropped OR closed node is SOFT — kept, queryable, reopenable — never deleted
+# (the retirement gate: nothing durable vanishes silently).
+CLOSED = "closed"
+TOPIC_STATUSES: frozenset[str] = frozenset({OPEN, CLOSED, DROPPED})
+
+# --- the `work` testing-state machine ------------------------------------
+# A work node does NOT close on build. It advances none -> built_untested ->
+# tested_unclosed -> closed; the two middle states are REMINDER states saddle
+# nags on (loud, not silent) until the user closes it WITH evidence. "No
+# evidence, no close" is enforced structurally by the store.
+TS_NONE = "none"
+TS_BUILT_UNTESTED = "built_untested"
+TS_TESTED_UNCLOSED = "tested_unclosed"
+TS_CLOSED = "closed"
+# Ordered progression — the index gives the forward direction; a transition may
+# only advance (or hold), never skip states, except an explicit reopen.
+TOPIC_TESTING_ORDER: tuple[str, ...] = (
+    TS_NONE, TS_BUILT_UNTESTED, TS_TESTED_UNCLOSED, TS_CLOSED,
+)
+TOPIC_TESTING_STATES: frozenset[str] = frozenset(TOPIC_TESTING_ORDER)
+# The states saddle actively reminds on — built but not yet signed off.
+TOPIC_REMINDER_STATES: frozenset[str] = frozenset(
+    {TS_BUILT_UNTESTED, TS_TESTED_UNCLOSED}
+)
+
+# --- edge kinds ----------------------------------------------------------
+EDGE_CONTAINS = "contains"    # parent -> child; the tree backbone
+EDGE_BACK = "back_edge"       # a conditional flow-back; fires only on its condition
+TOPIC_EDGE_KINDS: frozenset[str] = frozenset({EDGE_CONTAINS, EDGE_BACK})
+
+
+@dataclass
+class TopicNode:
+    """One node in the topic mind-map — a discussion thread saddle tracks across
+    the whole project life, independent of any one agent context.
+
+    ``type`` (:data:`TOPIC_NODE_TYPES`) fixes the closure semantics; ``status``
+    (:data:`TOPIC_STATUSES`) is open/closed/dropped; ``testing_state`` only means
+    something for a ``work`` node (:data:`TOPIC_TESTING_STATES`). ``topic_key`` is
+    a stable slug that lets a NEW node re-open a dropped thread (same key = same
+    thread, later). ``recorded_context`` is the compact why-summary a closed /
+    dropped node keeps so a thread is never re-explored cold. ``reopen_flag`` is
+    the other reopen path (set it to bring a closed node back). ``id``/``tenant``/
+    ``project``/``ts``/``updated_ts`` are stamped by the store on save."""
+
+    title: str
+    type: str = TN_TOPIC
+    topic_key: str = ""
+    status: str = OPEN
+    testing_state: str = TS_NONE
+    recorded_context: str = ""
+    reopen_flag: bool = False
+    id: str = ""
+    tenant: str = ""
+    project: str = ""
+    ts: float = 0.0
+    updated_ts: float = 0.0
+
+    def is_reminder(self) -> bool:
+        """True when this is a work node parked in a build-but-not-closed state
+        saddle should keep nagging about."""
+        return self.type == TN_WORK and self.testing_state in TOPIC_REMINDER_STATES
+
+
+@dataclass
+class TopicEdge:
+    """One edge between two topic nodes. ``kind`` is ``contains`` (the tree
+    backbone) or ``back_edge`` (a conditional flow-back that fires only when
+    ``condition`` holds — and, like every structural change, only when proposed
+    and user-confirmed). Stamped with ``(tenant, project)`` like every saddle row
+    so isolation never rides on the node ids alone. Keyed by
+    ``(parent_id, child_id, kind)``."""
+
+    parent_id: str
+    child_id: str
+    kind: str = EDGE_CONTAINS
+    condition: str = ""
+    tenant: str = ""
+    project: str = ""
+    ts: float = 0.0

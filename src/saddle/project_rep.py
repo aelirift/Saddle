@@ -35,6 +35,8 @@ if TYPE_CHECKING:  # pragma: no cover
     from saddle.context import Context
     from saddle.dialog import IntentTracker
     from saddle.dkb import DKB
+    from saddle.models import TopicNode
+    from saddle.topic_store import TopicStore
 
 _log = logging.getLogger("saddle.project_rep")
 
@@ -48,6 +50,18 @@ _CLIP = 240                   # per-entry body cap in the rendered block
 MapProbe = Callable[["Context"], str]
 
 
+def _thread_line(node: "TopicNode") -> str:
+    """One OPEN-THREADS line for the rep: the node title + its type, and for a
+    ``work`` node its testing state — so a build-but-not-signed-off reminder is
+    visible at a glance (that is the whole point of the reminder states)."""
+    from saddle.models import TN_WORK
+
+    label = (node.title or "").strip() or "(untitled)"
+    if node.type == TN_WORK and node.testing_state:
+        return f"{label} [work: {node.testing_state}]"
+    return f"{label} [{node.type}]"
+
+
 @dataclass
 class ProjectRep:
     """The assembled compact model for one (tenant, project). Every field is a live
@@ -57,6 +71,7 @@ class ProjectRep:
     intent: str = ""
     designs: list[str] = field(default_factory=list)
     knowledge: list[tuple[str, str, str]] = field(default_factory=list)  # (kind,title,body)
+    topics: list[str] = field(default_factory=list)  # OPEN THREADS lines
     map_status: str = ""
     rolling_chat: str = ""
     token_budget: int = DEFAULT_TOKEN_BUDGET
@@ -69,8 +84,10 @@ def assemble(
     dkb: "DKB | None" = None,
     tracker: "IntentTracker | None" = None,
     map_probe: "MapProbe | None" = None,
+    topic_store: "TopicStore | None" = None,
     rolling_chat: str = "",
     max_designs: int = 5,
+    max_topics: int = 8,
     recall_k: int = 8,
 ) -> ProjectRep:
     """Assemble the project rep for ``ctx`` from the live substrate. ``query`` biases
@@ -115,6 +132,20 @@ def assemble(
     except Exception as exc:  # noqa: BLE001
         _log.warning("project_rep: knowledge source failed for [%s]: %s", ctx.key, exc)
 
+    topics: list[str] = []
+    try:
+        store = topic_store
+        if store is None:
+            from saddle.topic_store import get_topic_store
+
+            store = get_topic_store()
+        # The OPEN threads, newest-touched first — the live loose-ends the brain
+        # should surface. list_nodes(status=open) already orders by updated_ts.
+        for node in store.list_nodes(ctx, status="open", limit=max_topics):
+            topics.append(_thread_line(node))
+    except Exception as exc:  # noqa: BLE001 — enrichment must never wedge the turn
+        _log.warning("project_rep: topics source failed for [%s]: %s", ctx.key, exc)
+
     map_status = ""
     if map_probe is not None:
         try:
@@ -128,6 +159,7 @@ def assemble(
         intent=intent,
         designs=designs,
         knowledge=knowledge,
+        topics=topics,
         map_status=map_status,
         rolling_chat=(rolling_chat or "").strip(),
         token_budget=DEFAULT_TOKEN_BUDGET,
@@ -153,6 +185,12 @@ def render(rep: ProjectRep, *, budget: int | None = None) -> str:
     sections: list[str] = []
     if rep.intent:
         sections.append(f"CURRENT INTENT (act on this): {_clip(rep.intent)}")
+    if rep.topics:
+        lines = "\n".join(f"  - {_clip(t, 160)}" for t in rep.topics)
+        sections.append(
+            "OPEN THREADS (the live loose-ends — surface, never silently drop; a "
+            f"work item stays open until closed with evidence):\n{lines}"
+        )
     if rep.map_status:
         sections.append(f"STRUCTURAL MAPS: {_clip(rep.map_status, 120)}")
     if rep.designs:
@@ -184,11 +222,12 @@ def rep_block(
     dkb: "DKB | None" = None,
     tracker: "IntentTracker | None" = None,
     map_probe: "MapProbe | None" = None,
+    topic_store: "TopicStore | None" = None,
     rolling_chat: str = "",
 ) -> str:
     """:func:`assemble` + :func:`render` in one call — the bounded project-rep block
     to feed the agent. Returns '' when there is nothing to say."""
     return render(assemble(
         ctx, query=query, dkb=dkb, tracker=tracker, map_probe=map_probe,
-        rolling_chat=rolling_chat,
+        topic_store=topic_store, rolling_chat=rolling_chat,
     ))
