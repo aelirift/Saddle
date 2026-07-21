@@ -47,11 +47,13 @@ from saddle.models import (
     DROPPED,
     EDGE_BACK,
     OPEN,
+    TN_FINDING,
     TN_ROOT,
     TN_TOPIC,
     TN_WORK,
     TOPIC_EDGE_KINDS,
     TOPIC_NODE_TYPES,
+    TOPIC_REMINDER_STATES,
     TOPIC_STATUSES,
     TOPIC_TESTING_ORDER,
     TOPIC_TESTING_STATES,
@@ -223,6 +225,12 @@ class SqliteTopicStore:
             raise ValueError(f"unknown topic status {node.status!r}")
         if node.testing_state not in TOPIC_TESTING_STATES:
             raise ValueError(f"unknown testing state {node.testing_state!r}")
+        # A finding is informational — spec: it "attaches to a topic, never
+        # 'open'". Bake that here so a finding never surfaces as a loose end in
+        # OPEN THREADS nor blocks its parent's closure via open_children. The
+        # invariant lives in the store, not in a caller's discipline.
+        if node.type == TN_FINDING and node.status == OPEN:
+            node.status = CLOSED
         now = time.time()
         node.id = node.id or ids.record_id(ids.KIND_TOPIC)
         node.tenant = ctx.tenant
@@ -287,9 +295,14 @@ class SqliteTopicStore:
         if state == TS_CLOSED:
             raise ValueError("close a work node via close_node (evidence-gated)")
         cur, new = TOPIC_TESTING_ORDER.index(node.testing_state), TOPIC_TESTING_ORDER.index(state)
-        if new < cur:
+        # Advance ONE step at a time (or hold): never backwards, and never SKIP a
+        # state — a node can't reach 'tested' without first passing 'built', so
+        # the reminder ladder can't be jumped (spec: "may only advance or hold,
+        # never skip states, except an explicit reopen").
+        if not (cur <= new <= cur + 1):
             raise ValueError(
-                f"testing state only advances: {node.testing_state!r} -> {state!r} is backwards"
+                f"testing state advances one step at a time (or holds): "
+                f"{node.testing_state!r} -> {state!r} skips or goes backwards"
             )
         return self._update(ctx, node_id, testing_state=state)
 
@@ -301,8 +314,11 @@ class SqliteTopicStore:
           folds into the recorded context and the testing state moves to ``closed``.
         * ``root`` / ``topic`` — refuse while any child is still OPEN (the
           "all children closed" half of the rule).
-        The other types close directly. ``user confirms`` is the engine's job; the
-        store enforces only what must be structurally true."""
+        The other types close directly. (A ``decision``'s "collapse into the
+        parent's recorded context" is a structural REMAP the per-turn engine
+        performs — a later slice, like split / merge / re-parent — so the store
+        just closes it here; it does not fold-and-delete.) ``user confirms`` is
+        the engine's job; the store enforces only what must be structurally true."""
         node = self._require_node(ctx, node_id)
         fields: dict = {"status": CLOSED}
         if node.type == TN_WORK:
@@ -362,7 +378,10 @@ class SqliteTopicStore:
                 args,
             )
             self._conn.commit()
-        got = self.get_node(ctx, node_id)
+            # Read back UNDER THE SAME lock — otherwise a concurrent writer could
+            # slip a different state in between our commit and a released-lock
+            # read, and we'd return a node this call never produced.
+            got = self._get_node_locked(ctx, node_id)
         assert got is not None  # _require_node already proved it exists in scope
         return got
 
@@ -374,13 +393,20 @@ class SqliteTopicStore:
             raise ValueError(f"topic node {node_id!r} not found in scope")
         return node
 
+    def _get_node_locked(self, ctx: Context, node_id: str) -> TopicNode | None:
+        """Fetch one node WITHOUT taking the lock — for a caller already holding
+        it (the write-then-read-back in :meth:`_update`). The single-connection
+        lock is not reentrant, so a locked caller must not re-enter
+        :meth:`get_node`."""
+        row = self._conn.execute(
+            "SELECT * FROM topic_node WHERE id=? AND tenant=? AND project=?",
+            (node_id, ctx.tenant, ctx.project),
+        ).fetchone()
+        return _row_to_node(row) if row is not None else None
+
     def get_node(self, ctx: Context, node_id: str) -> TopicNode | None:
         with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM topic_node WHERE id=? AND tenant=? AND project=?",
-                (node_id, ctx.tenant, ctx.project),
-            ).fetchone()
-        return _row_to_node(row) if row is not None else None
+            return self._get_node_locked(ctx, node_id)
 
     def list_nodes(
         self,
@@ -444,9 +470,20 @@ class SqliteTopicStore:
 
     def reminders(self, ctx: Context, *, limit: int = 50) -> list[TopicNode]:
         """Open work nodes parked in a build-but-not-signed-off state — the ones
-        saddle actively nags on (loud, never silent). Newest-updated first."""
-        nodes = self.list_nodes(ctx, status=OPEN, type=TN_WORK, limit=limit)
-        return [n for n in nodes if n.is_reminder()]
+        saddle actively nags on (loud, never silent). Newest-updated first. The
+        reminder-state filter runs IN SQL, so the LIMIT bounds the ACTUAL
+        reminders — not open work nodes that aren't reminders yet, which would
+        otherwise consume the budget and silently drop real reminders."""
+        states = tuple(TOPIC_REMINDER_STATES)
+        marks = ",".join("?" * len(states))
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM topic_node WHERE tenant=? AND project=? AND status=?"
+                f" AND type=? AND testing_state IN ({marks})"
+                f" ORDER BY updated_ts DESC LIMIT ?",
+                (ctx.tenant, ctx.project, OPEN, TN_WORK, *states, int(limit)),
+            ).fetchall()
+        return [_row_to_node(r) for r in rows]
 
     def close(self) -> None:
         with self._lock:

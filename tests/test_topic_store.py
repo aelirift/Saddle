@@ -122,6 +122,7 @@ def test_is_reminder_tracks_build_but_unclosed(store):
 
 def test_work_close_requires_evidence(store):
     w = _node(store, type=TN_WORK)
+    store.advance_testing(CTX, w.id, TS_BUILT_UNTESTED)
     store.advance_testing(CTX, w.id, TS_TESTED_UNCLOSED)
     with pytest.raises(ValueError):
         store.close_node(CTX, w.id)                             # no evidence -> refuse
@@ -138,6 +139,7 @@ def test_work_close_requires_tested_state(store):
 
 def test_work_close_with_evidence_succeeds_and_records_it(store):
     w = _node(store, type=TN_WORK)
+    store.advance_testing(CTX, w.id, TS_BUILT_UNTESTED)
     store.advance_testing(CTX, w.id, TS_TESTED_UNCLOSED)
     closed = store.close_node(CTX, w.id, evidence="pytest 42 passed")
     assert closed.status == CLOSED and closed.testing_state == TS_CLOSED
@@ -186,6 +188,7 @@ def test_reopen_restores_open_and_clears_flag(store):
 
 def test_reopen_work_returns_to_a_reminder_state(store):
     w = _node(store, type=TN_WORK)
+    store.advance_testing(CTX, w.id, TS_BUILT_UNTESTED)
     store.advance_testing(CTX, w.id, TS_TESTED_UNCLOSED)
     store.close_node(CTX, w.id, evidence="tested")
     reopened = store.reopen_node(CTX, w.id)
@@ -275,3 +278,53 @@ def test_recorded_context_is_bounded(store):
     n = store.add_node(CTX, TopicNode(title="x", type=TN_TOPIC,
                                       recorded_context="y" * 5000))
     assert len(store.get_node(CTX, n.id).recorded_context) <= 2000
+
+
+# -- defect fixes surfaced by the verification pass --------------------------
+
+def test_reminders_not_dropped_when_budget_filled_by_non_reminders(store):
+    """reminders() must filter to reminder states BEFORE the limit — else newer
+    non-reminder work nodes fill the budget and real reminders vanish (the
+    'loud, never silent' nag guarantee)."""
+    r1 = _node(store, type=TN_WORK)
+    r2 = _node(store, type=TN_WORK)
+    store.advance_testing(CTX, r1.id, TS_BUILT_UNTESTED)   # real reminders
+    store.advance_testing(CTX, r2.id, TS_BUILT_UNTESTED)
+    for _ in range(5):                                     # newer, NOT reminders
+        _node(store, type=TN_WORK)                          # testing_state = none
+    got = {n.id for n in store.reminders(CTX, limit=5)}
+    assert got == {r1.id, r2.id}                            # the 2 real ones, not []
+
+
+def test_advance_testing_rejects_skips(store):
+    """A work node cannot jump none -> tested_unclosed (skipping built) — the
+    build->tested reminder ladder must not be bypassable."""
+    w = _node(store, type=TN_WORK)
+    with pytest.raises(ValueError):
+        store.advance_testing(CTX, w.id, TS_TESTED_UNCLOSED)   # skips built_untested
+    # the single-step path still works.
+    store.advance_testing(CTX, w.id, TS_BUILT_UNTESTED)
+    store.advance_testing(CTX, w.id, TS_TESTED_UNCLOSED)
+    # holding at the same state is allowed.
+    assert store.advance_testing(CTX, w.id, TS_TESTED_UNCLOSED).testing_state == TS_TESTED_UNCLOSED
+
+
+def test_finding_is_never_open(store):
+    """A finding is informational: created non-open, absent from OPEN THREADS, and
+    never blocks its parent's closure."""
+    f = _node(store, type=TN_FINDING, title="camp mob level can't be clamped")
+    assert store.get_node(CTX, f.id).status != OPEN         # never 'open'
+    assert f.id not in {n.id for n in store.list_nodes(CTX, status=OPEN)}
+    # a topic with only a finding child closes (the finding doesn't block it).
+    parent = _node(store, type=TN_TOPIC, title="dungeon quality")
+    store.add_edge(CTX, TopicEdge(parent_id=parent.id, child_id=f.id))
+    assert store.open_children(CTX, parent.id) == []
+    assert store.close_node(CTX, parent.id).status == CLOSED
+
+
+def test_update_reads_back_the_state_it_wrote(store):
+    """_update returns the node with exactly the fields this call set (atomic
+    write+read-back under one lock)."""
+    w = _node(store, type=TN_WORK)
+    out = store.advance_testing(CTX, w.id, TS_BUILT_UNTESTED)
+    assert out.testing_state == TS_BUILT_UNTESTED and out.id == w.id
