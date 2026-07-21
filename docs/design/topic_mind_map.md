@@ -66,6 +66,29 @@ none  →  built_untested  →  tested_unclosed  →  closed
   the same `topic_key`** — chosen when a design/intent change makes a dropped topic
   applicable again. The back-edge condition drives the *suggestion* to reopen.
 
+## Retirement / deletion gate (owner 2026-07-20 — from a real miss this session)
+No durable fact OR topic node is retired/deleted silently or unilaterally (saddle
+retired a valid rayxiv4 restart point to "focus resume" — wrong; the gate below
+would have caught it). Before any retire/delete/overwrite of a durable artifact:
+
+1. **Question validity** — reason (against the project rep + mind map) about
+   whether the thing is still valid / no-longer-valid. Don't just remove it because
+   it's in the way.
+2. **Record the decision in the mind map** — a `decision` node *"X no longer valid
+   because <reason>"*, so the WHY is captured and X stays **reopenable** if the
+   reason later changes (the compact why-summary above).
+3. **Surface to the user + confirm** — *"removing X for <reason> (from our
+   discussion) — confirm?"*. Retirement is user-confirmed, reason traceable to the
+   discussion. Never silent.
+4. **Do it right after the discussion** that concluded it — fresh in the user's
+   mind AND recorded in the mind map, so nothing is forgotten.
+5. **Retirement is auditable** — a queryable ledger of *what was removed + why* (the
+   retired row already survives; retire is soft-hidden, never a hard delete).
+
+Applies to `dkb.retire_knowledge`, topic/node close+drop, and any durable-artifact
+overwrite. It is the standing rule *"if you didn't create it, surface before
+deleting"* made enforceable.
+
 ## Persisted store (new — the first genuinely new durable structure in the brain)
 A SQLite store alongside the fork / item stores, project-scoped:
 
@@ -83,6 +106,21 @@ split / merge / rename / re-parent / close-with-evidence / reopen — each
 **proposed and user-confirmed** (nothing implicit). Structural remaps carry
 children + recorded context to the new shape (the "stage 1 splits into predesign +
 design" case).
+
+## Project-based resume (owner 2026-07-20)
+`resume` is **project-scoped**: the user says **"resume saddle"** / **"resume
+rayxiv4"** (or "resume rayxi") and lands on THAT project's restart point — not a
+cross-project hunt (the session-start 3-thread wander was the anti-pattern). Model:
+
+- Each project's **mind-map root is its restart point**; `resume <project>` loads
+  that root (its open threads + where each was left off).
+- A restart point is a durable fact keyed by project (title carries the project),
+  so recall on "resume saddle" / "resume rayxiv4" surfaces the right one.
+- A **bare** `resume` (no project named) does NOT guess across projects — it asks
+  "resume which project?" or resumes the last-active one; it never enumerates other
+  projects' loose ends.
+- Other projects' restart points stay **valid and preserved** (see the retirement
+  gate) — they are simply not triggered unless their project is named.
 
 ## Reminder cadence — trigger-based (settled)
 Surface open loose-ends **after a big build completes, while testing, and on
