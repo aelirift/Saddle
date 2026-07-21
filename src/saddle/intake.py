@@ -68,11 +68,11 @@ _SYSTEM_ITEMIZE = (
     "rule or preference, a piece of background, or a decision to make MUST "
     "become its own item. When in doubt, emit an item rather than drop it. "
     "Split compound asks — 'do X and also tell me Y' is two items.\n\n"
-    "The message may be preceded by a RELEVANT KNOWLEDGE block of facts already "
-    "established about this project (its identity, conventions, prior lessons). "
-    "Use it to interpret the message correctly — a term defined there means what "
-    "it says there — but do NOT itemize the background; decompose only the USER "
-    "MESSAGE.\n\n"
+    "The message may be preceded by a PROJECT REP block — saddle's compact model "
+    "of what this project is about (its current intent, settled designs, and "
+    "established facts/lessons). Use it to interpret the message correctly — a term "
+    "defined there means what it says there — but do NOT itemize the background; "
+    "decompose only the USER MESSAGE.\n\n"
     "Classify each item's kind as exactly one of:\n"
     "- question: the user wants an answer or information back.\n"
     "- task: a concrete action to perform.\n"
@@ -170,10 +170,10 @@ def _norm(ask: str) -> str:
 
 
 def _itemize_prompt(prompt: str, grounding: str = "") -> str:
-    """The itemizer's user message, optionally prefixed with a bounded RELEVANT
-    KNOWLEDGE block (from :mod:`saddle.recall`) so the model interprets the prompt
-    against what the project already knows — e.g. that 'saddle' names THIS harness,
-    not some same-named external product."""
+    """The itemizer's user message, optionally prefixed with a bounded PROJECT REP
+    block (from :mod:`saddle.project_rep`) so the model interprets the prompt against
+    the project's live model — its intent, settled designs, and known facts — e.g.
+    that 'saddle' names THIS harness, not some same-named external product."""
     if grounding:
         return f"{grounding}\n\nUSER MESSAGE:\n{prompt}"
     return f"USER MESSAGE:\n{prompt}"
@@ -438,13 +438,14 @@ async def decompose(
         from saddle.llm.callers import build_callers
         caller = build_callers(ctx)["default"]
 
-    # Ground the itemizer in project memory (bounded, off the event loop). Done
-    # before the fairness gate: recall is a local retrieval, not a provider call,
-    # so it does not belong inside the tenant's LLM quota.
+    # Ground the itemizer in the PROJECT REP (bounded, off the event loop) — the
+    # compact live model of what this project is about (intent + settled designs +
+    # DKB knowledge; a superset of bare recall). Done before the fairness gate: it
+    # is local retrieval, not a provider call, so it does not belong in the LLM quota.
     grounding = ""
     if ground:
-        from saddle.recall import recall_block
-        grounding = await asyncio.to_thread(recall_block, ctx, text)
+        from saddle.project_rep import rep_block
+        grounding = await asyncio.to_thread(rep_block, ctx, query=text)
 
     audits_run = 0
     audit_complete = False
