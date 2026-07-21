@@ -112,6 +112,145 @@ def test_default_and_autonomous_never_deny():
     assert _hold_denies_edit("Edit", "s2", _Turn()) is False
 
 
+# -- council routing in _design_outcome (#78) --------------------------------
+
+def _council_result(**kw):
+    from saddle.council import CouncilResult
+
+    return CouncilResult(**kw)
+
+
+@pytest.fixture
+def _stub_convene(monkeypatch):
+    """Replace saddle.council.convene with a scripted async result; record whether
+    it was called (to prove a HELD session never convenes)."""
+    calls: list[tuple] = []
+    box: dict = {"result": None, "raise": None}
+
+    async def _fake_convene(goal, approach, ctx=None, **kw):
+        calls.append((goal, approach))
+        if box["raise"] is not None:
+            raise box["raise"]
+        return box["result"]
+
+    monkeypatch.setattr("saddle.council.convene", _fake_convene)
+    return calls, box
+
+
+def test_council_settled_maps_to_settled_outcome(_stub_convene, _stub_audit_and_settle):
+    from saddle import doctrine_hook
+
+    calls, box = _stub_convene
+    box["result"] = _council_result(convened=True, design_id="design_c",
+                                    index={"summary": "the reconciled plan"})
+    out = doctrine_hook._design_outcome(_CTX, "g", "some concrete approach", "s-council")
+    assert out.meta.get("settled") is True
+    assert out.meta.get("design_id") == "design_c"
+    assert calls                                    # council WAS convened
+    assert _stub_audit_and_settle == []             # single-audit floor NOT reached
+
+
+def test_council_audit_issues_map_to_alert(_stub_convene, _stub_audit_and_settle):
+    from saddle import doctrine_hook
+    from saddle.models import BUBBLE_ALERT
+
+    _, box = _stub_convene
+    box["result"] = _council_result(convened=True, body="synthesis",
+                                    audit_issues=["still a band-aid"])
+    out = doctrine_hook._design_outcome(_CTX, "g", "some concrete approach", "s-iss")
+    assert out.level == BUBBLE_ALERT
+    assert out.meta.get("issues") == ["still a band-aid"]
+    assert out.meta.get("settled") is not True
+
+
+def test_council_forks_map_to_alert(_stub_convene, _stub_audit_and_settle):
+    from saddle import doctrine_hook
+
+    _, box = _stub_convene
+    box["result"] = _council_result(convened=True, body="synthesis",
+                                    forks=["A vs B — you decide"])
+    out = doctrine_hook._design_outcome(_CTX, "g", "some concrete approach", "s-fork")
+    assert out.meta.get("issues") == ["A vs B — you decide"]
+
+
+def test_council_fell_back_uses_single_audit_floor(_stub_convene, _stub_audit_and_settle):
+    from saddle import doctrine_hook
+
+    _, box = _stub_convene
+    box["result"] = _council_result(convened=True, fell_back=True, dissent="no quorum")
+    out = doctrine_hook._design_outcome(_CTX, "g", "some concrete approach", "s-fb")
+    # Fell back -> the single (stubbed, clean) audit floor ran and SETTLED.
+    assert out.meta.get("settled") is True
+    assert _stub_audit_and_settle == ["some concrete approach"]
+
+
+def test_council_error_fails_open_to_single_audit(_stub_convene, _stub_audit_and_settle):
+    from saddle import doctrine_hook
+
+    _, box = _stub_convene
+    box["raise"] = RuntimeError("council blew up")
+    out = doctrine_hook._design_outcome(_CTX, "g", "some concrete approach", "s-err")
+    # FAIL OPEN: a council crash falls back to the single audit floor, not a wedge.
+    assert out.meta.get("settled") is True
+    assert _stub_audit_and_settle == ["some concrete approach"]
+
+
+def test_held_session_never_convenes_the_council(_stub_convene, _stub_audit_and_settle):
+    from saddle import doctrine_hook
+
+    calls, box = _stub_convene
+    box["raise"] = AssertionError("council must NOT be convened under a hold")
+    write_posture("s-held", HoldPosture(state=HOLD_HELD_STATE, held={"goal": "g"}))
+    out = doctrine_hook._design_outcome(_CTX, "g", "some concrete approach", "s-held")
+    assert out.meta.get("held") is True
+    assert calls == []                              # council skipped entirely
+    assert _stub_audit_and_settle == []             # clean-under-hold does NOT settle
+
+
+# -- supporting-file exemption: docs / tests never hold or review ------------
+
+def test_is_supporting_file_classifies_docs_tests_prose():
+    from saddle.doctrine_hook import _is_supporting_file
+
+    # prose / doc extensions
+    assert _is_supporting_file("docs/INTENT_AUDIT.md") is True
+    assert _is_supporting_file("/abs/notes.txt") is True
+    assert _is_supporting_file("README.rst") is True
+    # path-segment based
+    assert _is_supporting_file("/home/x/docs/design/foo.py") is True   # under docs/
+    assert _is_supporting_file("tests/test_thing.py") is True          # under tests/
+    assert _is_supporting_file("src/pkg/test_helper.py") is True       # test_* basename
+    # real code / design content still gates (NOT supporting)
+    assert _is_supporting_file("src/saddle/doctrine_hook.py") is False
+    assert _is_supporting_file("knowledge/systems/gameplay/ability_registry.json") is False
+    assert _is_supporting_file("game/player.gd") is False
+    assert _is_supporting_file("config.yaml") is False
+    assert _is_supporting_file("") is False
+    assert _is_supporting_file("docs.py") is False                     # not the docs/ dir
+
+
+def test_hook_allows_a_doc_edit_even_under_hold(tmp_path, monkeypatch, capsys):
+    """A HELD session denies a .py edit (see below) but a .md edit is exempt —
+    the design gate never fires on supporting files, so no deny is emitted."""
+    from saddle import doctrine_hook
+
+    write_posture("s1", HoldPosture(state=HOLD_HELD_STATE, held={"goal": "build it"}))
+    tp = _transcript(tmp_path)
+    payload = {
+        "tool_name": "Write",
+        "tool_input": {"file_path": str(tmp_path / "docs" / "notes.md"),
+                       "content": "hello"},
+        "session_id": "s1",
+        "transcript_path": str(tp),
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    assert doctrine_hook.main() == 0
+    out = capsys.readouterr().out.strip()
+    # No deny decision anywhere in stdout (a code edit under the SAME hold denies).
+    assert '"permissionDecision": "deny"' not in out
+    assert '"deny"' not in out
+
+
 # -- the PreToolUse hook, end to end (smoke) ---------------------------------
 
 def _transcript(tmp_path):

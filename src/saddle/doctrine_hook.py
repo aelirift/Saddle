@@ -153,6 +153,36 @@ def _surface_allow_warn(
 # file. Deliberately narrow, not an oversight.
 _CODE_EDIT_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 
+# Documentation / test / plain-prose extensions. The design HOLD + council review
+# gate the "main meat" — a NON-TRIVIAL code/feature change (design-session ruling
+# 2026-07-20: "the council convenes only on a real code/feature change — NEVER on
+# docs/supporting files, NEVER on a plain prompt, NEVER on trivial edits"). Editing
+# a doc, a test, or a note is none of those, so holding it or convening a council on
+# it is pure noise. Deliberately NARROW — prose + tests only. It must NOT widen to
+# `_DATA_SUFFIXES` (.json/.yaml/.gd/...): in a game-content project the real design
+# lives in JSON system files, which MUST still be reviewed.
+_DOC_SUFFIXES: tuple[str, ...] = (".md", ".rst", ".txt")
+
+
+def _is_supporting_file(file_path: str) -> bool:
+    """True when the edited path is documentation / a test / plain prose — the class
+    of edit the design gate (hold + review) must skip. Matches the contract exactly:
+    a ``*.md`` / ``*.rst`` / ``*.txt`` extension, any ``docs/`` or ``tests/`` path
+    segment, or a ``test_*`` basename (pytest convention). Everything else — real
+    source, JSON/YAML design content — still gates."""
+    fp = (file_path or "").strip()
+    if not fp:
+        return False
+    from pathlib import PurePosixPath
+
+    p = PurePosixPath(fp.replace("\\", "/"))
+    if p.suffix.lower() in _DOC_SUFFIXES:
+        return True
+    parts = set(p.parts)
+    if "docs" in parts or "tests" in parts:
+        return True
+    return p.name.startswith("test_")
+
 
 def _design_marker_path(session: str):
     """Where this session's last design-gate turn-anchor is parked — alongside the
@@ -289,17 +319,114 @@ def _emit_pretool_context(
         print(body, file=sys.stderr)
 
 
+def _session_held(session: str) -> bool:
+    """True when the user asked to approve the plan before code (HOLD_HELD_STATE).
+    A posture read that fails is treated as NOT held (fail-open to today's settle
+    behaviour) with a loud line — a garbled posture must never wedge the review."""
+    if not session:
+        return False
+    try:
+        from saddle.hold import HOLD_HELD_STATE, read_posture
+
+        return read_posture(session).state == HOLD_HELD_STATE
+    except Exception as exc:  # noqa: BLE001 — a posture read must not wedge the review
+        print(f"doctrine_hook: hold-gate read error ({exc!r}); settling as before",
+              file=sys.stderr)
+        return False
+
+
+def _council_timeout(single_timeout: float) -> float:
+    """The deadline for the council path. A 2-critic panel + synthesis + audit floor
+    needs far more wall-clock than the single audit, so it gets its own ceiling
+    (``SADDLE_HOOK_COUNCIL_TIMEOUT``, default 180s). The council runs ONLY on a
+    non-trivial surface (convene triages small changes out) and FAILS OPEN, so an
+    over-run falls back to the single audit rather than wedging the edit — the cost
+    is a bounded stall on a meaty edit, never a lost one."""
+    try:
+        return float(os.environ.get("SADDLE_HOOK_COUNCIL_TIMEOUT", "180") or 180)
+    except ValueError:
+        return max(single_timeout, 180.0)
+
+
+def _council_outcome(
+    ctx: "Context", goal: str, approach: str, timeout: float,
+) -> "StageOutcome | None":
+    """Convene the design COUNCIL and map its result to a StageOutcome — or ``None``
+    to signal 'no council verdict; use the single audit floor'.
+
+    Returns ``None`` when convene triaged the surface out as trivial, fell back (no
+    panel / no quorum / no synthesis), or FAILED OPEN on an unexpected error or
+    timeout — a council bug must never wedge an edit (the audit floor is the trusted,
+    fail-LOUD path). A settled reconciled design ⇒ a settled NOTICE; audit-floor
+    issues or an unresolved user fork ⇒ an ALERT carrying them as issues, so the
+    strict gate holds the floor and Stage 5 can harvest them."""
+    from saddle.council import convene
+    from saddle.supervisor import StageOutcome, run_bounded
+
+    try:
+        result = run_bounded(
+            convene(goal, approach, ctx),
+            seconds=_council_timeout(timeout),
+            what="the design council (a two-critic panel)",
+        )
+    except Exception as exc:  # noqa: BLE001 — FAIL OPEN: fall back to the single audit
+        print(f"doctrine_hook: council review error ({exc!r}); "
+              "falling back to the single design audit", file=sys.stderr)
+        return None
+
+    if not result.convened or result.fell_back:
+        # Trivial surface (convened=False) OR a panel that could not deliver
+        # (fell_back) — either way, keep the single audit floor below.
+        if result.fell_back:
+            print(f"doctrine_hook: council fell back ({result.dissent}); "
+                  "using the single design audit", file=sys.stderr)
+        return None
+
+    from saddle.models import BUBBLE_ALERT, BUBBLE_NOTICE
+
+    if result.settled:
+        from saddle.voice import design_settled
+
+        summary = (result.index or {}).get("summary") or goal
+        return StageOutcome(
+            sections=[design_settled(summary)],
+            level=BUBBLE_NOTICE,
+            title="plan agreed by council",
+            meta={"settled": True, "design_id": result.design_id},
+        )
+
+    # Convened but did NOT settle: the anti-pattern floor flagged the synthesis, or
+    # a genuine tradeoff remains for the user to decide. Surface both as issues so
+    # the strict gate holds and the turn-end harvest (Stage 5) can learn from them.
+    from saddle.voice import design_issues_pre_edit
+
+    issues = list(result.audit_issues) + list(result.forks)
+    if not issues:
+        issues = [result.dissent or "the council did not settle a design"]
+    body = "\n".join(f"  • {i}" for i in issues)
+    return StageOutcome(
+        sections=[design_issues_pre_edit(body)],
+        level=BUBBLE_ALERT,
+        meta={"issues": issues},
+    )
+
+
 def _design_outcome(
     ctx: "Context", goal: str, approach: str, session: str = "",
 ) -> "StageOutcome | None":
-    """Stage 3 body — audit the agent's pre-edit approach, fail LOUD.
+    """Stage 3 body — review the agent's pre-edit approach; escalate by blast radius.
 
-    No recorded approach ⇒ the agent jumped straight to code, which is itself the
-    finding (a deterministic ALERT, no LLM call). Otherwise the approach is audited
-    under a deadline via :func:`saddle.supervisor.run_bounded`, which PROPAGATES a
-    timeout / provider outage / contract gap to :func:`run_stage` to classify and
-    bubble — never a swallowed 'looked fine'. A clean audit returns ``None``
-    (silent); issues return an ALERT naming each one."""
+    No recorded approach ⇒ the agent jumped straight to code, itself the finding (a
+    deterministic ALERT, no LLM call). Otherwise the review escalates: a non-trivial
+    code/feature change convenes the design COUNCIL (a two-critic panel that
+    self-triages a trivial surface back to the single audit and settles a clean
+    reconciled design); a small change keeps the single :func:`audit_proposal` floor.
+    The council FAILS OPEN — a council bug/timeout falls back to the single audit
+    rather than wedging the edit — while the audit floor stays fail-LOUD via
+    :func:`run_bounded`. Under an active HOLD nothing may auto-settle (the plan is
+    the USER's to approve), and convene settles internally, so the hold-check runs
+    BEFORE the council: a held session takes only the single observational audit and,
+    if clean, returns a held-awaiting-approval NOTICE."""
     from saddle.models import BUBBLE_ALERT
     from saddle.supervisor import StageOutcome
 
@@ -314,9 +441,6 @@ def _design_outcome(
             # no-plan edit too — writing the plan IS the way through.
             meta={"issues": [no_recorded_design()]},
         )
-
-    from saddle.design import audit_proposal
-    from saddle.supervisor import run_bounded
 
     # Gap 5 — judge from the SAME state as the completion gate: after a
     # goal-keeper forced continuation, the gate's missing-items list IS
@@ -344,68 +468,74 @@ def _design_outcome(
         timeout = float(os.environ.get("SADDLE_HOOK_DESIGN_TIMEOUT", "60") or 60)
     except ValueError:
         timeout = 60.0
+
+    # Under a HOLD the agreement is the USER's to give — nothing may auto-settle.
+    # convene() settles a clean synthesis INTERNALLY, so the hold-check runs FIRST:
+    # a held session never convenes; it takes the single observational audit below
+    # and, when clean, returns the held-awaiting-approval NOTICE (no settle).
+    held = _session_held(session)
+
+    if not held:
+        # The "main meat": convene the design council. It self-triages a trivial
+        # surface (-> None, keep the single audit floor) and FAILS OPEN on error.
+        convened = _council_outcome(ctx, goal, approach, timeout)
+        if convened is not None:
+            return convened
+
+    # -- Single-audit floor (fail-LOUD): the trivial / council-fallback / held path.
+    from saddle.design import audit_proposal
+    from saddle.supervisor import run_bounded
+
     verdict = run_bounded(
         audit_proposal(goal, approach, ctx),
         seconds=timeout,
         what="the design review (root-cause / band-aid / coverage)",
     )
-    if not verdict.has_issues:
-        # Design-Hold (Part 1): a clean audit auto-settles as "converged" ONLY
-        # when the USER did not ask to be in the loop. Under an active HOLD the
-        # agreement is the USER's to give, so a clean plan is HELD (not settled)
-        # and awaits their approval — the surgical gate on the auto-settle bug.
-        # DEFAULT / AUTONOMOUS keep today's behaviour. (Belt-and-suspenders: the
-        # deterministic hold gate in _run_design_stage already DENIED the edit
-        # under HOLD before this stage ran, so this is the second line — it also
-        # covers any path that reaches _design_outcome without that gate.)
-        if session:
-            try:
-                from saddle.hold import HOLD_HELD_STATE, read_posture
+    if verdict.has_issues:
+        from saddle.voice import design_issues_pre_edit
 
-                if read_posture(session).state == HOLD_HELD_STATE:
-                    from saddle.models import BUBBLE_NOTICE
-                    from saddle.voice import design_held_awaiting_approval
-
-                    return StageOutcome(
-                        sections=[design_held_awaiting_approval(goal)],
-                        level=BUBBLE_NOTICE,
-                        title="plan held — awaiting your approval",
-                        meta={"held": True},
-                    )
-            except Exception as exc:  # noqa: BLE001 — a posture read must not wedge the review
-                print(f"doctrine_hook: hold-gate read error ({exc!r}); "
-                      "settling as before", file=sys.stderr)
-
-        # Audited clean at the moment code starts -> the plan IS the agreement.
-        # SETTLE it (mediator loop step 4): recorded as a final design with a
-        # completeness surface, so Stage 4 re-gates the code against it every
-        # turn from here on and the topic goes quiet. A settlement failure
-        # PROPAGATES to run_stage (classified, loud) — never a silent skip.
-        from saddle.design import settle_approach
-        from saddle.models import BUBBLE_NOTICE
-        from saddle.voice import design_settled
-
-        design = run_bounded(
-            settle_approach(goal, approach, ctx),
-            seconds=timeout,
-            what="recording the agreed design (settlement)",
-        )
+        body = "\n".join(f"  • {i}" for i in verdict.issues)
         return StageOutcome(
-            sections=[design_settled(design.summary or goal)],
-            level=BUBBLE_NOTICE,
-            title="plan agreed and recorded",
-            meta={"settled": True, "design_id": design.id},
+            sections=[design_issues_pre_edit(body)],
+            level=BUBBLE_ALERT,
+            # The caught flaws ride on the bubble (like Stage 4's code drift) so the
+            # turn-end lesson harvest (Stage 5) can learn from them without
+            # re-parsing the rendered prose.
+            meta={"issues": list(verdict.issues)},
         )
-    from saddle.voice import design_issues_pre_edit
+    if held:
+        # Clean under a hold: HELD (not settled) — the agreement is the user's to
+        # give (the surgical gate on the auto-settle bug). The deterministic hold
+        # gate in _run_design_stage already DENIED the edit under HOLD before this
+        # stage ran; this is the belt-and-suspenders second line.
+        from saddle.models import BUBBLE_NOTICE
+        from saddle.voice import design_held_awaiting_approval
 
-    body = "\n".join(f"  • {i}" for i in verdict.issues)
+        return StageOutcome(
+            sections=[design_held_awaiting_approval(goal)],
+            level=BUBBLE_NOTICE,
+            title="plan held — awaiting your approval",
+            meta={"held": True},
+        )
+
+    # Audited clean at the moment code starts -> the plan IS the agreement. SETTLE it
+    # (mediator loop step 4): recorded as a final design with a completeness surface,
+    # so Stage 4 re-gates the code against it every turn from here on. A settlement
+    # failure PROPAGATES to run_stage (classified, loud) — never a silent skip.
+    from saddle.design import settle_approach
+    from saddle.models import BUBBLE_NOTICE
+    from saddle.voice import design_settled
+
+    design = run_bounded(
+        settle_approach(goal, approach, ctx),
+        seconds=timeout,
+        what="recording the agreed design (settlement)",
+    )
     return StageOutcome(
-        sections=[design_issues_pre_edit(body)],
-        level=BUBBLE_ALERT,
-        # The caught flaws ride on the bubble (like Stage 4's code drift) so the
-        # turn-end lesson harvest (Stage 5) can learn from them without re-parsing
-        # the rendered prose.
-        meta={"issues": list(verdict.issues)},
+        sections=[design_settled(design.summary or goal)],
+        level=BUBBLE_NOTICE,
+        title="plan agreed and recorded",
+        meta={"settled": True, "design_id": design.id},
     )
 
 
@@ -424,6 +554,17 @@ def _run_design_stage(
 
     Infra (no transcript, anchor IO, ctx resolution) fails OPEN — observation must
     never wedge an edit — but the AUDIT itself fails LOUD via :func:`run_stage`."""
+    # -- Supporting-file exemption — checked BEFORE everything else. The hold + the
+    # design review gate the "main meat" (a non-trivial code/feature change). A doc,
+    # a test, or a plain-prose edit is none of those, so it is neither held nor
+    # reviewed (design-session 2026-07-20). This does NOT weaken enforcement: the
+    # deterministic guard (scope-fence / cross-project DELETE) already ran and
+    # ALLOWED in main() before Stage 3 is reached — this only skips the observation.
+    if tool_name in _CODE_EDIT_TOOLS:
+        _fp = str((tool_input or {}).get("file_path")
+                  or (tool_input or {}).get("notebook_path") or "")
+        if _is_supporting_file(_fp):
+            return
     # -- Design-Hold gate (Part 1) — USER-CONSENT, deterministic, checked FIRST and
     # INDEPENDENT of the LLM design-review toggle AND of transcript availability.
     # The posture is durable per-session state; when the user asked to approve the
